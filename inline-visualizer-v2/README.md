@@ -215,6 +215,8 @@ const rows = getCachedData();
 
 `getCachedMeta()` exposes only `cacheId` and `sourceTool`. SQL arguments, other cache entries, and request metadata are not injected. The producer result has already appeared once in the LLM's native tool context before `cache_tool_call()` runs; this feature prevents the dataset from being copied again into the visualization call or generated JavaScript.
 
+`cache_tool_call()` resolves the current assistant message through the server-provided `chat_id` and `message_id`. It reads the saved message output plus the newer active response stream, then strictly matches `function_call` and `function_call_output` by `call_id`. The reserved `__messages__` argument is retained only as a compatibility fallback for Open WebUI modes that include tool results there.
+
 The primary cache lives in `__request__.state.cached_tool_calls` and is scoped to the active assistant turn. A bounded 30-minute in-process fallback is keyed by user/chat/session. It does not survive process restarts and is not shared across workers. If a reference is unavailable, the tool asks the model to rerun the query.
 
 ---

@@ -2,8 +2,9 @@ import asyncio
 import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -52,6 +53,35 @@ def history(*calls):
             }
         )
     return [{"role": "assistant", "content": "", "tool_calls": tool_calls}, *results]
+
+
+def response_output(*calls):
+    output = []
+    for call_id, name, arguments, result in calls:
+        output.extend(
+            [
+                {
+                    "type": "function_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": json.dumps(arguments),
+                    "status": "completed",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": [
+                        {
+                            "type": "input_text",
+                            "text": json.dumps(result, ensure_ascii=False),
+                        }
+                    ],
+                    "status": "completed",
+                },
+            ]
+        )
+    return output
 
 
 _DEFAULT_RESULT = object()
@@ -162,6 +192,107 @@ def test_cache_tool_call_reports_missing_call_and_result():
     ]
     missing_result = run(tool.cache_tool_call("execute_sql", __messages__=messages))
     assert missing_result["error"] == "Matching tool result not found"
+
+
+def test_find_latest_tool_call_in_open_webui_output():
+    output = response_output(
+        ("call-old", "execute_sql", {"sql": "old"}, [{"v": "old"}]),
+        ("call-other", "other_tool", {}, [{"v": "other"}]),
+        ("call-new", "execute_sql", {"sql": "new"}, [{"v": "new"}]),
+    )
+
+    call_data, error = cache_iv._find_latest_output_tool_call(output, "execute_sql")
+
+    assert error is None
+    assert call_data == {
+        "tool_id": "execute_sql",
+        "tool_call_id": "call-new",
+        "arguments": {"sql": "new"},
+        "result": [{"v": "new"}],
+    }
+
+
+def test_cache_tool_call_prefers_chat_message_output(monkeypatch):
+    async def load_chat_message_output(request, metadata):
+        assert metadata == {"chat_id": "chat", "message_id": "assistant-message"}
+        return response_output(
+            ("call-live", "execute_sql", {"sql": "live"}, [{"v": "live"}])
+        )
+
+    monkeypatch.setattr(
+        cache_iv, "_load_chat_message_output", load_chat_message_output
+    )
+    stale_messages = history(
+        ("call-stale", "execute_sql", {"sql": "stale"}, [{"v": "stale"}])
+    )
+    request = DummyRequest()
+
+    result = run(
+        cache_iv.Tools().cache_tool_call(
+            "execute_sql",
+            __messages__=stale_messages,
+            __request__=request,
+            __metadata__={"chat_id": "chat", "message_id": "assistant-message"},
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert request.state.cached_tool_calls[0]["tool_call_id"] == "call-live"
+    assert request.state.cached_tool_calls[0]["result"] == [{"v": "live"}]
+
+
+def test_load_chat_message_output_uses_ids_and_prefers_active_stream(monkeypatch):
+    saved_output = response_output(
+        ("call-saved", "execute_sql", {"sql": "saved"}, [{"v": "saved"}])
+    )
+    live_output = response_output(
+        ("call-live", "execute_sql", {"sql": "live"}, [{"v": "live"}])
+    )
+    calls = []
+
+    class FakeChats:
+        @staticmethod
+        async def get_message_by_id_and_message_id(chat_id, message_id):
+            calls.append(("message", chat_id, message_id))
+            return {"output": saved_output}
+
+    async def get_response_streams_by_chat_id(redis, chat_id):
+        calls.append(("stream", redis, chat_id))
+        return [
+            {
+                "chat_id": chat_id,
+                "message_id": "assistant-message",
+                "output": live_output,
+            }
+        ]
+
+    open_webui_module = ModuleType("open_webui")
+    open_webui_module.__path__ = []
+    models_module = ModuleType("open_webui.models")
+    models_module.__path__ = []
+    chats_module = ModuleType("open_webui.models.chats")
+    chats_module.Chats = FakeChats
+    tasks_module = ModuleType("open_webui.tasks")
+    tasks_module.get_response_streams_by_chat_id = get_response_streams_by_chat_id
+    monkeypatch.setitem(sys.modules, "open_webui", open_webui_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+    monkeypatch.setitem(sys.modules, "open_webui.tasks", tasks_module)
+
+    request = DummyRequest()
+    request.app.state.redis = "redis-connection"
+    output = run(
+        cache_iv._load_chat_message_output(
+            request,
+            {"chat_id": "chat", "message_id": "assistant-message"},
+        )
+    )
+
+    assert output == live_output
+    assert calls == [
+        ("message", "chat", "assistant-message"),
+        ("stream", "redis-connection", "chat"),
+    ]
 
 
 def test_separate_tools_share_the_same_request_cache():
