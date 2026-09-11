@@ -1,6 +1,6 @@
 ---
 name: visualize
-description: Render rich interactive visuals — SVG diagrams, HTML widgets, Plotly or Chart.js charts, cached tool data, and interactive explainers — directly inline in chat using visualize(). Use only when the user explicitly asks for a visualization, diagram, chart, graph, drawing, map, dashboard, or similar visual artifact. Do not use for ordinary markdown, code blocks, file previews, or answer formatting
+description: Render rich interactive visuals — SVG diagrams, HTML widgets, Chart.js charts, completed tool-call data, and interactive explainers — directly inline in chat using visualize(). Use only when the user explicitly asks for a visualization, diagram, chart, graph, drawing, map, dashboard, or similar visual artifact. Do not use for ordinary markdown, code blocks, file previews, or answer formatting
 ---
 
 # Inline Visualizer
@@ -14,7 +14,7 @@ you called the view_skill() tool to read the tutorial/handbook about this tool.
 Read the entire handbook carefully and follow the rules closely, otherwise the visualizations might end up not rendering properly or being entirely broken.
 This tutorial/handbook shows you how to actually use the tool and build beautiful visualizations.
 
-1. Call visualize(title="…", cache_id="…" if cached data is available) - YOU MUST CALL THE TOOL, otherwise the visualization you output will not be rendered in the chat.
+1. Call visualize(title="…", tool_call_id="…" if reusing a completed tool result) - YOU MUST CALL THE TOOL, otherwise the visualization you output will not be rendered in the chat.
 2. Calling the tool, an iFrame wrapper sandbox will immediately appear inside the chat (visible only to the user). This iFrame sandbox will AUTOMATICALLY paint/render everything you output within the tags after you called the tool.
 3. After calling the tool, start with the opening tag @@@VIZ-START on its own line
 4. Next, after the opening tag, emit the HTML/SVG content (no <!DOCTYPE>, <html>, <head>, <body>)
@@ -49,19 +49,30 @@ As you can see, each query token attends to all key tokens simultaneously.
 ## What's auto-injected
 
 - Theme CSS, SVG classes, color ramps, height reporting, sendPrompt() bridge, and openLink() bridge
-- When `cache_id` is supplied: the `getCachedData()` bridge
+- When `tool_call_id` is supplied: the `getToolData()` bridge containing only that call's textual result
 - Pre-styled bare-tag form elements (see below) — saves tokens on simple forms
 - Consider making diagrams **conversational** with sendPrompt() — see the "sendPrompt bridge" section further below for patterns and examples
 
-## Using `cache_id`
+## Using `tool_call_id`
 
-`visualize()` accepts an optional `cache_id`. When one is supplied, read its dataset inside generated JavaScript with `getCachedData()`.
+Use this workflow when a data-producing tool has already returned the dataset needed by the visualization:
+
+1. Call the producer tool and wait for its result.
+2. Copy its exact `tool_call_id`/`call_id` from the completed result in the structured conversation context.
+3. In a later sequential tool round, call `visualize(title="…", tool_call_id="<exact ID>")`.
+4. Read the selected result in the generated script with `getToolData()`.
 
 ```js
-const rows = getCachedData();
+const rows = getToolData();
 ```
 
-The dataset is already parsed. Do not call `JSON.parse()` on it, reproduce it inside generated HTML, convert it into a JavaScript literal, or pass it to `visualize()` as another argument. This skill does not create or manage cache references; it only explains how `visualize()` consumes an existing `cache_id`.
+The ID format is chosen by the provider. Treat it as an opaque string and copy it exactly; do not derive it from the tool name or call count. IDs such as `call_abc123`, `search_web:0`, and `function.search_web:0` are only valid when the completed call actually carries that exact value.
+
+The value returned by `getToolData()` is already parsed: JSON strings become objects, arrays, scalars, or `null`, while ordinary text remains a string. Do not call `JSON.parse()` on it. Do not reproduce the producer result in `visualize()`, HTML, or JavaScript, and do not invent or alter the ID.
+
+Never call the producer and `visualize()` in the same parallel batch. The result is not available to the visualizer until Open WebUI has finished and recorded that batch. Each visualization accepts at most one `tool_call_id`; have the producer return one combined dataset when a visual needs several related series.
+
+If `visualize()` returns `Invalid tool_call_id` or `Tool result not found`, verify the exact ID and that the producer completed in an earlier tool round. Do not retry a side-effecting producer merely to recover its result.
 
 ### Pre-styled form elements
 
@@ -310,67 +321,60 @@ the thing itself**, not a labeled diagram about it.
 
 ---
 
-## Chart libraries: Plotly.js and Chart.js only
+## Charts (Chart.js)
 
-The visualizer does not preload a chart library. Include exactly one of the pinned script tags below before your generated inline script. External scripts are executed in source order by the original streaming runtime.
+Load Chart.js in your HTML fragment:
 
-Use Plotly.js for interactive analytical charts, scatter plots, time series, heatmaps, multiple traces, zoom/pan/hover, and relatively large datasets. If both libraries fit an analytical visualization, prefer Plotly.
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 
-Use Chart.js for simple bar or line charts, pie/doughnut charts, small categorical comparisons, and compact dashboard charts.
+Setup pattern:
 
-Do not use D3, ECharts, Vega, Vega-Lite, Highcharts, ApexCharts, Mermaid, Google Charts, vis-network, or any other visualization library.
-
-### Canonical Plotly cached-data example
-
-Call `visualize(title="Sales", cache_id="<cache_id>")`, then emit:
-
-<div id="chart"></div>
-<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.3/plotly.min.js"></script>
-<script>
-const rows = getCachedData();
-
-const trace = {
-  x: rows.map(row => row.month),
-  y: rows.map(row => row.sales),
-  type: "bar"
-};
-
-Plotly.newPlot(
-  "chart",
-  [trace],
-  { title: "Sales" },
-  { responsive: true }
-);
-</script>
-
-### Canonical Chart.js cached-data example
-
-Call `visualize(title="Sales", cache_id="<cache_id>")`, then emit:
-
-<div style="position:relative;height:300px">
+<div style="position: relative; height: 300px;">
   <canvas id="chart"></canvas>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
-const rows = getCachedData();
+const ctx = document.getElementById('chart').getContext('2d');
+const s = getComputedStyle(document.documentElement);
+const textColor = s.getPropertyValue('--color-text-secondary').trim();
+const gridColor = s.getPropertyValue('--color-border-tertiary').trim();
 
-new Chart(
-  document.getElementById("chart"),
-  {
-    type: "bar",
-    data: {
-      labels: rows.map(row => row.month),
-      datasets: [{
-        label: "Sales",
-        data: rows.map(row => row.sales)
-      }]
-    },
-    options: { responsive: true, maintainAspectRatio: false }
+new Chart(ctx, {
+  type: 'bar',
+  data: {
+    labels: ['Q1','Q2','Q3','Q4'],
+    datasets: [{ label: 'Revenue', data: [12,19,8,15],
+      backgroundColor: '#1D9E75', borderRadius: 4, borderSkipped: false }]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { labels: { color: textColor, font: { size: 12 } } } },
+    scales: {
+      x: { grid: { display: false }, ticks: { color: textColor, font: { size: 12 } }, border: { color: gridColor } },
+      y: { grid: { color: gridColor }, ticks: { color: textColor, font: { size: 12 } }, border: { display: false } }
+    }
   }
-);
+});
 </script>
 
-Chart.js canvases need a positioned container with an explicit height. Always set `responsive: true` and `maintainAspectRatio: false`. Read the injected CSS variables for theme-aware text, grid, and border colors.
+**Chart rules:**
+- Wrap canvas in container with position: relative and explicit height — without it, maintainAspectRatio: false collapses the canvas to zero
+- Always pass responsive: true, maintainAspectRatio: false in options — without maintainAspectRatio: false, Chart.js locks the canvas to a 2:1 aspect and ignores the container height; without responsive: true, it won't redraw when the iframe re-measures. You have to set them explicitly on every new Chart(...) call (Chart.js reads options at construction time, so there's no global default we could pre-set for you).
+- Read CSS variables for text/border colors so the chart tracks the theme
+- borderRadius: 4 on bars
+- Line charts: tension: 0.3 for smooth curves
+- Doughnut: cutout: '60%' — never use pie
+
+**Chart type selection:**
+
+| Data shape | Type | Notes |
+|-----------|------|-------|
+| Categories + values (a few items, comparable magnitudes) | **Bar** | Default for "compare values across labels". Switch to a horizontal bar (indexAxis: 'y') when labels are long, when there are 8+ categories, or when ranking is the point. |
+| Time series, anything sampled at regular intervals | **Line** | tension: 0.3 for a natural curve. Stack multiple datasets when you're comparing trends, not when each line wanders independently — overlap gets unreadable past 4 lines. |
+| Parts of a whole, ≤5 slices | **Doughnut** | Use cutout: '60%' so the empty middle can hold a total or label. Skip if the segments are very uneven (one slice >70%) — the small slices vanish; show a stacked bar instead. |
+| Two continuous variables, looking for correlation | **Scatter** | Add a trend line if the relationship is the takeaway. For dense clouds, drop point opacity to 0.3–0.5 so density reads. |
+| Stacked / cumulative composition over time | **Stacked bar / stacked area** | Bar when the buckets are discrete (months, segments); area when the underlying signal is continuous. |
+| Single-value vs target / threshold | **Bar with reference line** or KPI card | A whole chart is overkill for one number — consider a metric card with a sparkline instead. |
+| Multi-dimensional comparison (3–6 axes) | **Radar** | Only when the axes are genuinely commensurate — otherwise a small-multiples bar grid is clearer. |
 
 ### Inline SVG charts (no library)
 
@@ -499,20 +503,25 @@ function showTab(id, btn) {
 
 Persist the active tab with saveState/loadState so it survives reloads.
 
-**Charts in inactive tabs render at 0×0.** Plotly and Chart.js measure their container at initialization time.
+**Charts in inactive tabs render at 0×0.** Plotly, ECharts, and vis-network all measure their container at init time.
 If that container is inside a hidden / display:none panel, they paint into a zero-size canvas and stay blank even after the tab becomes visible.
 Two workarounds, pick one:
 
-1. **Lazy-init**: call `Plotly.newPlot` or `new Chart` only the first time its tab is shown (track a `tabInit[id]` flag in the handler).
+1. **Lazy-init**: only call Plotly.newPlot / echarts.init / new vis.Network the first time its tab is shown (track a tabInit[id] flag in the handler).
 2. **Resize on show**: init everything up front (so data is ready), then in showTab call the right resize hook for whichever lib is in that tab.
    Note the API differs per library — c.resize() does not work for all of them:
 
+   // ECharts: instance.resize()
+   echartsInstance.resize();
    // Plotly: pass the container element, no .resize() on the chart
    Plotly.Plots.resize(document.getElementById('plotly-container'));
+   // vis-network: redraw + fit — the instance has no .resize()
+   networkInstance.redraw();
+   networkInstance.fit();
    // Chart.js: instance.resize() — but Chart.js auto-resizes on
    // container size change so usually nothing needed.
 
-   Inline SVG paints declaratively and does not need a resize hook.
+   Skip the resize call for D3 / Vega-Lite / inline SVG — they paint declaratively into the SVG namespace and aren't bothered by hidden parents.
 
 ### Step-through walkthrough — guided narrative
 A "Next ▶" button advances through a sequence of stages, each with its own caption and (optionally) a different highlighted region of the same diagram.
@@ -682,10 +691,59 @@ Values are JSON-serialized. If localStorage is blocked (private browsing, sandbo
 
 ---
 
-## Library initialization rules
+## CDN libraries
 
-- Do not pass a `library` argument to `visualize()`; it is not part of the Tool API.
-- Include exactly one pinned `<script src="…">` from the canonical examples before the inline consumer script.
-- Do not call `document.createElement("script")`, use dynamic `import()`, or fetch/evaluate another library.
-- Use `Plotly` for Plotly.js or `Chart` for Chart.js after its pinned script tag.
-- Cached data is already parsed. Call `getCachedData()` directly; do not call `JSON.parse` on its return value.
+Strict-mode CSP allowlists three CDN hosts. Anything served from them
+loads — no plugin tweaking needed, even in strict security mode.
+
+Allowed hosts:
+- cdnjs.cloudflare.com — widest coverage
+- cdn.jsdelivr.net — npm / GitHub backed, supports minor-version pinning
+- unpkg.com — npm mirror
+
+Common picks:
+
+| Library | Why reach for it | Example loader |
+|---------|------------------|----------------|
+| **Chart.js** | Bar / line / doughnut / scatter with animation out of the box | <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script> |
+| **D3.js** | Custom data-driven SVG (force graphs, arcs, maps, non-standard charts) | <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script> |
+| **Vega-Lite** | Declarative grammar of graphics — feed it a JSON spec, it draws the chart | <script src="https://cdn.jsdelivr.net/npm/vega@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script> |
+| **ECharts** | Rich interactive dashboards, advanced chart types | <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js"></script> |
+| **Plotly** | Scientific / 3D plots, statistical charts | <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist@2"></script> |
+| **vis-network** | Force-directed network / node-link graphs | <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script> (the **standalone** UMD bundle — exposes vis.Network *and* vis.DataSet. The bare vis-network.min.js on cdnjs is the *peer* build and requires vis-data loaded separately, otherwise new vis.DataSet(...) throws vis is not defined.) |
+| **Tone.js / Wavesurfer** | Audio synthesis, waveform visualisation | <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/15.0.4/Tone.js"></script> |
+
+Anything else on those three CDNs is fair game — apexcharts, d3-force,
+konva, flatpickr, etc. Pick whatever fits the topic.
+
+---
+
+## Library init
+
+Two patterns to follow when using a CDN library:
+
+### 1 · Wrap a Chart.js canvas in a fixed-height container
+
+maintainAspectRatio: false makes Chart.js use the container's height.
+If the canvas has no intrinsic height (e.g. inside a flex column without a height set), it collapses to zero and nothing draws:
+
+<div style="position: relative; height: 260px;">
+  <canvas id="chart"></canvas>
+</div>
+<script>
+  new Chart(document.getElementById('chart').getContext('2d'), {
+    type: 'bar',
+    data: { /* … */ },
+    options: { responsive: true, maintainAspectRatio: false, /* … */ }
+  });
+</script>
+
+### 2 · Source order matters
+
+Put external <script src="…"> tags **before** the inline <script> that
+uses them. They execute in order, so a consumer that runs before its
+library is loaded will fail with Chart is not defined.
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script>/* uses Chart and d3 */</script>
