@@ -14,7 +14,7 @@ you called the view_skill() tool to read the tutorial/handbook about this tool.
 Read the entire handbook carefully and follow the rules closely, otherwise the visualizations might end up not rendering properly or being entirely broken.
 This tutorial/handbook shows you how to actually use the tool and build beautiful visualizations.
 
-1. Call visualize(title="…", library="plotly" | "chartjs") - YOU MUST CALL THE TOOL, otherwise the visualization you output will not be rendered in the chat.
+1. Call visualize(title="…", cache_id="…" if cached data is available) - YOU MUST CALL THE TOOL, otherwise the visualization you output will not be rendered in the chat.
 2. Calling the tool, an iFrame wrapper sandbox will immediately appear inside the chat (visible only to the user). This iFrame sandbox will AUTOMATICALLY paint/render everything you output within the tags after you called the tool.
 3. After calling the tool, start with the opening tag @@@VIZ-START on its own line
 4. Next, after the opening tag, emit the HTML/SVG content (no <!DOCTYPE>, <html>, <head>, <body>)
@@ -49,18 +49,16 @@ As you can see, each query token attends to all key tokens simultaneously.
 ## What's auto-injected
 
 - Theme CSS, SVG classes, color ramps, height reporting, sendPrompt() bridge, and openLink() bridge
-- The selected pinned chart library: `Plotly` or `Chart`. Never emit a `<script src="…">` tag yourself.
-- When `cache_id` is supplied: `getCachedData()` and limited `getCachedMeta()` bridges
+- When `cache_id` is supplied: the `getCachedData()` bridge
 - Pre-styled bare-tag form elements (see below) — saves tokens on simple forms
 - Consider making diagrams **conversational** with sendPrompt() — see the "sendPrompt bridge" section further below for patterns and examples
 
 ## Using `cache_id`
 
-`visualize()` accepts an optional `cache_id`. When one is supplied, read its dataset inside generated JavaScript with `getCachedData()` and its limited metadata with `getCachedMeta()`.
+`visualize()` accepts an optional `cache_id`. When one is supplied, read its dataset inside generated JavaScript with `getCachedData()`.
 
 ```js
 const rows = getCachedData();
-const { cacheId, sourceTool } = getCachedMeta();
 ```
 
 The dataset is already parsed. Do not call `JSON.parse()` on it, reproduce it inside generated HTML, convert it into a JavaScript literal, or pass it to `visualize()` as another argument. This skill does not create or manage cache references; it only explains how `visualize()` consumes an existing `cache_id`.
@@ -314,7 +312,7 @@ the thing itself**, not a labeled diagram about it.
 
 ## Chart libraries: Plotly.js and Chart.js only
 
-The plugin loads the selected library before your generated script runs. Never emit an external script tag and never dynamically load another library.
+The visualizer does not preload a chart library. Include exactly one of the pinned script tags below before your generated inline script. External scripts are executed in source order by the original streaming runtime.
 
 Use Plotly.js for interactive analytical charts, scatter plots, time series, heatmaps, multiple traces, zoom/pan/hover, and relatively large datasets. If both libraries fit an analytical visualization, prefer Plotly.
 
@@ -324,9 +322,10 @@ Do not use D3, ECharts, Vega, Vega-Lite, Highcharts, ApexCharts, Mermaid, Google
 
 ### Canonical Plotly cached-data example
 
-Call `visualize(title="Sales", library="plotly", cache_id="<cache_id>")`, then emit:
+Call `visualize(title="Sales", cache_id="<cache_id>")`, then emit:
 
 <div id="chart"></div>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.3/plotly.min.js"></script>
 <script>
 const rows = getCachedData();
 
@@ -346,11 +345,12 @@ Plotly.newPlot(
 
 ### Canonical Chart.js cached-data example
 
-Call `visualize(title="Sales", library="chartjs", cache_id="<cache_id>")`, then emit:
+Call `visualize(title="Sales", cache_id="<cache_id>")`, then emit:
 
 <div style="position:relative;height:300px">
   <canvas id="chart"></canvas>
 </div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
 const rows = getCachedData();
 
@@ -684,9 +684,8 @@ Values are JSON-serialized. If localStorage is blocked (private browsing, sandbo
 
 ## Library initialization rules
 
-- Select exactly `library="plotly"` or `library="chartjs"` in the tool call.
-- The plugin loads the pinned library before the streamed fragment is finalized and before your inline script executes.
-- Never emit `<script src="…">`, call `document.createElement("script")`, use dynamic `import()`, or fetch/evaluate a library.
-- Use only the global selected by the tool: `Plotly` for Plotly.js or `Chart` for Chart.js.
-- A failed library load is shown by the wrapper. Do not try a fallback library.
+- Do not pass a `library` argument to `visualize()`; it is not part of the Tool API.
+- Include exactly one pinned `<script src="…">` from the canonical examples before the inline consumer script.
+- Do not call `document.createElement("script")`, use dynamic `import()`, or fetch/evaluate another library.
+- Use `Plotly` for Plotly.js or `Chart` for Chart.js after its pinned script tag.
 - Cached data is already parsed. Call `getCachedData()` directly; do not call `JSON.parse` on its return value.

@@ -314,27 +314,12 @@ def test_separate_tools_share_the_same_request_cache():
     assert extract_cached_json(html) == [{"shared": True}]
 
 
-def test_legacy_visualize_and_pinned_libraries():
+def test_legacy_visualize_without_cache():
     tool = iv.Tools()
-    result, plotly_html = capture_visualize(tool, title="Legacy")
+    result, html = capture_visualize(tool, title="Legacy")
     assert "waiting for content" in result
-    assert iv._LIBRARY_URLS["plotly"] in plotly_html
-    assert "data-iv-build=\"2.3.0\"" in plotly_html
-
-    _, chart_html = capture_visualize(tool, title="Chart", library="chartjs")
-    assert iv._LIBRARY_URLS["chartjs"] in chart_html
-    assert iv._LIBRARY_URLS["plotly"] not in chart_html
-
-
-@pytest.mark.parametrize("library", ["d3", "echarts"])
-def test_unsupported_library_is_controlled_error(library):
-    result = run(iv.Tools().visualize(library=library))
-    assert result == {
-        "status": "error",
-        "error": "Unsupported visualization library",
-        "library": library,
-        "supported_libraries": ["chartjs", "plotly"],
-    }
+    assert "data-iv-build=\"2.3.0\"" in html
+    assert "getCachedData" not in html
 
 
 def test_invalid_cache_id_is_controlled_error():
@@ -342,8 +327,6 @@ def test_invalid_cache_id_is_controlled_error():
         iv.Tools().visualize(
             cache_id="missing",
             __request__=DummyRequest(),
-            __user__={"id": "user"},
-            __metadata__={"chat_id": "chat", "session_id": "session"},
         )
     )
     assert result["status"] == "error"
@@ -360,7 +343,7 @@ def test_visualize_injects_only_selected_cache_without_arguments():
     ]
 
     _, html = capture_visualize(
-        iv.Tools(), cache_id="cache-b", __request__=request, library="plotly"
+        iv.Tools(), cache_id="cache-b", __request__=request
     )
 
     assert extract_cached_json(html) == [{"marker": "ONLY_SELECTED_B"}]
@@ -368,7 +351,7 @@ def test_visualize_injects_only_selected_cache_without_arguments():
     assert "DO_NOT_INCLUDE_C" not in html
     assert "SELECT secret" not in html
     assert "getCachedData" in html
-    assert '"sourceTool":"execute_sql"' in html
+    assert "sourceTool" not in html
 
 
 def test_two_cached_datasets_render_independently():
@@ -400,7 +383,7 @@ def test_two_cached_datasets_render_independently():
     ],
 )
 def test_cached_bridge_round_trip_for_supported_result_shapes(payload):
-    bridge, _ = iv._build_cached_data_bridge(cache_entry(result=payload))
+    bridge = iv._build_cached_data_bridge(cache_entry(result=payload))
     assert extract_cached_json(bridge) == payload
 
 
@@ -411,7 +394,7 @@ def test_safe_json_round_trip_blocks_script_breakout_and_preserves_unicode():
         "symbols": "<>&",
         "separators": "before\u2028middle\u2029after",
     }
-    bridge, _ = iv._build_cached_data_bridge(cache_entry(result=payload))
+    bridge = iv._build_cached_data_bridge(cache_entry(result=payload))
 
     assert "</script><script>window.pwned" not in bridge
     assert "\\u003c/script\\u003e" in bridge
@@ -421,82 +404,25 @@ def test_safe_json_round_trip_blocks_script_breakout_and_preserves_unicode():
     assert extract_cached_json(bridge) == payload
 
 
-def test_oversized_dataset_returns_controlled_error_without_embed():
-    request = DummyRequest()
-    request.state.cached_tool_calls = [cache_entry(result="123456")]
-    tool = iv.Tools()
-    tool.valves.max_cached_data_bytes = 4
-
-    result, html = capture_visualize(tool, cache_id="cache-b", __request__=request)
-
-    assert html is None
-    assert result["error"] == "Cached dataset is too large for inline visualization"
-    assert result["size_bytes"] > result["limit_bytes"]
-
-
-def test_process_fallback_is_scoped_by_user_chat_and_session():
-    cache_tool = cache_iv.Tools()
-    visualizer = iv.Tools()
-    first_request = DummyRequest()
-    messages = history(
-        ("call-fallback", "execute_sql", {"sql": "x"}, [{"fallback": True}])
-    )
-    user = {"id": "user"}
-    metadata = {"chat_id": "chat", "session_id": "session"}
-    cached = run(
-        cache_tool.cache_tool_call(
-            "execute_sql",
-            __messages__=messages,
-            __request__=first_request,
-            __user__=user,
-            __metadata__=metadata,
-        )
-    )
-
-    _, html = capture_visualize(
-        visualizer,
-        cache_id=cached["cache_id"],
-        __request__=DummyRequest(app=first_request.app),
-        __user__=user,
-        __metadata__=metadata,
-    )
-    assert extract_cached_json(html) == [{"fallback": True}]
-
-    wrong_scope = run(
-        visualizer.visualize(
-            cache_id=cached["cache_id"],
-            __request__=DummyRequest(app=first_request.app),
-            __user__={"id": "other"},
-            __metadata__=metadata,
-        )
-    )
-    assert wrong_scope["error"] == "Cache entry not found"
-
-
-def test_runtime_order_csp_and_external_script_guards():
+def test_cached_bridge_preserves_original_runtime_and_csp_order():
     entry = cache_entry(result=[{"x": 1}])
-    bridge, _ = iv._build_cached_data_bridge(entry)
+    bridge = iv._build_cached_data_bridge(entry)
     html = iv._build_html(
         security_level="strict",
-        library="chartjs",
         cached_data_bridge=bridge,
     )
 
     assert html.index("function sendPrompt") < html.index('id="iv-cached-data"')
-    assert html.index("getCachedData") < html.index('data-iv-library="chartjs"')
-    assert html.index('data-iv-library="chartjs"') < html.index("var START_MARK")
-    assert iv._LIBRARY_URLS["chartjs"] in html
-    assert iv._LIBRARY_URLS["plotly"] not in html
-    assert "cdnjs.cloudflare.com" not in html
-    assert "unpkg.com" not in html
-    assert "'unsafe-eval'" not in html
+    assert html.index("getCachedData") < html.index("var START_MARK")
+    assert "cdnjs.cloudflare.com" in html
+    assert "cdn.jsdelivr.net" in html
+    assert "unpkg.com" in html
+    assert "'unsafe-eval'" in html
     assert "if (src)" in html
-    assert "_ivIsBlockedScript" in html
-    assert "External scripts are not allowed" in html
+    assert "_ivIsBlockedScript" not in html
+    assert "External scripts are not allowed" not in html
 
 
-def test_offline_uses_fixed_self_hosted_library_path():
-    html = iv._build_html(security_level="offline", library="plotly")
-    assert iv._OFFLINE_LIBRARY_URLS["plotly"] in html
-    assert iv._LIBRARY_URLS["plotly"] not in html
-    assert "script-src 'unsafe-inline' 'self'" in html
+def test_offline_preserves_original_self_hosted_script_policy():
+    html = iv._build_html(security_level="offline")
+    assert "script-src 'unsafe-inline' 'unsafe-eval' 'self'" in html

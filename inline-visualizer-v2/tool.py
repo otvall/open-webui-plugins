@@ -5,12 +5,11 @@ author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
 version: 2.3.0
 required_open_webui_version: 0.10.2
-description: Renders streaming HTML/SVG visualizations with pinned Plotly.js or Chart.js and optional cached native tool data. Requires "iframe Sandbox Allow Same Origin" in Open WebUI Settings -> Interface. For design instructions, call view_skill("visualize").
+description: Renders interactive HTML/SVG visualizations inline in chat with optional cached tool data. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. For design instructions, the model should call view_skill("visualize").
 """
 
 import json
 import re
-import time
 from typing import Any, Literal, Optional
 
 # Build marker embedded into the rendered iframe so the running
@@ -23,82 +22,12 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 
-SUPPORTED_LIBRARIES = {"plotly", "chartjs"}
-_LIBRARY_URLS = {
-    "plotly": "https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.3/plotly.min.js",
-    "chartjs": "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js",
-}
-_OFFLINE_LIBRARY_URLS = {
-    "plotly": "/static/iv-libs/plotly-2.35.3.min.js",
-    "chartjs": "/static/iv-libs/chart-4.4.1.umd.min.js",
-}
-_HTML2CANVAS_URL = (
-    "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"
-)
-
-_APP_CACHE_ATTR = "_inline_visualizer_tool_call_cache_v1"
-_PROCESS_CACHE_TTL_SECONDS = 30 * 60
-
-
-def _validate_library(library: str) -> Optional[dict[str, Any]]:
-    if library in SUPPORTED_LIBRARIES:
-        return None
-    return {
-        "status": "error",
-        "error": "Unsupported visualization library",
-        "library": library,
-        "supported_libraries": sorted(SUPPORTED_LIBRARIES),
-    }
-
-
 def _get_request_cache(__request__) -> Optional[list[dict]]:
     state = getattr(__request__, "state", None) if __request__ is not None else None
     if state is None:
         return None
     cached = getattr(state, "cached_tool_calls", None)
     return cached if isinstance(cached, list) else None
-
-
-def _cache_scope_key(__user__, __metadata__) -> Optional[tuple[str, str, str]]:
-    user = __user__ if isinstance(__user__, dict) else {}
-    metadata = __metadata__ if isinstance(__metadata__, dict) else {}
-    user_id = str(user.get("id") or metadata.get("user_id") or "")
-    chat_id = str(metadata.get("chat_id") or "")
-    session_id = str(metadata.get("session_id") or "")
-    if not (user_id and chat_id and session_id):
-        return None
-    return user_id, chat_id, session_id
-
-
-async def _find_process_cache(
-    __request__, scope: Optional[tuple[str, str, str]], cache_id: str
-) -> Optional[dict[str, Any]]:
-    if scope is None:
-        return None
-    app = getattr(__request__, "app", None) if __request__ is not None else None
-    app_state = getattr(app, "state", None) if app is not None else None
-    cache = getattr(app_state, _APP_CACHE_ATTR, None) if app_state is not None else None
-    if not isinstance(cache, dict):
-        return None
-    lock = cache.get("lock")
-    buckets = cache.get("buckets")
-    if lock is None or buckets is None:
-        return None
-    now = time.monotonic()
-    async with lock:
-        bucket = buckets.get(scope)
-        if bucket is None:
-            return None
-        if now - bucket["updated_at"] > _PROCESS_CACHE_TTL_SECONDS:
-            buckets.pop(scope, None)
-            return None
-        move_to_end = getattr(buckets, "move_to_end", None)
-        if move_to_end is not None:
-            move_to_end(scope)
-        for entry, _ in reversed(bucket["entries"]):
-            if entry.get("cache_id") == cache_id:
-                return entry
-    return None
 
 
 def _find_cached_entry(
@@ -123,28 +52,18 @@ def _safe_json_for_html(value: Any) -> str:
     )
 
 
-def _build_cached_data_bridge(entry: dict[str, Any]) -> tuple[str, int]:
+def _build_cached_data_bridge(entry: dict[str, Any]) -> str:
     data_json = _safe_json_for_html(entry.get("result"))
-    meta_json = _safe_json_for_html(
-        {
-            "cacheId": entry.get("cache_id"),
-            "sourceTool": entry.get("tool_id"),
-        }
-    )
-    bridge = (
+    return (
         '<script id="iv-cached-data" type="application/json">'
         f"{data_json}</script>"
-        '<script id="iv-cached-meta" type="application/json">'
-        f"{meta_json}</script>"
         "<script>(function(){"
         "function read(id){var el=document.getElementById(id);"
         "if(!el)return null;try{return JSON.parse(el.textContent);}catch(e){return null;}}"
-        "var data=read('iv-cached-data');var meta=read('iv-cached-meta');"
+        "var data=read('iv-cached-data');"
         "window.getCachedData=function(){return data;};"
-        "window.getCachedMeta=function(){return meta;};"
         "})();</script>"
     )
-    return bridge, len(data_json.encode("utf-8"))
 
 # ---------------------------------------------------------------------------
 # Injected CSS — Theme variables (light default, dark via data-theme)
@@ -1780,7 +1699,7 @@ function _ivSvgToPng(onFail) {
 
 function _ivHtml2Png() {
   // Screenshot the full visualization via html2canvas.
-  // This fixed utility URL is permitted by the iframe CSP;
+  // The CDN is permitted by the iframe CSP (script-src includes jsdelivr);
   // no data leaves the iframe (connect-src stays 'none').
   var run = function() {
     var dlWrap = document.getElementById('iv-dl-wrap');
@@ -1801,7 +1720,6 @@ function _ivHtml2Png() {
   };
   if (window.html2canvas) { run(); return; }
   var scriptEl = document.createElement('script');
-  scriptEl.setAttribute('data-iv-internal-script', '1');
   scriptEl.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
   scriptEl.onload = run;
   scriptEl.onerror = function() { _ivSvgToPng(); };
@@ -2117,35 +2035,6 @@ STREAMING_OBSERVER_SCRIPT = """
 <script>
 (function() {
   'use strict';
-
-  // Keep generated code from adding external script elements after the
-  // plugin has loaded its selected, pinned chart library.  The reconciler
-  // uses the captured native methods for approved inline scripts.
-  var _ivNativeAppendChild = Node.prototype.appendChild;
-  var _ivNativeInsertBefore = Node.prototype.insertBefore;
-  var _ivNativeReplaceChild = Node.prototype.replaceChild;
-  function _ivIsBlockedScript(node) {
-    return !!(node && node.nodeType === 1 &&
-      String(node.tagName || '').toLowerCase() === 'script' &&
-      node.getAttribute('data-iv-internal-script') !== '1');
-  }
-  function _ivReportBlockedScript() {
-    try { console.warn('Inline Visualizer blocked a generated script element'); } catch(e) {}
-    try { if (typeof toast === 'function') toast('External scripts are not allowed', 'warn'); } catch(e) {}
-  }
-  Node.prototype.appendChild = function(node) {
-    if (_ivIsBlockedScript(node)) { _ivReportBlockedScript(); return node; }
-    return _ivNativeAppendChild.call(this, node);
-  };
-  Node.prototype.insertBefore = function(node, reference) {
-    if (_ivIsBlockedScript(node)) { _ivReportBlockedScript(); return node; }
-    return _ivNativeInsertBefore.call(this, node, reference);
-  };
-  Node.prototype.replaceChild = function(node, oldNode) {
-    if (_ivIsBlockedScript(node)) { _ivReportBlockedScript(); return oldNode; }
-    return _ivNativeReplaceChild.call(this, node, oldNode);
-  };
-
   // Markers must match SKILL.md. Chosen so markdown never treats them
   // as a code fence (would put CodeMirror in the loop).
   var START_MARK = '@@@VIZ-START';
@@ -3117,13 +3006,6 @@ STREAMING_OBSERVER_SCRIPT = """
     var src = incoming.getAttribute && incoming.getAttribute('src');
     var code = incoming.textContent || '';
 
-    // Libraries are loaded by the plugin from pinned URLs.  Never execute
-    // an external script supplied in the streamed model fragment.
-    if (src) {
-      _ivReportBlockedScript();
-      return;
-    }
-
     // Dedupe by src or content hash — reconciler may hit the same
     // script twice across streaming/finalize branches. Re-execution
     // would redeclare consts and double-wire listeners.
@@ -3139,19 +3021,35 @@ STREAMING_OBSERVER_SCRIPT = """
     // script (model wrote invalid JS, attribute name has weird chars,
     // appendChild's synchronous parse throws, etc.) can't kill the
     // chain and stall every script that follows.
-    _ivScriptChain = _ivScriptChain.then(function() {
-      try {
-        var scriptEl = document.createElement('script');
-        attrs.forEach(function(pair) {
-          try { scriptEl.setAttribute(pair[0], pair[1]); } catch(_){}
+    if (src) {
+      _ivScriptChain = _ivScriptChain.then(function() {
+        return new Promise(function(resolve) {
+          try {
+            var scriptEl = document.createElement('script');
+            attrs.forEach(function(pair) {
+              try { scriptEl.setAttribute(pair[0], pair[1]); } catch(_){}
+            });
+            // Tag for HTML export: _ivDownload moves these to end of body
+            // so they execute after the model's canvases / DOM nodes exist.
+            scriptEl.setAttribute('data-iv-imported', '1');
+            scriptEl.onload = scriptEl.onerror = function() { resolve(); };
+            document.head.appendChild(scriptEl);
+          } catch(e) { resolve(); }
         });
-        scriptEl.removeAttribute('src');
-        scriptEl.setAttribute('data-iv-imported', '1');
-        scriptEl.setAttribute('data-iv-internal-script', '1');
-        scriptEl.textContent = code;
-        _ivNativeAppendChild.call(document.head, scriptEl);
-      } catch(e) {}
-    }).catch(function() {});
+      }).catch(function() {});
+    } else {
+      _ivScriptChain = _ivScriptChain.then(function() {
+        try {
+          var scriptEl = document.createElement('script');
+          attrs.forEach(function(pair) {
+            try { scriptEl.setAttribute(pair[0], pair[1]); } catch(_){}
+          });
+          scriptEl.setAttribute('data-iv-imported', '1');
+          scriptEl.textContent = code;
+          document.head.appendChild(scriptEl);
+        } catch(e) {}
+      }).catch(function() {});
+    }
   }
 
   // importNode preserves SVG namespaces. Scripts go through
@@ -3186,8 +3084,8 @@ STREAMING_OBSERVER_SCRIPT = """
     var incomingChildren = incoming.childNodes;
     // Source declares this element as a leaf (no children); any children
     // in the live DOM came from user scripts that target this element by
-    // id (for example Plotly or Chart.js painting into a target div/canvas).
-    // Trimming
+    // id (d3.select(...).append('svg'), new vis.Network(container, ...),
+    // ECharts/Plotly/Vega painting into their target div, etc.). Trimming
     // them would erase the chart, so leave the leaf alone.
     if (incomingChildren.length === 0) return;
     var i;
@@ -3216,8 +3114,8 @@ STREAMING_OBSERVER_SCRIPT = """
       if (existingChild.nodeType === 1) reconcile(existingChild, incomingChild);
     }
     // No outer trim — streaming source is append-only, so existing
-    // children beyond incomingChildren.length are script-added chart output.
-    // Removing them erases the chart
+    // children beyond incomingChildren.length are script-added (D3 SVG, vis-network
+    // canvas/SVG, ECharts canvas, etc.). Removing them erases the chart
     // mid-render even when the script targeted a non-leaf container.
   }
 
@@ -3981,81 +3879,85 @@ DOWNLOAD_BUTTON = (
 
 
 # ---------------------------------------------------------------------------
-# CSP and pinned visualization libraries
+# CSP generation per security level
 # ---------------------------------------------------------------------------
 
+_KNOWN_CDNS = (
+    "https://cdnjs.cloudflare.com" " https://cdn.jsdelivr.net" " https://unpkg.com"
+)
 
-def _library_script_url(security_level: str, library: str) -> str:
-    urls = _OFFLINE_LIBRARY_URLS if security_level == "offline" else _LIBRARY_URLS
-    return urls[library]
+# The strict and balanced tags interpolate the (constant) CDN allowlist, so
+# assemble them once at import instead of rebuilding the string on every render.
+_CSP_STRICT = (
+    '<meta http-equiv="Content-Security-Policy" content="'
+    f"default-src 'self'; "
+    f"script-src 'unsafe-inline' 'unsafe-eval' {_KNOWN_CDNS}; "
+    "style-src 'self' 'unsafe-inline'; "
+    "connect-src 'none'; "
+    "form-action 'none'; "
+    "img-src 'self' data: blob:; "
+    "font-src 'self' data:; "
+    "media-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    '">'
+)
+_CSP_BALANCED = (
+    '<meta http-equiv="Content-Security-Policy" content="'
+    f"default-src 'self'; "
+    f"script-src 'unsafe-inline' 'unsafe-eval' {_KNOWN_CDNS}; "
+    "style-src 'self' 'unsafe-inline'; "
+    "connect-src 'none'; "
+    "form-action 'none'; "
+    "img-src * data: blob:; "
+    "font-src 'self' data:; "
+    "media-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    '">'
+)
 
 
-def _build_csp_tag(level: str, library: str = "plotly") -> str:
-    """Build a CSP that always limits executable external libraries.
+def _build_csp_tag(level: str) -> str:
+    """Return a <meta> CSP tag for the given security level, or empty string.
 
-    The four security levels keep their existing data/image behavior.  Their
-    script policy is deliberately shared: model-generated inline code can run,
-    while external scripts are limited to the selected pinned chart library
-    and the plugin's internal PNG-export helper.
+    'unsafe-eval' is included because runtime expression compilers like
+    Vega / Vega-Lite use new Function() internally and fail under
+    strict CSP. 'unsafe-inline' is already present (inline scripts can
+    execute arbitrary code), so adding 'unsafe-eval' does not
+    meaningfully widen the attack surface — the real exfil blockers
+    (connect-src, form-action, img-src, object-src) remain intact.
     """
-    if level == "offline":
-        script_sources = "'unsafe-inline' 'self'"
-    else:
-        script_sources = (
-            f"'unsafe-inline' {_library_script_url(level, library)} "
-            f"{_HTML2CANVAS_URL}"
-        )
-
     if level == "none":
+        return ""
+
+    if level == "offline":
+        # STRICT minus the public CDN allowlist: nothing loads from
+        # outside the Open WebUI origin. 'self' replaces the CDN hosts
+        # so admins can serve pinned libraries from the instance's own
+        # /static directory (srcdoc iframes inherit the parent page's
+        # origin and base URL, so 'self' == the Open WebUI host and
+        # paths like /static/iv-libs/chart.umd.min.js resolve locally).
         return (
             '<meta http-equiv="Content-Security-Policy" content="'
-            "default-src * data: blob:; "
-            f"script-src {script_sources}; "
-            "style-src * 'unsafe-inline'; "
-            "connect-src *; "
-            "form-action *; "
-            "img-src * data: blob:; "
-            "font-src * data:; "
-            "media-src * data: blob:; "
+            "default-src 'self'; "
+            "script-src 'unsafe-inline' 'unsafe-eval' 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "connect-src 'none'; "
+            "form-action 'none'; "
+            "img-src 'self' data: blob:; "
+            "font-src 'self' data:; "
+            "media-src 'self'; "
             "object-src 'none'; "
             "base-uri 'self'; "
             '">'
         )
 
-    image_sources = "* data: blob:" if level == "balanced" else "'self' data: blob:"
-    return (
-        '<meta http-equiv="Content-Security-Policy" content="'
-        "default-src 'self'; "
-        f"script-src {script_sources}; "
-        "style-src 'self' 'unsafe-inline'; "
-        "connect-src 'none'; "
-        "form-action 'none'; "
-        f"img-src {image_sources}; "
-        "font-src 'self' data:; "
-        "media-src 'self'; "
-        "object-src 'none'; "
-        "base-uri 'self'; "
-        '">'
-    )
+    if level == "strict":
+        return _CSP_STRICT
 
-
-def _build_library_loader(security_level: str, library: str) -> str:
-    src = _library_script_url(security_level, library)
-    global_name = "Plotly" if library == "plotly" else "Chart"
-    return (
-        "<script>(function(){"
-        "window._ivLibraryLoaded=function(name,globalName){"
-        "window._ivSelectedLibrary=name;window._ivLibraryReady=!!window[globalName];"
-        "if(!window._ivLibraryReady&&typeof toast==='function')"
-        "toast('Visualization library did not initialize','error');};"
-        "window._ivLibraryFailed=function(name){window._ivSelectedLibrary=name;"
-        "window._ivLibraryReady=false;window._ivLibraryLoadFailed=true;"
-        "if(typeof toast==='function')toast('Visualization library failed to load','error');};"
-        "})();</script>"
-        f'<script data-iv-internal-script="1" data-iv-library="{library}" '
-        f'src="{src}" onload="_ivLibraryLoaded(\'{library}\',\'{global_name}\')" '
-        f'onerror="_ivLibraryFailed(\'{library}\')"></script>'
-    )
+    # balanced: block outbound connections & forms, allow external images
+    return _CSP_BALANCED
 
 
 def _build_html(
@@ -4063,7 +3965,6 @@ def _build_html(
     title: str = "Visualization",
     lang: str = "en",
     chime: bool = True,
-    library: Literal["plotly", "chartjs"] = "plotly",
     cached_data_bridge: str = "",
 ) -> str:
     """Wrap the streaming visualization shell: empty render area + observer.
@@ -4072,8 +3973,7 @@ def _build_html(
     ``@@@VIZ-END`` plain-text block in the assistant message and renders
     its contents live into #iv-render.
     """
-    csp_tag = _build_csp_tag(security_level, library)
-    library_loader = _build_library_loader(security_level, library)
+    csp_tag = _build_csp_tag(security_level)
     strict_script = (
         STRICT_SECURITY_SCRIPT if security_level in ("strict", "offline") else ""
     )
@@ -4106,7 +4006,6 @@ def _build_html(
         f"{DOWNLOAD_BUTTON}\n"
         f"{body_scripts}"
         f"{cached_data_bridge}"
-        f"{library_loader}"
         f"{STREAMING_OBSERVER_SCRIPT}"
         f"{strict_script}"
     )
@@ -4135,16 +4034,17 @@ def _build_html(
 #              additional hygiene (query-only; does not cover path or
 #              fragment, and does not intercept location.assign/replace).
 #              Script execution within the visualization is intentionally
-#              allowed ('unsafe-inline' + pinned library URL) — this is
-#              required for Plotly, Chart.js, and interactive visualizations.
+#              allowed ('unsafe-inline' + CDN allowlist) — this is
+#              required for Chart.js, D3, and interactive visualizations.
 #
 #   BALANCED — Same as STRICT but allows external image loading (img-src *).
 #              No URL parameter stripping. Note: img-src * permits
 #              tracking pixels — this is an accepted privacy tradeoff
 #              for visualizations that need external images.
 #
-#   NONE     — Outbound data and image requests are allowed, but executable
-#              external scripts remain limited to the pinned libraries.
+#   NONE     — No CSP applied. Visualization can make arbitrary network
+#              requests. Use only for visualizations that fetch live API
+#              data (CORS restrictions still apply).
 #
 #   OFFLINE  — Nothing leaves the Open WebUI host. Same as STRICT but
 #              the public CDN hosts are dropped from script-src and
@@ -4170,26 +4070,22 @@ class Tools:
     Security is controlled via the ``security_level`` valve, which applies
     a Content Security Policy to the rendered iframe.  Defaults to STRICT,
     which blocks outbound network requests (fetch/XHR) and form submissions
-    while allowlisting the selected pinned chart library.  OFFLINE uses
-    fixed self-hosted library paths under the instance's /static directory.
+    while allowlisting three public script CDNs.  OFFLINE additionally
+    drops the CDN allowlist for zero external connections (self-hosted
+    libraries under the instance's /static directory still load).
     Script execution is always permitted — it is required for interactive
-    visualizations, Plotly, and Chart.js.  See the developer reference above
+    visualizations, Chart.js, and D3.  See the developer reference above
     for the full security model and its limitations.
     """
 
     class Valves(BaseModel):
         security_level: Literal["strict", "balanced", "none", "offline"] = Field(
             default="strict",
-            description="Strict (default): blocks outbound fetch/XHR, images, and forms; only the selected pinned chart library may load. Offline: like Strict with fixed self-hosted library paths. Balanced: like Strict but allows external images. None: allows outbound data/images while keeping the script-library restriction.",
+            description="Strict (default): blocks outbound fetch/XHR, images, and forms; scripts always allowed (3 public CDNs allowlisted). Offline: like Strict but with ZERO external connections — even the CDNs are blocked; libraries self-hosted under Open WebUI's /static folder still load (see README). Balanced: like Strict but also allows external images. None: no restrictions.",
         )
         chime: bool = Field(
             default=True,
             description="Play a soft three-note chime when a live-streamed visualization finishes. When off, the chime script is omitted from the iframe entirely (not shipped as a no-op).",
-        )
-        max_cached_data_bytes: int = Field(
-            default=20 * 1024 * 1024,
-            ge=1,
-            description="Maximum UTF-8 byte size of cached JSON injected into one visualization iframe.",
         )
 
     def __init__(self):
@@ -4198,13 +4094,10 @@ class Tools:
     async def visualize(
         self,
         title: str = "Visualization",
-        library: Literal["plotly", "chartjs"] = "plotly",
         cache_id: Optional[str] = None,
         __request__=None,
         __event_call__=None,
         __event_emitter__=None,
-        __user__=None,
-        __metadata__=None,
     ):
         """
         You need to call this tool before EVERY visualization you want to render.
@@ -4216,7 +4109,7 @@ class Tools:
         Do NOT use this tool proactively. Do NOT infer that a visualization would be helpful.
         **If the user did not explicitly ask for a visual artifact, do not call visualize().**
         Never use visualize() for ordinary assistant output.
-        The chat you are responding in has a full Markdown, LaTeX, and KaTeX rendering engine.
+        The chat you are responding in has a full Markdown, LaTeX, KaTeX and Mermaid rendering engine.
         Call visualize() ONLY when the user clearly and UNAMBIGUOUSLY, DIRECTLY, EXPLICITLY asked for a visual artifact (e.g. diagrams, charts, graphs, dashboards, illustrations, interactive explainers, etc.).
 
         IMPORTANT:
@@ -4240,30 +4133,18 @@ class Tools:
         - Do not use ```html, ```svg, ~~~, :::, or any other fenced block.
         - Emit a fragment only: no <!DOCTYPE>, no <html>, no <head>, no <body>.
         - Structure the fragment as: <style> first, visible content next, <script> last.
-        - Never add a <script src> tag. The selected Plotly or Chart.js library is loaded by this tool.
         - When cache_id is supplied, read the dataset with getCachedData(). Never reproduce it as a JavaScript literal.
         - Do not describe the HTML/SVG source to the user. Describe what the visualization shows.
 
         :param title: Short descriptive title for the visualization.
-        :param library: Exactly "plotly" or "chartjs". Defaults to Plotly.
         :param cache_id: Optional reference returned by cache_tool_call().
         :return: Interactive rich embed rendered in the chat, with LLM context.
         """
-        library_error = _validate_library(library)
-        if library_error is not None:
-            return library_error
-
         cached_data_bridge = ""
         cached_entry = None
         if cache_id is not None:
             request_cache = _get_request_cache(__request__)
             cached_entry = _find_cached_entry(request_cache, cache_id)
-            if cached_entry is None:
-                cached_entry = await _find_process_cache(
-                    __request__,
-                    _cache_scope_key(__user__, __metadata__),
-                    cache_id,
-                )
             if cached_entry is None:
                 return {
                     "status": "error",
@@ -4272,23 +4153,13 @@ class Tools:
                     "message": "Cached visualization data is no longer available. Re-run the query.",
                 }
             try:
-                cached_data_bridge, size_bytes = _build_cached_data_bridge(
-                    cached_entry
-                )
+                cached_data_bridge = _build_cached_data_bridge(cached_entry)
             except (TypeError, ValueError, UnicodeError) as exc:
                 return {
                     "status": "error",
                     "error": "Cached dataset cannot be serialized",
                     "cache_id": cache_id,
                     "detail": str(exc),
-                }
-            if size_bytes > self.valves.max_cached_data_bytes:
-                return {
-                    "status": "error",
-                    "error": "Cached dataset is too large for inline visualization",
-                    "cache_id": cache_id,
-                    "size_bytes": size_bytes,
-                    "limit_bytes": self.valves.max_cached_data_bytes,
                 }
 
         # Detect UI language via parent page JS (same pattern as PDF/Gamma actions)
@@ -4327,7 +4198,6 @@ return (() => {
             title,
             lang,
             chime=self.valves.chime,
-            library=library,
             cached_data_bridge=cached_data_bridge,
         )
         response = HTMLResponse(
@@ -4336,14 +4206,13 @@ return (() => {
         )
         cached_context = (
             "The selected cached dataset is available inside the iframe only via "
-            "getCachedData(); limited metadata is available via getCachedMeta(). "
+            "getCachedData(). "
             "Do not reproduce the dataset in the generated HTML or JavaScript. "
             if cached_entry is not None
             else ""
         )
         result_context = (
             f'Visualization wrapper "{title}" is mounted and waiting for content. '
-            f'The pinned {library} library is loaded by the wrapper. '
             f"{cached_context}"
             f"Now emit the HTML/SVG in your NEXT text response wrapped in the "
             f"TEXT delimiters @@@VIZ-START and @@@VIZ-END, each on their own line. "

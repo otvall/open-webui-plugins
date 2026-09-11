@@ -28,14 +28,14 @@ Legend: 🚫 feature not in that version · ⚡ present, v2 expands it · ✅ pr
 | **Pre-styled bare HTML** | 🚫 N/A — model styles every primitive from scratch. | ✅ Drop a vanilla `<button>`, `<input>` (every common type), `<textarea>`, `<select>`, `<label>`, `<fieldset>`, `<table>`, `<details>` / `<summary>`, `<blockquote>`, `<kbd>`, `<hr>`, `<mark>`, `<dl>` (in `data-layout="grid"` and `inline` modes too) and they come out theme-matched. Adding `class` or `style` opts out — model can still go fully custom. **Smaller payloads, faster generation, consistent look across visualizations.** |
 | **Accent palette** | 🚫 N/A | ✅ `data-accent="teal"` (or `coral`, `pink`, `gray`, `blue`, `green`, `amber`, `red`) on any element recolors focus rings, checkboxes, radios, and `var(--accent)` consumers. 9 named values matching the chart ramps. Light/dark handled per-theme. |
 | **Accessibility defaults** | 🚫 N/A | ✅ `aria-invalid="true"` paints a red border on inputs/textareas/selects; `:focus-visible` draws a clear accent outline on keyboard focus only (mouse focus stays subtle). |
-| **Chart libraries** | ⚡ Model-selected CDN libraries | ✅ Exactly two plugin-loaded, pinned choices: **Plotly.js 2.35.3** and **Chart.js 4.4.1**. Generated external script tags are blocked. |
+| **Chart libraries** | ⚡ Model-selected CDN libraries | ✅ The skill uses pinned **Plotly.js 2.35.3** or **Chart.js 4.4.1** script tags; the original streaming runtime loads them in source order. |
 | **Cached tool data** | 🚫 N/A | ✅ `cache_tool_call(tool_id)` stores the latest matching native tool result by `tool_call_id`; `visualize(cache_id=…)` exposes only that dataset through `getCachedData()`. |
 | **Chart-type coverage in skill** | ⚡ Bar / line / doughnut / scatter | ✅ Adds stacked bars/areas, radar, KPI cards with sparklines, progress bars, ranking strips, KPI donuts, custom-shape charts (thermometers, batteries, fuel gauges), plus comparison cards, slider-driven explainers, tabs (with hidden-panel init guidance), step-through walkthroughs. |
 | **Stream-completion feedback** | 🚫 N/A — no stream. | ✅ Localized "Visualization ready" toast in the top-right + an optional soft chime. Fires only when a real stream was seen — reopening a finished chat stays quiet. The chime is off-switchable via the `chime` valve (off → chime code isn't shipped at all). |
 | **i18n surface** | ⚡ 1 string × 47 languages = 47 translations (download tooltip) | ✅ 8 strings × 48 languages = **384 translations** — download tooltip, loader label, "unavailable" notice (title + body), "Copied" toast, "Visualization ready" toast, "Export failed" toast, "Visualization script error" toast. Auto-detected from `<html data-iv-lang>`, `localStorage.locale`, and `navigator.language`. |
 | **Mid-stream reconciler** | 🚫 N/A — the iframe is built once from a complete payload. | ✅ Custom safe-cut HTML parser flushes the longest valid prefix on each chunk. Incremental DOM reconciler only appends new nodes and **leaves script-populated containers alone**, so Plotly/Chart.js output survives the final paint pass. **Existing nodes never re-mount, animations never re-trigger, zero flicker.** |
 | **Per-tick efficiency** | 🚫 N/A | ✅ `msg.textContent` cached between ticks; unchanged → full pipeline (regex extract, DOM walk, reconciler) short-circuits to a string compare. Only one tick per real DOM mutation does real work. |
-| **Script execution** | 🚫 N/A — scripts come baked into the static srcdoc and are parsed by the browser normally. | ✅ The plugin loads the selected pinned library before generated inline scripts. Generated `<script src>` and dynamic external script insertion are rejected. |
+| **Script execution** | 🚫 N/A — scripts come baked into the static srcdoc and are parsed by the browser normally. | ✅ External and inline scripts from the generated fragment are serialized through the original promise chain, preserving source order. |
 | **Script-boundary safety** | 🚫 N/A — the browser parses the srcdoc once, no re-injection. | ✅ Safe-cut parser tracks the tokenizer state across HTML's script-data-escape and double-escape transitions. **Module-load guard** refuses to start the plugin if any embedded script body contains a literal `<!--`, `<script>`, etc. that would silently break the IIFE. |
 | **Tool-result-example bleed** | 🚫 N/A — observer doesn't scan chat DOM. | ✅ TreeWalker excludes `<details type="tool_calls" \| reasoning \| code_execution \| code_interpreter>` when scanning, with a lax fallback that recovers responses from providers that wrap the visible answer inside a reasoning block (Bedrock-hosted Haiku 4.5). |
 | **Bootstrap resilience** | 🚫 N/A | ✅ Initial tick, inner observer, parent observer, and poll timer each independently guarded — any one failure can't leave the iframe silently dormant. Height reporter collapses `100vh` / `100vw` descendants during measurement to break the feedback loop. |
@@ -84,12 +84,12 @@ Auto-detects the user's language from `<html data-iv-lang>` (injected server-sid
 
 ### 🔒 Configurable CSP
 
-| Level | Outbound fetch | External images | External chart scripts | Use case |
+| Level | Outbound fetch | External images | Script CDNs | Use case |
 |---|:-:|:-:|:-:|---|
 | **Offline** | ❌ | ❌ | ❌ self-hosted only | Air-gapped / zero external connections. [Self-hosting tutorial ↓](#-offline-mode--self-hosting-the-cdn-libraries) |
-| **Strict** (default) | ❌ | ❌ | ✅ selected pinned URL | Maximum sandboxing, pinned charts still work. |
-| **Balanced** | ❌ | ✅ | ✅ selected pinned URL | Flags, logos, external image references. |
-| **None** | ✅ | ✅ | ✅ selected pinned URL | Live API data pulls without arbitrary library loading. |
+| **Strict** (default) | ❌ | ❌ | ✅ 3 allowlisted hosts | Maximum sandboxing, CDN charts still work. |
+| **Balanced** | ❌ | ✅ | ✅ 3 allowlisted hosts | Flags, logos, external image references. |
+| **None** | ✅ | ✅ | ✅ any | Live API data pulls from inside the iframe. |
 
 ### 🎉 Done toast + chime
 When a live stream finalizes, a localized "Visualization ready" toast slides in top-right and a soft three-note C-major arpeggio plays on Web Audio sine oscillators. Refreshes of completed messages are silent — the observer only celebrates when it actually witnessed the stream. Mute via `saveState('iv-sound', false)` per viz, or `localStorage['iv-sound-off']='1'` globally.
@@ -97,7 +97,7 @@ When a live stream finalizes, a localized "Visualization ready" toast slides in 
 ### 🧼 Efficient tick loop
 - `msg.textContent` cached between ticks; unchanged → full pipeline short-circuits to a string compare
 - DOM hide walker skips text nodes inside `<details type="tool_calls">` so the skill's own example markers never hijack detection
-- Generated inline scripts are serialized through a promise chain; external generated scripts are rejected because the selected Plotly/Chart.js build is already loaded by the wrapper
+- External and inline generated scripts are serialized through a promise chain, so a library script finishes loading before its consumer script runs
 - `navigator.vibrate` is silently stubbed inside the iframe — models sometimes reach for haptic feedback on click, and Chrome logs an `[Intervention]` line every time without a user gesture; the stub keeps the console clean
 - Safe-cut HTML parser lets the reconciler flush partial markup (`<svg><rect/><g>` renders during stream) without breaking on unclosed tags
 
@@ -113,7 +113,7 @@ Three parts. Install both Tools and the Skill.
 | `cache_tool.py` | Tool | Workspace → Tools (provides `cache_tool_call`) |
 | `SKILL.md` | Skill | Workspace → Knowledge → Create Skill (name it **`visualize`**) |
 
-The **Visualizer Tool** mounts the iframe wrapper, reads cached data, loads the selected pinned chart library, and tails the chat for markers. The separate **Tool Call Cache Tool** captures completed native tool results and returns compact references. The **skill** teaches the model the protocol, cache workflow, design system, and Plotly/Chart.js usage.
+The **Visualizer Tool** mounts the original iframe wrapper, optionally exposes cached data, and tails the chat for markers. The separate **Tool Call Cache Tool** captures completed native tool results and returns compact references. The **skill** teaches the model the protocol, design system, and pinned Plotly/Chart.js script usage.
 
 ---
 
@@ -170,7 +170,7 @@ Steps:
 
 ## 🎯 Usage
 
-Ask for a visualization. The model calls `view_skill("visualize")`, calls `visualize(title=…, library="plotly" | "chartjs")` to mount the wrapper, then streams the HTML/SVG between `@@@VIZ-START` / `@@@VIZ-END` markers.
+Ask for a visualization. The model calls `view_skill("visualize")`, calls `visualize(title=…, cache_id=…)` to mount the wrapper, then streams the HTML/SVG between `@@@VIZ-START` / `@@@VIZ-END` markers.
 
 ### Example prompts
 
@@ -204,7 +204,7 @@ execute_sql(...)
 → wait for its result
 → cache_tool_call(tool_id="execute_sql")
 → {"status":"ok","cache_id":"…","source_tool":"execute_sql"}
-→ visualize(title="Sales", library="plotly", cache_id="…")
+→ visualize(title="Sales", cache_id="…")
 ```
 
 Inside the visualization, the normalized result is available through:
@@ -213,11 +213,11 @@ Inside the visualization, the normalized result is available through:
 const rows = getCachedData();
 ```
 
-`getCachedMeta()` exposes only `cacheId` and `sourceTool`. SQL arguments, other cache entries, and request metadata are not injected. The producer result has already appeared once in the LLM's native tool context before `cache_tool_call()` runs; this feature prevents the dataset from being copied again into the visualization call or generated JavaScript.
+Only the selected result is injected. SQL arguments, other cache entries, and request metadata are not included in the iframe. The producer result has already appeared once in the LLM's native tool context before `cache_tool_call()` runs; this feature prevents the dataset from being copied again into the visualization call or generated JavaScript.
 
 `cache_tool_call()` resolves the current assistant message through the server-provided `chat_id` and `message_id`. It reads the saved message output plus the newer active response stream, then strictly matches `function_call` and `function_call_output` by `call_id`. The reserved `__messages__` argument is retained only as a compatibility fallback for Open WebUI modes that include tool results there.
 
-The primary cache lives in `__request__.state.cached_tool_calls` and is scoped to the active assistant turn. A bounded 30-minute in-process fallback is keyed by user/chat/session. It does not survive process restarts and is not shared across workers. If a reference is unavailable, the tool asks the model to rerun the query.
+The visualizer reads `__request__.state.cached_tool_calls`, so a cache reference is intended for the same sequential assistant tool loop. If a reference is unavailable, the tool asks the model to rerun the query.
 
 ---
 
@@ -336,29 +336,29 @@ Every visualization renders in a sandboxed iframe with a configurable Content Se
 
 | Level | Outbound requests | External images | URL param stripping | Use case |
 |-------|:-:|:-:|:-:|---|
-| **Offline** | ❌ | ❌ | ✅ | Nothing leaves your instance; Plotly/Chart.js load from fixed `/static/iv-libs/` paths. |
-| **Strict** (default) | ❌ | ❌ | ✅ | Pinned Plotly/Chart.js URL only. All core features work normally. |
+| **Offline** | ❌ | ❌ | ✅ | Nothing leaves your instance; library files must be referenced from same-origin paths. |
+| **Strict** (default) | ❌ | ❌ | ✅ | Scripts from cdnjs, jsDelivr, and unpkg are allowed. |
 | **Balanced** | ❌ | ✅ | — | Visualizations displaying external images (flags, logos). |
-| **None** | ✅ | ✅ | — | Live API data is allowed, but arbitrary external script libraries remain blocked. |
+| **None** | ✅ | ✅ | — | No CSP; live API data and external scripts are allowed subject to browser CORS. |
 
 ### What works in Strict mode
 
-The plugin loads exactly one fixed library before generated code runs: Plotly.js 2.35.3 or Chart.js 4.4.1. The CSP contains the exact selected URL rather than a whole CDN hostname, and does not grant `'unsafe-eval'`.
+The skill emits one pinned Plotly.js or Chart.js script tag before generated chart code. The original runtime waits for an external script to load before executing the following inline script. Strict CSP allowlists cdnjs, jsDelivr, and unpkg and includes `'unsafe-eval'` for compatible client libraries.
 
-**What Strict blocks:** runtime `fetch()` calls, external images, form submits, arbitrary library URLs, and generated external script elements. If you need live API data, switch to **None**; the library restriction still applies.
+**What Strict blocks:** runtime `fetch()` calls, external images, form submits, and script hosts outside the three allowlisted CDNs. If you need live API data, switch to **None**.
 
-**What Offline additionally blocks:** every external host. The selected library is loaded automatically from its fixed self-hosted path. Pure inline SVG/HTML remains available.
+**What Offline additionally blocks:** every external host. Pure inline SVG/HTML remains available; library charts require a same-origin script path.
 
 > [!NOTE]
-> Strict allows `'unsafe-inline'` because model-generated visualizations contain inline code. The outbound blockers (`connect-src 'none'`, `form-action 'none'`, restricted `img-src`, `object-src 'none'`) remain in place.
+> Strict allows `'unsafe-inline'` and `'unsafe-eval'` because model-generated visualizations and some client libraries require them. The outbound blockers (`connect-src 'none'`, `form-action 'none'`, restricted `img-src`, `object-src 'none'`) remain in place.
 
-### Why `script-src` allows pinned files but `connect-src` doesn't
+### Why `script-src` allows CDNs but `connect-src` doesn't
 
-Loading a pinned library is a `GET` of one fixed public URL. Allowing arbitrary `fetch()` would let generated code place data in request URLs, so Strict permits the fixed executable asset while denying arbitrary outbound connections.
+Loading a library from an allowlisted CDN is separate from allowing arbitrary `fetch()`. Strict permits scripts from the three known CDN hosts while denying arbitrary outbound connections.
 
 ### Sourcemap warnings in DevTools
 
-When DevTools is open, it may request source maps for Plotly or Chart.js. Strict blocks those via `connect-src 'none'`; these warnings do not affect chart rendering.
+When DevTools is open, it may request source maps for loaded libraries. Strict blocks those via `connect-src 'none'`; these warnings do not affect chart rendering.
 
 > [!WARNING]
 > With `allow-same-origin` enabled (required for streaming), JavaScript in a visualization has reach into the parent Open WebUI page. That is a platform-level permission — the tool cannot narrow it further. The tool's only network traffic of its own is one same-origin GET to your own instance's chats API (retried until the chat is saved): when an inline script in a rendered block fails to parse, it re-reads the raw message text via the parent frame — works at every security level and sends nothing anywhere else. If you need full isolation, disable same-origin: v2 degrades gracefully with a localized "streaming unavailable" notice, and you can fall back to the original inline-visualizer (static mode only) for that workflow.
@@ -368,16 +368,16 @@ When DevTools is open, it may request source maps for Plotly or Chart.js. Strict
 
 ---
 
-## 🔌 Offline mode — self-hosting Plotly and Chart.js
+## 🔌 Offline mode — self-hosting chart libraries
 
-Offline blocks all external hosts. The plugin automatically uses these fixed same-origin paths:
+Offline blocks all external hosts. To use a chart library, serve the pinned files from same-origin paths such as:
 
 - `/static/iv-libs/plotly-2.35.3.min.js`
 - `/static/iv-libs/chart-4.4.1.umd.min.js`
 
-Download the two pinned builds, rename them exactly as above, and mount/copy the directory to `/app/backend/open_webui/static/iv-libs/` in the Open WebUI container. The model and `SKILL.md` do not need different URLs because generated code never supplies library script tags.
+Download the pinned builds, rename them as above, and mount/copy the directory to `/app/backend/open_webui/static/iv-libs/` in the Open WebUI container. In Offline mode the generated fragment must use the corresponding `/static/iv-libs/...` script URL instead of the public CDN URL.
 
-Inline HTML/SVG visualizations still work if the selected local library file is absent, but the wrapper displays a library-load error and chart code using `Plotly` or `Chart` cannot run.
+Inline HTML/SVG visualizations work without these files. Chart code using `Plotly` or `Chart` cannot run until its same-origin script is available.
 
 ---
 
@@ -423,13 +423,13 @@ Chart.js needs `<div style="position: relative; height: Xpx;">` around its canva
 <details>
 <summary><b>I switched to Offline and Plotly / Chart.js stopped loading</b></summary>
 
-Offline requires the exact files `/static/iv-libs/plotly-2.35.3.min.js` and `/static/iv-libs/chart-4.4.1.umd.min.js`. Install them there or use Strict, which loads the same pinned versions from their fixed public URLs.
+Offline requires same-origin library files such as `/static/iv-libs/plotly-2.35.3.min.js` and `/static/iv-libs/chart-4.4.1.umd.min.js`, plus matching script tags in the generated fragment. Otherwise use Strict with the pinned public CDN URLs from `SKILL.md`.
 </details>
 
 <details>
 <summary><b>cache_id is not found</b></summary>
 
-The reference belongs to an earlier request, expired from the bounded fallback, or was created in another worker process. Re-run the data-producing tool and call `cache_tool_call()` again before `visualize()`.
+The reference belongs to another request or is no longer present in the current request state. Re-run the data-producing tool and call `cache_tool_call()` again before `visualize()`.
 </details>
 
 <details>
@@ -485,7 +485,7 @@ On **multi-worker deployments** (`UVICORN_WORKERS > 1`), each worker process has
 └────────────────────────────────────────────────────────────┘
 ```
 
-The observer inside the iframe uses `parent.document` (via `allow-same-origin`) to `getSearchableText(msg)` — a TreeWalker that excludes `<details type="tool_calls">` — runs a regex for the N-th `@@@VIZ-START…@@@VIZ-END` block (N = iframe's embed index), safe-cuts the partial HTML, parses into a detached tree, and reconciles into `#iv-render`. On `@@@VIZ-END` it finalizes: executes generated inline scripts through a promise chain, fires the done toast + chime, and hides the loader. Generated external scripts are rejected; the selected pinned library is loaded by the wrapper before the observer starts.
+The observer inside the iframe uses `parent.document` (via `allow-same-origin`) to `getSearchableText(msg)` — a TreeWalker that excludes `<details type="tool_calls">` — runs a regex for the N-th `@@@VIZ-START…@@@VIZ-END` block (N = iframe's embed index), safe-cuts the partial HTML, parses into a detached tree, and reconciles into `#iv-render`. On `@@@VIZ-END` it finalizes: executes external and inline scripts through the original promise chain, fires the done toast + chime, and hides the loader.
 
 ### Finalize triggers
 
