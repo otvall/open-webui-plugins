@@ -105,15 +105,16 @@ When a live stream finalizes, a localized "Visualization ready" toast slides in 
 
 ## 📦 Components
 
-Three parts. Install both Tools and the Skill.
+Four parts. Install both Tools and both Skills.
 
 | File | Type | Install location |
 |------|------|-----------------|
 | `tool.py` | Tool | Workspace → Tools (provides `visualize`) |
 | `cache_tool.py` | Tool | Workspace → Tools (provides `cache_tool_call`) |
 | `SKILL.md` | Skill | Workspace → Knowledge → Create Skill (name it **`visualize`**) |
+| `tool-call-cache/SKILL.md` | Skill | Workspace → Knowledge → Create Skill (name it **`tool-call-cache`**) |
 
-The **Visualizer Tool** mounts the original iframe wrapper, optionally exposes cached data, and tails the chat for markers. The separate **Tool Call Cache Tool** captures completed native tool results and returns compact references. The **skill** teaches the model the protocol, design system, and pinned Plotly/Chart.js script usage.
+The **Visualizer Tool** mounts the original iframe wrapper, optionally exposes cached data, and tails the chat for markers. The separate **Tool Call Cache Tool** captures completed native tool results and returns compact references. The **visualize skill** teaches the rendering protocol and design system; the **tool-call-cache skill** teaches the sequential producer → cache → consumer workflow.
 
 ---
 
@@ -134,7 +135,7 @@ The **Visualizer Tool** mounts the original iframe wrapper, optionally exposes c
 2. In Open WebUI: **Workspace → Tools → + Create New**
 3. Paste. **Save**.
 
-### 3. Install the skill
+### 3. Install the Visualizer skill
 
 1. Copy the contents of `SKILL.md`
 2. In Open WebUI: **Workspace → Knowledge → Create Skill**
@@ -144,15 +145,22 @@ The **Visualizer Tool** mounts the original iframe wrapper, optionally exposes c
 > [!TIP]
 > Or drag `SKILL.md` straight into the import field on **Workspace → Skills** — Open WebUI reads the YAML frontmatter (`name: visualize`, `description: …`) and pre-fills the create form for you. Just click **Save**.
 
-### 4. Attach to your model
+### 4. Install the Tool Call Cache skill
+
+1. Copy the contents of `tool-call-cache/SKILL.md`
+2. In Open WebUI: **Workspace → Knowledge → Create Skill**
+3. Name it **`Tool Call Cache`**
+4. Paste. **Save**.
+
+### 5. Attach to your model
 
 1. **Admin Panel → Settings → Models** → edit the model you want
 2. Under **Tools**, enable **Inline Visualizer** and **Tool Call Cache for Inline Visualizer**
-3. Under **Skills**, attach **Visualizer**
+3. Under **Skills**, attach **Visualizer** and **Tool Call Cache**
 4. Check **Function Calling** is **not** set to `Legacy` (Advanced Params). `Default` and `Native` both work, and `Default` has been native since Open WebUI `0.10.0`
 5. Save.
 
-### 5. Enable same-origin access — **required**
+### 6. Enable same-origin access — **required**
 
 > [!IMPORTANT]
 > Streaming mode **does not work without this setting.** The observer's entire job is reading the parent chat's DOM to find markers as they stream in — that requires cross-frame access, which the browser blocks unless the iframe is allowed same-origin. With the setting off, every visualization renders a localized "Streaming visualization unavailable" notice instead of content.
