@@ -2,23 +2,14 @@
 title: Tool Call Cache for Inline Visualizer
 author: Classic298
 author_url: https://github.com/Classic298
-version: 2.3.0
+version: 2.3.1
 required_open_webui_version: 0.10.2
 description: Caches the latest completed native tool result and returns a compact cache_id for Inline Visualizer.
 """
 
-import asyncio
 import json
-import time
-from collections import OrderedDict
 from typing import Any, Optional
 from uuid import uuid4
-
-
-_APP_CACHE_ATTR = "_inline_visualizer_tool_call_cache_v1"
-_PROCESS_CACHE_TTL_SECONDS = 30 * 60
-_PROCESS_CACHE_MAX_ENTRIES_PER_SCOPE = 8
-_PROCESS_CACHE_MAX_BYTES = 128 * 1024 * 1024
 
 
 def _normalize_cached_result(result: Any) -> Any:
@@ -213,77 +204,6 @@ def _get_request_cache(__request__, create: bool = False) -> Optional[list[dict]
     return cached if isinstance(cached, list) else None
 
 
-def _cache_scope_key(__user__, __metadata__) -> Optional[tuple[str, str, str]]:
-    user = __user__ if isinstance(__user__, dict) else {}
-    metadata = __metadata__ if isinstance(__metadata__, dict) else {}
-    user_id = str(user.get("id") or metadata.get("user_id") or "")
-    chat_id = str(metadata.get("chat_id") or "")
-    session_id = str(metadata.get("session_id") or "")
-    if not (user_id and chat_id and session_id):
-        return None
-    return user_id, chat_id, session_id
-
-
-def _serialized_size(value: Any) -> int:
-    try:
-        serialized = json.dumps(
-            value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-        )
-    except (TypeError, ValueError):
-        serialized = json.dumps(str(value), ensure_ascii=False)
-    return len(serialized.encode("utf-8"))
-
-
-def _get_app_cache(__request__, create: bool = False) -> Optional[dict[str, Any]]:
-    app = getattr(__request__, "app", None) if __request__ is not None else None
-    app_state = getattr(app, "state", None) if app is not None else None
-    if app_state is None:
-        return None
-    cache = getattr(app_state, _APP_CACHE_ATTR, None)
-    if cache is None and create:
-        cache = {"buckets": OrderedDict(), "lock": asyncio.Lock()}
-        setattr(app_state, _APP_CACHE_ATTR, cache)
-    return cache if isinstance(cache, dict) else None
-
-
-async def _store_process_cache(
-    __request__,
-    scope: Optional[tuple[str, str, str]],
-    entry: dict[str, Any],
-) -> bool:
-    cache = _get_app_cache(__request__, create=True)
-    if scope is None or cache is None:
-        return False
-    now = time.monotonic()
-    entry_size = _serialized_size(entry.get("result"))
-    async with cache["lock"]:
-        buckets = cache["buckets"]
-        expired = [
-            key
-            for key, bucket in buckets.items()
-            if now - bucket["updated_at"] > _PROCESS_CACHE_TTL_SECONDS
-        ]
-        for key in expired:
-            buckets.pop(key, None)
-
-        bucket = buckets.pop(
-            scope, {"updated_at": now, "entries": [], "size_bytes": 0}
-        )
-        bucket["entries"].append((entry, entry_size))
-        bucket["size_bytes"] += entry_size
-        while len(bucket["entries"]) > _PROCESS_CACHE_MAX_ENTRIES_PER_SCOPE:
-            _, removed_size = bucket["entries"].pop(0)
-            bucket["size_bytes"] -= removed_size
-        bucket["updated_at"] = now
-        buckets[scope] = bucket
-
-        total_size = sum(item["size_bytes"] for item in buckets.values())
-        while total_size > _PROCESS_CACHE_MAX_BYTES and buckets:
-            _, removed = buckets.popitem(last=False)
-            total_size -= removed["size_bytes"]
-    return True
-
-
 class Tools:
     """Cache completed native tool results for Inline Visualizer."""
 
@@ -292,7 +212,6 @@ class Tools:
         tool_id: str,
         __messages__=None,
         __request__=None,
-        __user__=None,
         __metadata__=None,
     ):
         """Cache the latest completed invocation of ``tool_id``.
@@ -335,18 +254,13 @@ class Tools:
             "result": call_data["result"],
         }
         request_cache = _get_request_cache(__request__, create=True)
-        if request_cache is not None:
-            request_cache.append(entry)
-
-        fallback_stored = await _store_process_cache(
-            __request__, _cache_scope_key(__user__, __metadata__), entry
-        )
-        if request_cache is None and not fallback_stored:
+        if request_cache is None:
             return {
                 "status": "error",
                 "error": "Cache storage unavailable",
                 "tool_id": tool_id,
             }
+        request_cache.append(entry)
         return {
             "status": "ok",
             "cache_id": entry["cache_id"],

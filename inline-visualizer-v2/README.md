@@ -217,7 +217,7 @@ Only the selected result is injected. SQL arguments, other cache entries, and re
 
 `cache_tool_call()` resolves the current assistant message through the server-provided `chat_id` and `message_id`. It reads the saved message output plus the newer active response stream, then strictly matches `function_call` and `function_call_output` by `call_id`. The reserved `__messages__` argument is retained only as a compatibility fallback for Open WebUI modes that include tool results there.
 
-The visualizer reads `__request__.state.cached_tool_calls`, so a cache reference is intended for the same sequential assistant tool loop. If a reference is unavailable, the tool asks the model to rerun the query.
+The visualizer reads `__request__.state.cached_tool_calls`, so a cache reference is available only within the same sequential assistant tool loop for one user request. There is no process-local cache, TTL, or cross-request fallback. If a reference is unavailable, the tool asks the model to rerun the query.
 
 ---
 

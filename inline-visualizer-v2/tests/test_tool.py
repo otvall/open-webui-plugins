@@ -161,7 +161,6 @@ def test_cache_tool_call_uses_latest_matching_call_and_tool_call_id():
             "execute_sql",
             __messages__=messages,
             __request__=request,
-            __user__={"id": "user"},
             __metadata__={"chat_id": "chat", "session_id": "session"},
         )
     )
@@ -312,6 +311,94 @@ def test_separate_tools_share_the_same_request_cache():
     )
 
     assert extract_cached_json(html) == [{"shared": True}]
+
+
+def test_cache_is_isolated_to_one_request_and_does_not_touch_app_state():
+    first_request = DummyRequest()
+    cached = run(
+        cache_iv.Tools().cache_tool_call(
+            "execute_sql",
+            __messages__=history(
+                ("call-local", "execute_sql", {"sql": "x"}, [{"local": True}])
+            ),
+            __request__=first_request,
+        )
+    )
+
+    assert cached["status"] == "ok"
+    assert vars(first_request.app.state) == {}
+
+    second_request = DummyRequest()
+    result = run(
+        iv.Tools().visualize(
+            cache_id=cached["cache_id"],
+            __request__=second_request,
+        )
+    )
+    assert result["status"] == "error"
+    assert result["error"] == "Cache entry not found"
+
+
+def test_cache_tool_reports_unavailable_request_state():
+    request_without_state = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace())
+    )
+
+    result = run(
+        cache_iv.Tools().cache_tool_call(
+            "execute_sql",
+            __messages__=history(
+                ("call-no-state", "execute_sql", {}, [{"value": 1}])
+            ),
+            __request__=request_without_state,
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "error": "Cache storage unavailable",
+        "tool_id": "execute_sql",
+    }
+
+
+def test_cache_tool_keeps_multiple_entries_in_one_request():
+    request = DummyRequest()
+    tool = cache_iv.Tools()
+
+    first = run(
+        tool.cache_tool_call(
+            "execute_sql",
+            __messages__=history(
+                (
+                    "call-first",
+                    "execute_sql",
+                    {"sql": "first"},
+                    [{"series": "A"}],
+                )
+            ),
+            __request__=request,
+        )
+    )
+    second = run(
+        tool.cache_tool_call(
+            "execute_sql",
+            __messages__=history(
+                (
+                    "call-second",
+                    "execute_sql",
+                    {"sql": "second"},
+                    [{"series": "B"}],
+                )
+            ),
+            __request__=request,
+        )
+    )
+
+    assert first["cache_id"] != second["cache_id"]
+    assert [entry["result"] for entry in request.state.cached_tool_calls] == [
+        [{"series": "A"}],
+        [{"series": "B"}],
+    ]
 
 
 def test_legacy_visualize_without_cache():
