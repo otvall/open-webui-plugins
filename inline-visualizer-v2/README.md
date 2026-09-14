@@ -28,7 +28,6 @@ Legend: 🚫 feature not in that version · ⚡ present, v2 expands it · ✅ pr
 | **Pre-styled bare HTML** | 🚫 N/A — model styles every primitive from scratch. | ✅ Drop a vanilla `<button>`, `<input>` (every common type), `<textarea>`, `<select>`, `<label>`, `<fieldset>`, `<table>`, `<details>` / `<summary>`, `<blockquote>`, `<kbd>`, `<hr>`, `<mark>`, `<dl>` (in `data-layout="grid"` and `inline` modes too) and they come out theme-matched. Adding `class` or `style` opts out — model can still go fully custom. **Smaller payloads, faster generation, consistent look across visualizations.** |
 | **Accent palette** | 🚫 N/A | ✅ `data-accent="teal"` (or `coral`, `pink`, `gray`, `blue`, `green`, `amber`, `red`) on any element recolors focus rings, checkboxes, radios, and `var(--accent)` consumers. 9 named values matching the chart ramps. Light/dark handled per-theme. |
 | **Accessibility defaults** | 🚫 N/A | ✅ `aria-invalid="true"` paints a red border on inputs/textareas/selects; `:focus-visible` draws a clear accent outline on keyboard focus only (mouse focus stays subtle). |
-| **Existing tool results** | 🚫 N/A | ✅ Pass a completed call's exact `tool_call_id` to `visualize()` and consume its result with `getToolData()` without copying the dataset through the model. |
 | **CDN library catalog in skill** | ⚡ Chart.js, D3.js examples | ✅ Chart.js, D3.js, Vega-Lite, **ECharts**, **Plotly**, **vis-network** (standalone bundle), **Tone.js / Wavesurfer** — each with a vetted CDN URL and "when to reach for it" guidance. Allowlisted in strict CSP out of the box. |
 | **Chart-type coverage in skill** | ⚡ Bar / line / doughnut / scatter | ✅ Adds stacked bars/areas, radar, KPI cards with sparklines, progress bars, ranking strips, KPI donuts, custom-shape charts (thermometers, batteries, fuel gauges), plus comparison cards, slider-driven explainers, tabs (with hidden-panel init guidance), step-through walkthroughs. |
 | **Stream-completion feedback** | 🚫 N/A — no stream. | ✅ Localized "Visualization ready" toast in the top-right + an optional soft chime. Fires only when a real stream was seen — reopening a finished chat stays quiet. The chime is off-switchable via the `chime` valve (off → chime code isn't shipped at all). |
@@ -187,28 +186,6 @@ As you can see, each query token attends to all key tokens simultaneously.
 ```
 
 Everything between the markers is hidden from the chat body and piped into the iframe. Prose before and after renders normally.
-
-### Reusing a tool result by ID
-
-When another tool returns the data for a visualization, the model can pass that completed call's exact ID instead of copying the result into a second tool call or into generated JavaScript:
-
-```text
-execute_sql(...)
-→ wait for its result with tool_call_id="call_123"
-→ visualize(title="Sales", tool_call_id="call_123")
-```
-
-Inside the visualization, the selected result is already parsed and available through:
-
-```js
-const rows = getToolData();
-```
-
-The model receives the producer call's correlation ID in the structured tool context. It must copy that value exactly. The ID is provider-defined and should be treated as opaque: values such as `call_abc123`, `search_web:0`, or `function.search_web:0` are all valid when that is the ID actually attached to the completed call. `visualize()` does not construct or translate IDs from a tool name and call count.
-
-The producer and `visualize()` must run in separate, sequential tool rounds. Open WebUI records tool results only after every call in the current batch finishes, so a visualizer called in the same parallel batch cannot see its producer's result.
-
-The visualizer resolves the exact ID from the current assistant message's active response stream, then its saved output, then completed tool results in the current dialogue supplied through `__messages__`. Only the selected textual result is injected: producer arguments, other results, metadata, images, and file attachments are excluded. JSON strings become parsed objects or arrays; non-JSON text remains a string.
 
 ---
 
@@ -477,12 +454,6 @@ Chart.js needs `<div style="position: relative; height: Xpx;">` around its canva
 <summary><b>I switched to Offline and Chart.js / D3 stopped loading</b></summary>
 
 Expected — Offline blocks the CDNs by design. Either self-host the libraries under `/static/iv-libs/` and point `SKILL.md` at them (see [Offline mode](#-offline-mode--self-hosting-the-cdn-libraries)), or stay on **Strict**, which allowlists the three public CDNs while still blocking every data-exfiltration channel.
-</details>
-
-<details>
-<summary><b>tool_call_id is not found</b></summary>
-
-Pass the exact ID of a completed data-producing call, and call `visualize()` only after that result has returned in an earlier tool round. Temporary or compatibility modes that expose neither the active message output nor tool messages cannot resolve the result.
 </details>
 
 <details>

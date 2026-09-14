@@ -1,40 +1,42 @@
 ---
-name: visualize
-description: Render rich interactive visuals — SVG diagrams, HTML widgets, Chart.js charts, and interactive explainers — directly inline in chat using visualize(). Use only when the user explicitly asks for a visualization, diagram, chart, graph, drawing, map, dashboard, or similar visual artifact. Do not use for ordinary markdown, code blocks, file previews, or answer formatting
+name: visualize-tool-result
+description: Render one completed tool call's result as a rich interactive visualization using visualize_tool_result(). Use only when a system or developer instruction explicitly requires a visualization based on another tool's completed result. Use the standard visualize skill for all other visualizations
 ---
 
-# Inline Visualizer
+# Inline Visualizer — Tool Result
 
-This is the handbook/tutorial on how to use the visualizer tool.
-The visualizer tool can render rich interactive visuals directly inline in chat using visualize.
+This handbook explains how to render the result of one completed tool call directly inline in chat using `visualize_tool_result()`.
 
 ## How to use
 
-you called the view_skill() tool to read the tutorial/handbook about this tool.
-Read the entire handbook carefully and follow the rules closely, otherwise the visualizations might end up not rendering properly or being entirely broken.
-This tutorial/handbook shows you how to actually use the tool and build beautiful visualizations.
+Use this skill only when a system or developer instruction explicitly tells you to visualize the result of another tool call. Do not choose this workflow on your own. For ordinary diagrams, explainers, widgets, or visuals that do not reuse a completed tool result, use `visualize()` and the standard `visualize` skill instead.
 
-1. Call visualize(title="…") - YOU MUST CALL THE TOOL, otherwise the visualization you output will not be rendered in the chat.
-2. Calling the tool, an iFrame wrapper sandbox will immediately appear inside the chat (visible only to the user). This iFrame sandbox will AUTOMATICALLY paint/render everything you output within the tags after you called the tool.
-3. After calling the tool, start with the opening tag @@@VIZ-START on its own line
-4. Next, after the opening tag, emit the HTML/SVG content (no <!DOCTYPE>, <html>, <head>, <body>)
-5. Once you are done writing the code for the visualization, immediately close with @@@VIZ-END on its own line
-6. Done! The visualization is complete. Continue with any follow-up text to the user.
+1. Call the data-producing tool.
+2. Wait until that tool call has fully completed.
+3. Identify the completed call containing the required data and read its explicit `tool_call_id` or `call_id` from the structured conversation context.
+4. Copy the complete identifier character-for-character.
+5. In a later sequential tool round, call `visualize_tool_result(title="…", source_tool_call_id="<exact copied ID>")`. YOU MUST CALL THE TOOL, otherwise the visualization will not render.
+6. Wait for `visualize_tool_result()` to complete successfully. It mounts an iframe wrapper sandbox in the chat and injects the selected result as `getToolData()`.
+7. Emit `@@@VIZ-START` on its own line.
+8. Emit exactly one HTML/SVG fragment with `<style>` first, visible content next, and `<script>` last. Access the source result with `getToolData()`.
+9. Emit `@@@VIZ-END` on its own line, then continue with any brief explanation for the user.
 
 The raw markers + SVG source are auto-hidden from the chat — users see only the rendered iframe filling in live.
 
 **Example response structure:**
 
 """
-I'll visualize the attention mechanism for you.
+I'll visualize the completed sales result for you.
 
 @@@VIZ-START
-<svg viewBox="0 0 680 240">
-  <!-- content streams here, renders live -->
-</svg>
+<div id="chart"></div>
+<script>
+  const data = getToolData();
+  // Build the visualization from data.
+</script>
 @@@VIZ-END
 
-As you can see, each query token attends to all key tokens simultaneously.
+The chart shows the main changes in the completed result.
 """
 
 **Streaming rules:**
@@ -49,8 +51,35 @@ As you can see, each query token attends to all key tokens simultaneously.
 ## What's auto-injected
 
 - Theme CSS, SVG classes, color ramps, height reporting, sendPrompt() bridge, and openLink() bridge
+- The `getToolData()` bridge containing only the selected completed call's textual result
 - Pre-styled bare-tag form elements (see below) — saves tokens on simple forms
 - Consider making diagrams **conversational** with sendPrompt() — see the "sendPrompt bridge" section further below for patterns and examples
+
+## Source call ID
+
+`source_tool_call_id` is required. It is the ID of a completed tool call, not the name of the tool.
+
+Treat the identifier as an opaque token. Copy it exactly as it appears on the completed source call. Never construct, infer, normalize, shorten, extend, or repair it. Preserve every prefix, separator, and numeric suffix.
+
+For example, if the completed call explicitly contains `tool_call_id = "functions.get_sales:1"`, pass exactly `source_tool_call_id="functions.get_sales:1"`. Do not pass `get_sales`, `get_sales:1`, `function.get_sales:1`, or `functions.get_sales`.
+
+The example demonstrates exact copying only. It does not define a universal ID format. If no explicit `tool_call_id` or `call_id` is available, do not guess one and do not call `visualize_tool_result()`.
+
+## Result handling
+
+You may inspect the completed producer result to understand its field names, nesting, and value types. Access the actual dataset only through `getToolData()`:
+
+```js
+const data = getToolData();
+```
+
+The value is already parsed when possible: JSON strings become objects, arrays, scalars, or `null`, while ordinary text remains a string. Do not call `JSON.parse()` unless the producer intentionally returned JSON encoded inside another string. Do not reproduce the producer result in the tool arguments, generated HTML, generated JavaScript, or another model-generated JSON object.
+
+Each visualization accepts exactly one `source_tool_call_id`. If the visualization requires several related datasets, have one producer call return them together as a combined result.
+
+Never call the producer and `visualize_tool_result()` in the same parallel batch. The result is unavailable until the producer call has finished and Open WebUI has recorded it.
+
+If `visualize_tool_result()` returns `Invalid source_tool_call_id` or `Tool result not found`, re-read the explicit ID attached to the completed source call and copy it again. Do not attempt to repair the ID, and do not retry a side-effecting producer merely to recover its result.
 
 ### Pre-styled form elements
 

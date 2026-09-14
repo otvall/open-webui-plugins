@@ -1,24 +1,191 @@
 """
-title: Inline Visualizer
+title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 2.2.2
+version: 1.0.0
 required_open_webui_version: 0.10.2
-description: Renders interactive HTML/SVG visualizations inline in chat. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. For design instructions, the model should call view_skill("visualize").
+description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
 
+import json
 import re
-from typing import Literal
+from typing import Any, Literal
 
 # Build marker embedded into the rendered iframe so the running
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "2.2.2"
+_IV_BUILD = "tool-result-1.0.0"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+
+
+def _normalize_tool_result(result: Any) -> Any:
+    if isinstance(result, (list, dict)) or result is None:
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return result
+    return result
+
+
+def _extract_text_content(content: Any) -> Any:
+    """Extract textual result parts and deliberately omit images/files."""
+    if not isinstance(content, list):
+        return content
+
+    text_parts = []
+    for part in content:
+        if isinstance(part, str):
+            text_parts.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") in ("text", "input_text", "output_text"):
+            text = part.get("text", "")
+            text_parts.append(text if isinstance(text, str) else str(text))
+
+    return "".join(text_parts)
+
+
+def _find_output_tool_result(
+    output: list[dict[str, Any]], tool_call_id: str
+) -> tuple[bool, Any]:
+    """Find the newest matching Open WebUI function_call_output item."""
+    for item in reversed(output):
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and str(item.get("call_id") or "") == tool_call_id
+            and item.get("status")
+            not in ("in_progress", "pending", "queued", "requires_approval")
+        ):
+            return True, _normalize_tool_result(
+                _extract_text_content(item.get("output"))
+            )
+    return False, None
+
+
+def _find_message_tool_result(
+    messages: list[dict[str, Any]], tool_call_id: str
+) -> tuple[bool, Any]:
+    """Find the newest matching result anywhere in the current dialogue."""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+
+        # Some Open WebUI versions expose saved Responses API items on the
+        # assistant message instead of converting them to role="tool" messages.
+        output = message.get("output")
+        if isinstance(output, list):
+            found, result = _find_output_tool_result(output, tool_call_id)
+            if found:
+                return True, result
+
+        # Other adapters pass Responses API output items directly.
+        if (
+            message.get("type") == "function_call_output"
+            and str(message.get("call_id") or "") == tool_call_id
+            and message.get("status")
+            not in ("in_progress", "pending", "queued", "requires_approval")
+        ):
+            return True, _normalize_tool_result(
+                _extract_text_content(message.get("output"))
+            )
+
+        if (
+            message.get("role") == "tool"
+            and str(message.get("tool_call_id") or "") == tool_call_id
+        ):
+            return True, _normalize_tool_result(
+                _extract_text_content(message.get("content"))
+            )
+    return False, None
+
+
+async def _load_current_message_outputs(
+    __request__, __metadata__
+) -> list[list[dict[str, Any]]]:
+    """Load live, then stored, output for the current assistant message."""
+    metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+    chat_id = str(metadata.get("chat_id") or "")
+    message_id = str(
+        metadata.get("message_id") or metadata.get("assistant_message_id") or ""
+    )
+    if not (chat_id and message_id):
+        return []
+
+    candidates = []
+    try:
+        from open_webui.tasks import get_response_streams_by_chat_id
+
+        app = getattr(__request__, "app", None) if __request__ is not None else None
+        app_state = getattr(app, "state", None) if app is not None else None
+        redis = getattr(app_state, "redis", None) if app_state is not None else None
+        streams = await get_response_streams_by_chat_id(redis, chat_id)
+        for stream in reversed(streams or []):
+            if (
+                isinstance(stream, dict)
+                and str(stream.get("message_id") or "") == message_id
+                and isinstance(stream.get("output"), list)
+            ):
+                candidates.append(stream["output"])
+    except Exception:
+        pass
+
+    try:
+        from open_webui.models.chats import Chats
+
+        message = await Chats.get_message_by_id_and_message_id(chat_id, message_id)
+        if isinstance(message, dict) and isinstance(message.get("output"), list):
+            candidates.append(message["output"])
+    except Exception:
+        pass
+
+    return candidates
+
+
+async def _resolve_tool_result(
+    tool_call_id: str, __request__, __metadata__, __messages__
+) -> tuple[bool, Any]:
+    for output in await _load_current_message_outputs(__request__, __metadata__):
+        found, result = _find_output_tool_result(output, tool_call_id)
+        if found:
+            return True, result
+
+    messages = __messages__ if isinstance(__messages__, list) else []
+    return _find_message_tool_result(messages, tool_call_id)
+
+
+def _safe_json_for_html(value: Any) -> str:
+    serialized = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    )
+    return (
+        serialized.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _build_tool_data_bridge(result: Any) -> str:
+    data_json = _safe_json_for_html(result)
+    return (
+        '<script id="iv-tool-data" type="application/json">'
+        f"{data_json}</script>"
+        "<script>(function(){"
+        "function read(id){var el=document.getElementById(id);"
+        "if(!el)return null;try{return JSON.parse(el.textContent);}catch(e){return null;}}"
+        "var data=read('iv-tool-data');"
+        "window.getToolData=function(){return data;};"
+        "})();</script>"
+    )
 
 # ---------------------------------------------------------------------------
 # Injected CSS — Theme variables (light default, dark via data-theme)
@@ -3920,6 +4087,7 @@ def _build_html(
     title: str = "Visualization",
     lang: str = "en",
     chime: bool = True,
+    tool_data_bridge: str = "",
 ) -> str:
     """Wrap the streaming visualization shell: empty render area + observer.
 
@@ -3959,6 +4127,7 @@ def _build_html(
         "</div>\n"
         f"{DOWNLOAD_BUTTON}\n"
         f"{body_scripts}"
+        f"{tool_data_bridge}"
         f"{STREAMING_OBSERVER_SCRIPT}"
         f"{strict_script}"
     )
@@ -4044,30 +4213,30 @@ class Tools:
     def __init__(self):
         self.valves = self.Valves()
 
-    async def visualize(
+    async def visualize_tool_result(
         self,
-        title: str = "Visualization",
+        source_tool_call_id: str,
+        title: str = "Tool Result Visualization",
+        __messages__=None,
+        __request__=None,
+        __metadata__=None,
         __event_call__=None,
         __event_emitter__=None,
     ):
         """
-        You need to call this tool before EVERY visualization you want to render.
-        What this tool does: visualize() mounts an iframe sandbox directly in the chat.
+        Visualize the result of exactly one completed tool call.
+        What this tool does: visualize_tool_result() resolves the selected source result and mounts an iframe sandbox directly in the chat.
         After this tool is called, the assistant must stream exactly one HTML/SVG visualization fragment between the plain-text delimiters @@@VIZ-START and @@@VIZ-END.
         The sandbox renders that fragment live for the user.
 
-        Use this tool ONLY for EXPLICIT visualization requests.
-        Do NOT use this tool proactively. Do NOT infer that a visualization would be helpful.
-        **If the user did not explicitly ask for a visual artifact, do not call visualize().**
-        Never use visualize() for ordinary assistant output.
-        The chat you are responding in has a full Markdown, LaTeX, KaTeX and Mermaid rendering engine.
-        Call visualize() ONLY when the user clearly and UNAMBIGUOUSLY, DIRECTLY, EXPLICITLY asked for a visual artifact (e.g. diagrams, charts, graphs, dashboards, illustrations, interactive explainers, etc.).
+        Use this tool only when a system or developer instruction explicitly requires a visualization based on the result of another tool call.
+        Never use it for an ordinary visualization; use visualize() for that workflow.
+        The data-producing call MUST finish before this tool is called. Never place the producer and visualize_tool_result() in the same parallel tool batch.
+        Copy source_tool_call_id character-for-character from the completed source call's explicit tool_call_id or call_id. It is a call ID, not a tool name. Never construct, shorten, normalize, or repair it.
 
         IMPORTANT:
-        BEFORE CALLING THIS TOOL, YOU MUST: Call view_skill("visualize") FIRST.
-        You MUST call view_skill("visualize") first.
-        The visualize skill contains a mandatory handbook/tutorial with important rules for rendering, layout, SVG setup, chart patterns, colors, interactivity, and common failure points.
-        Never generate a visualization without reading the skill first.
+        BEFORE CALLING THIS TOOL, YOU MUST call view_skill("visualize-tool-result") first.
+        Never generate a tool-result visualization without reading that skill first.
 
         After calling this tool:
         In the assistant message that follows, emit exactly one visualization block:
@@ -4084,11 +4253,43 @@ class Tools:
         - Do not use ```html, ```svg, ~~~, :::, or any other fenced block.
         - Emit a fragment only: no <!DOCTYPE>, no <html>, no <head>, no <body>.
         - Structure the fragment as: <style> first, visible content next, <script> last.
+        - Read the selected result with getToolData(). Never reproduce it as a JavaScript literal.
         - Do not describe the HTML/SVG source to the user. Describe what the visualization shows.
 
+        :param source_tool_call_id: Required complete tool_call_id/call_id copied character-for-character from the completed source tool call. Preserve every prefix, separator, and numeric suffix. This is a call ID, not a tool name; never construct or modify it.
         :param title: Short descriptive title for the visualization.
         :return: Interactive rich embed rendered in the chat, with LLM context.
         """
+        if not isinstance(source_tool_call_id, str) or not source_tool_call_id.strip():
+            return {
+                "status": "error",
+                "error": "Invalid source_tool_call_id",
+                "source_tool_call_id": source_tool_call_id,
+                "message": "Copy the complete call_id from the completed source tool call.",
+            }
+
+        has_tool_data, tool_result = await _resolve_tool_result(
+            source_tool_call_id, __request__, __metadata__, __messages__
+        )
+
+        if not has_tool_data:
+            return {
+                "status": "error",
+                "error": "Tool result not found",
+                "source_tool_call_id": source_tool_call_id,
+                "message": "No completed tool result with this exact ID is available in the current conversation. Run the data-producing tool first, then call visualize_tool_result in a later tool round.",
+            }
+
+        try:
+            tool_data_bridge = _build_tool_data_bridge(tool_result)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            return {
+                "status": "error",
+                "error": "Tool result cannot be serialized",
+                "source_tool_call_id": source_tool_call_id,
+                "detail": str(exc),
+            }
+
         # Detect UI language via parent page JS (same pattern as PDF/Gamma actions)
         lang = "en"
         if __event_call__:
@@ -4125,6 +4326,7 @@ return (() => {
             title,
             lang,
             chime=self.valves.chime,
+            tool_data_bridge=tool_data_bridge,
         )
         response = HTMLResponse(
             content=html,
@@ -4132,6 +4334,8 @@ return (() => {
         )
         result_context = (
             f'Visualization wrapper "{title}" is mounted and waiting for content. '
+            f"The selected tool result is available inside the iframe only via "
+            f"getToolData(). Do not reproduce it in the generated HTML or JavaScript. "
             f"Now emit the HTML/SVG in your NEXT text response wrapped in the "
             f"TEXT delimiters @@@VIZ-START and @@@VIZ-END, each on their own line. "
             f"The wrapper will tail your stream and render live. These are PLAIN "
