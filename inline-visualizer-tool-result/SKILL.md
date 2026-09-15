@@ -53,6 +53,8 @@ The chart shows the main changes in the completed result.
 
 - Theme CSS, SVG classes, color ramps, height reporting, sendPrompt() bridge, and openLink() bridge
 - The `getToolData()` bridge containing only the selected completed call's textual result
+- `ivPointBudget()` and `ivDownsample()` for density-limited line and scatter rendering
+- Automatic suspension of older completed visualizations; static previews can be reactivated by the user
 - Pre-styled bare-tag form elements (see below) — saves tokens on simple forms
 - Consider making diagrams **conversational** with sendPrompt() — see the "sendPrompt bridge" section further below for patterns and examples
 
@@ -81,6 +83,47 @@ Each visualization accepts exactly one `source_tool_call_id`. If the visualizati
 Never call the producer and `visualize_tool_result()` in the same parallel batch. The result is unavailable until the producer call has finished and Open WebUI has recorded it. If the provider batches them despite this rule, follow the returned `retry.arguments` in the next round.
 
 `retry_required` is a bounded visualization retry, not a request for fresh data. Call only `visualize_tool_result()` with the supplied arguments. If that retry returns `Tool result not found`, stop visualization recovery and report that the existing result could not be resolved. For `Invalid source_tool_call_id`, re-read the explicit ID attached to the completed source call; never construct or repair it.
+
+## Dense line and scatter data
+
+`getToolData()` always returns the full source result. Use the full value for totals, averages, thresholds, annotations, and every other calculation. For each line or scatter series whose length exceeds its display budget, you MUST pass a separate display array through `ivDownsample()` before giving it to Chart.js, Plotly, ECharts, D3, or an SVG path generator.
+
+The default budget is one displayed point per CSS pixel across the chart. Multiple visible series share it. `ivDownsample()` does not mutate its input, uses LTTB for `mode: 'line'`, and uses spatial binning for `mode: 'scatter'`.
+
+Single series:
+
+```js
+const rows = getToolData();
+const chartEl = document.getElementById('chart');
+const displayRows = ivDownsample(rows, {
+  container: chartEl,
+  x: 'date',
+  y: 'value',
+  mode: 'line',
+  seriesCount: 1
+});
+// Calculate summaries from rows; draw only displayRows.
+```
+
+Multiple series:
+
+```js
+const payload = getToolData();
+const chartEl = document.getElementById('chart');
+const seriesCount = payload.series.length;
+const displaySeries = payload.series.map(series => ({
+  ...series,
+  points: ivDownsample(series.points, {
+    container: chartEl,
+    x: 'date',
+    y: 'value',
+    mode: 'line',
+    seriesCount
+  })
+}));
+```
+
+`x` and `y` may be an object field name, an array index, or an accessor function. Sort time-series points by x before downsampling. If `ivPointBudget(chartEl, seriesCount)` is greater than or equal to the series length, using `ivDownsample()` is harmless and returns a shallow copy. Do not downsample categorical bars, tables, KPI calculations, or source data merely because they contain many rows.
 
 ### Pre-styled form elements
 

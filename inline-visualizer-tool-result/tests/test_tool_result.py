@@ -3,12 +3,14 @@ import importlib.util
 import inspect
 import json
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
-
+from pydantic import ValidationError
 
 MODULE_PATH = Path(__file__).parents[1] / "tool.py"
 SPEC = importlib.util.spec_from_file_location(
@@ -334,7 +336,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.0.1' in response.body
+    assert b'tool-result-1.1.0' in response.body
 
 
 def test_visualize_injects_only_the_selected_result():
@@ -552,3 +554,167 @@ def test_tool_data_bridge_preserves_original_runtime_and_csp_order():
 def test_offline_preserves_original_self_hosted_script_policy():
     html = iv._build_html(security_level="offline")
     assert "script-src 'unsafe-inline' 'unsafe-eval' 'self'" in html
+
+
+def _run_downsampling_js(assertion_source, point_density=1):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for executable browser-helper tests")
+    match = re.fullmatch(
+        r"\s*<script>\s*(.*?)\s*</script>\s*",
+        iv.DOWNSAMPLING_SCRIPT,
+        re.DOTALL,
+    )
+    assert match is not None
+    source = (
+        f"global.window={{__ivRuntimeConfig:{{pointDensity:{point_density}}}}};"
+        "global.document={documentElement:{clientWidth:200},"
+        "querySelector:function(){return null;}};"
+        + match.group(1)
+        + assertion_source
+    )
+    completed = subprocess.run(
+        [node],
+        input=source,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout.strip().splitlines()[-1])
+
+
+def test_runtime_config_and_valve_defaults_are_injected():
+    valves = iv.Tools.Valves()
+    assert valves.max_active_visualizations == 2
+    assert valves.point_density == 1.0
+
+    html = iv._build_html(
+        max_active_visualizations=4,
+        point_density=1.5,
+    )
+    config_match = re.search(
+        r'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    assert config_match is not None
+    assert json.loads(config_match.group(1)) == {
+        "build": "tool-result-1.1.0",
+        "lifecycleVersion": 1,
+        "maxActiveVisualizations": 4,
+        "pointDensity": 1.5,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_active_visualizations", -1),
+        ("max_active_visualizations", 11),
+        ("point_density", -0.1),
+        ("point_density", 4.1),
+    ],
+)
+def test_optimization_valves_are_bounded(field, value):
+    with pytest.raises(ValidationError):
+        iv.Tools.Valves(**{field: value})
+
+
+def test_line_downsampling_obeys_css_pixel_budget_and_keeps_peak():
+    result = _run_downsampling_js(
+        """
+const points=Array.from({length:2000},(_,i)=>[i,i===1000?10000:Math.sin(i)]);
+const before=JSON.stringify(points);
+const output=window.ivDownsample(points,{container:200,x:0,y:1,mode:'line'});
+console.log(JSON.stringify({
+  budget:window.ivPointBudget(200,1), length:output.length,
+  first:output[0][0], last:output[output.length-1][0],
+  peak:output.some((point)=>point[1]===10000), unchanged:before===JSON.stringify(points)
+}));
+"""
+    )
+    assert result == {
+        "budget": 200,
+        "length": 200,
+        "first": 0,
+        "last": 1999,
+        "peak": True,
+        "unchanged": True,
+    }
+
+
+def test_scatter_downsampling_and_multi_series_share_budget():
+    result = _run_downsampling_js(
+        """
+const points=Array.from({length:2000},(_,i)=>({x:i%100,y:Math.floor(i/100)}));
+const output=window.ivDownsample(points,{
+  container:200,x:'x',y:'y',mode:'scatter',seriesCount:2
+});
+console.log(JSON.stringify({
+  budget:window.ivPointBudget(200,2), length:output.length
+}));
+"""
+    )
+    assert result["budget"] == 100
+    assert result["length"] <= result["budget"]
+
+
+def test_invalid_coordinates_use_endpoint_preserving_fallback():
+    result = _run_downsampling_js(
+        """
+const points=Array.from({length:2000},(_,i)=>({label:'p'+i,value:i}));
+const output=window.ivDownsample(points,{container:200,x:'missing',y:'value'});
+console.log(JSON.stringify({
+  length:output.length, first:output[0].label, last:output[output.length-1].label
+}));
+"""
+    )
+    assert result == {"length": 200, "first": "p0", "last": "p1999"}
+
+
+def test_zero_density_disables_downsampling():
+    result = _run_downsampling_js(
+        """
+const points=Array.from({length:2000},(_,i)=>[i,i]);
+const output=window.ivDownsample(points,{container:200,x:0,y:1});
+console.log(JSON.stringify({length:output.length}));
+""",
+        point_density=0,
+    )
+    assert result["length"] == 2000
+
+
+def test_lifecycle_static_shell_excludes_live_payloads_and_libraries():
+    source = iv.LIFECYCLE_BOOTSTRAP_SCRIPT
+    assert "data-iv-static" in source
+    assert "Restore interactivity" in source
+    assert "iv-tool-data" not in source
+    assert "getToolData" not in source
+    assert "cdnjs.cloudflare.com" not in source
+    assert "Chart.js" not in source
+
+
+def test_all_iframe_scripts_keep_the_srcdoc_safety_invariant():
+    for name, source in iv._IFRAME_EMBEDDED_SCRIPTS.items():
+        iv._assert_srcdoc_safe(name, source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [iv.DOWNSAMPLING_SCRIPT, iv.LIFECYCLE_BOOTSTRAP_SCRIPT],
+)
+def test_new_browser_scripts_parse_after_python_string_decoding(source):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for executable browser-helper tests")
+    match = re.fullmatch(r"\s*<script>\s*(.*?)\s*</script>\s*", source, re.DOTALL)
+    assert match is not None
+    completed = subprocess.run(
+        [node],
+        input=f"new Function({json.dumps(match.group(1))});",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr

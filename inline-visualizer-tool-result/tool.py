@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.0.1
+version: 1.1.0
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -16,7 +16,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.0.1"
+_IV_BUILD = "tool-result-1.1.0"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -186,6 +186,490 @@ def _build_tool_data_bridge(result: Any) -> str:
         "window.getToolData=function(){return data;};"
         "})();</script>"
     )
+
+
+def _build_runtime_config(
+    max_active_visualizations: int = 2,
+    point_density: float = 1.0,
+) -> str:
+    """Serialize bounded browser-runtime settings into inert JSON."""
+    config = {
+        "build": _IV_BUILD,
+        "lifecycleVersion": 1,
+        "maxActiveVisualizations": max_active_visualizations,
+        "pointDensity": point_density,
+    }
+    return (
+        '<script id="iv-runtime-config" type="application/json">'
+        f"{_safe_json_for_html(config)}</script>"
+        "<script>(function(){"
+        "var el=document.getElementById('iv-runtime-config');"
+        "var cfg={};try{cfg=JSON.parse(el.textContent)||{};}catch(e){}"
+        "window.__ivRuntimeConfig=cfg;"
+        "})();</script>"
+    )
+
+
+DOWNSAMPLING_SCRIPT = """
+<script>
+(function() {
+  'use strict';
+  var cfg = window.__ivRuntimeConfig || {};
+  var density = Number(cfg.pointDensity);
+  if (!isFinite(density) || density < 0) density = 1;
+
+  function resolveElement(target) {
+    if (target && target.nodeType === 1) return target;
+    if (typeof target === 'string') {
+      try { return document.querySelector(target); } catch(e) { return null; }
+    }
+    return null;
+  }
+
+  function renderedSize(target) {
+    if (typeof target === 'number' && isFinite(target) && target > 0) {
+      return { width: target, height: Math.max(1, target * 0.6) };
+    }
+    var el = resolveElement(target);
+    var rect = null;
+    try { rect = el && el.getBoundingClientRect(); } catch(e) {}
+    var width = rect && rect.width;
+    var height = rect && rect.height;
+    if (!(width > 0)) width = document.documentElement.clientWidth || 680;
+    if (!(height > 0)) height = Math.max(1, width * 0.6);
+    return { width: width, height: height };
+  }
+
+  window.ivPointBudget = function(target, seriesCount) {
+    if (!(density > 0)) return Number.MAX_SAFE_INTEGER || 9007199254740991;
+    var count = Number(seriesCount);
+    if (!isFinite(count) || count < 1) count = 1;
+    var width = renderedSize(target).width;
+    return Math.max(3, Math.ceil(width * density / Math.ceil(count)));
+  };
+
+  function accessor(spec, fallbackIndex) {
+    if (typeof spec === 'function') return spec;
+    if (typeof spec === 'string' || typeof spec === 'number') {
+      return function(point) { return point == null ? undefined : point[spec]; };
+    }
+    return function(point) {
+      if (Array.isArray(point)) return point[fallbackIndex];
+      if (point && typeof point === 'object') {
+        return point[fallbackIndex === 0 ? 'x' : 'y'];
+      }
+      return undefined;
+    };
+  }
+
+  function numeric(value, allowDate) {
+    if (typeof value === 'number') return isFinite(value) ? value : NaN;
+    if (value instanceof Date) return value.getTime();
+    if (value !== null && value !== '' && isFinite(Number(value))) return Number(value);
+    if (allowDate && typeof value === 'string') {
+      var parsed = Date.parse(value);
+      if (isFinite(parsed)) return parsed;
+    }
+    return NaN;
+  }
+
+  function evenSample(points, target) {
+    var length = points.length;
+    if (target >= length) return points.slice();
+    if (target <= 1) return length ? [points[0]] : [];
+    var result = new Array(target);
+    result[0] = points[0];
+    result[target - 1] = points[length - 1];
+    for (var i = 1; i < target - 1; i++) {
+      result[i] = points[Math.round(i * (length - 1) / (target - 1))];
+    }
+    return result;
+  }
+
+  function coordinates(points, xSpec, ySpec) {
+    var getX = accessor(xSpec, 0);
+    var getY = accessor(ySpec, 1);
+    var coords = new Array(points.length);
+    for (var i = 0; i < points.length; i++) {
+      var x;
+      var y;
+      try {
+        x = numeric(getX(points[i], i, points), true);
+        y = numeric(getY(points[i], i, points), false);
+      } catch(e) { return null; }
+      if (!isFinite(x) || !isFinite(y)) return null;
+      coords[i] = { x: x, y: y };
+    }
+    return coords;
+  }
+
+  function lttb(points, coords, target) {
+    var length = points.length;
+    if (target >= length || target === 0) return points.slice();
+    if (target < 3) return evenSample(points, target);
+    var sampled = [points[0]];
+    var every = (length - 2) / (target - 2);
+    var a = 0;
+    for (var i = 0; i < target - 2; i++) {
+      var avgStart = Math.floor((i + 1) * every) + 1;
+      var avgEnd = Math.min(Math.floor((i + 2) * every) + 1, length);
+      if (avgStart >= length) avgStart = length - 1;
+      if (avgEnd <= avgStart) avgEnd = Math.min(length, avgStart + 1);
+      var avgX = 0;
+      var avgY = 0;
+      var avgCount = avgEnd - avgStart;
+      for (var avgIndex = avgStart; avgIndex < avgEnd; avgIndex++) {
+        avgX += coords[avgIndex].x;
+        avgY += coords[avgIndex].y;
+      }
+      avgX /= avgCount || 1;
+      avgY /= avgCount || 1;
+
+      var rangeStart = Math.floor(i * every) + 1;
+      var rangeEnd = Math.min(Math.floor((i + 1) * every) + 1, length - 1);
+      if (rangeEnd <= rangeStart) rangeEnd = Math.min(length - 1, rangeStart + 1);
+      var pointA = coords[a];
+      var maxArea = -1;
+      var nextA = rangeStart;
+      for (var rangeIndex = rangeStart; rangeIndex < rangeEnd; rangeIndex++) {
+        var point = coords[rangeIndex];
+        var area = Math.abs(
+          (pointA.x - avgX) * (point.y - pointA.y) -
+          (pointA.x - point.x) * (avgY - pointA.y)
+        );
+        if (area > maxArea) {
+          maxArea = area;
+          nextA = rangeIndex;
+        }
+      }
+      sampled.push(points[nextA]);
+      a = nextA;
+    }
+    sampled.push(points[length - 1]);
+    return sampled;
+  }
+
+  function scatterGrid(points, coords, target, size) {
+    if (target >= points.length) return points.slice();
+    var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (var i = 0; i < coords.length; i++) {
+      minX = Math.min(minX, coords[i].x); maxX = Math.max(maxX, coords[i].x);
+      minY = Math.min(minY, coords[i].y); maxY = Math.max(maxY, coords[i].y);
+    }
+    if (!(maxX > minX) || !(maxY > minY)) return evenSample(points, target);
+    var aspect = Math.max(0.1, Math.min(10, size.width / size.height));
+    var cols = Math.max(1, Math.floor(Math.sqrt(target * aspect)));
+    var rows = Math.max(1, Math.floor(target / cols));
+    while (cols * rows > target && rows > 1) rows--;
+    var selected = [];
+    var cells = Object.create(null);
+    for (var index = 0; index < coords.length; index++) {
+      var col = Math.min(cols - 1, Math.floor((coords[index].x - minX) / (maxX - minX) * cols));
+      var row = Math.min(rows - 1, Math.floor((coords[index].y - minY) / (maxY - minY) * rows));
+      var key = col + ':' + row;
+      if (!cells[key]) {
+        cells[key] = true;
+        selected.push(points[index]);
+      }
+    }
+    return selected.length > target ? evenSample(selected, target) : selected;
+  }
+
+  window.ivDownsample = function(points, options) {
+    if (!Array.isArray(points)) return [];
+    var opts = options || {};
+    var size = renderedSize(opts.container);
+    var target = window.ivPointBudget(size.width, opts.seriesCount || 1);
+    if (!(density > 0) || target >= points.length) return points.slice();
+    var coords = coordinates(points, opts.x, opts.y);
+    if (!coords) return evenSample(points, target);
+    return opts.mode === 'scatter'
+      ? scatterGrid(points, coords, target, size)
+      : lttb(points, coords, target);
+  };
+})();
+</script>
+"""
+
+
+LIFECYCLE_BOOTSTRAP_SCRIPT = """
+<script>
+(function() {
+  'use strict';
+
+  function installLifecycleManager() {
+    if (window.__ivLifecycleV1) return;
+    var records = new WeakMap();
+    var frames = new Set();
+    var sequence = 0;
+    var maxActive = 2;
+    var enforcing = false;
+    var observerRaf = 0;
+    var pendingMutationRecords = [];
+
+    function boundedMax(value) {
+      var parsed = Math.floor(Number(value));
+      if (!isFinite(parsed)) return 2;
+      return Math.max(0, Math.min(10, parsed));
+    }
+
+    function setState(frame, record, state) {
+      record.state = state;
+      try {
+        frame.setAttribute('data-iv-lifecycle-version', '1');
+        frame.setAttribute('data-iv-state', state);
+      } catch(e) {}
+    }
+
+    function recordFor(frame, config) {
+      var record = records.get(frame);
+      if (!record) {
+        record = {
+          state: 'streaming',
+          originalSrcdoc: frame.getAttribute('srcdoc') || '',
+          title: 'Visualization',
+          height: 0,
+          lastActive: ++sequence,
+          config: config || {},
+          snapshot: null
+        };
+        records.set(frame, record);
+        frames.add(frame);
+      }
+      if (config) record.config = config;
+      return record;
+    }
+
+    function htmlEscape(value) {
+      return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function staticDocument(record, snapshot) {
+      var title = htmlEscape(record.title || 'Visualization');
+      var image = snapshot && snapshot.url ? htmlEscape(snapshot.url) : '';
+      var imageMarkup = image
+        ? '<img id="iv-static-image" src="' + image + '" alt="' + title + '">'
+        : '<div class="iv-static-fallback">Preview unavailable</div>';
+      var openScript = '<scr' + 'ipt>';
+      var closeScript = '</scr' + 'ipt>';
+      var behavior = "(function(){" +
+        "function report(){try{parent.postMessage({type:'iframe:height',height:document.documentElement.scrollHeight},'*');}catch(e){}}" +
+        "function activate(){try{var m=parent.__ivLifecycleV1;if(m)m.activate(window.frameElement);}catch(e){}}" +
+        "var button=document.getElementById('iv-static-activate');if(button)button.addEventListener('click',activate);" +
+        "var image=document.getElementById('iv-static-image');if(image)image.addEventListener('click',activate);" +
+        "window.addEventListener('load',report);setTimeout(report,0);" +
+        "})();";
+      return '<!doctype html><html data-iv-static="1"><head><meta charset="utf-8">' +
+        '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+        '<meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; img-src data: blob:; style-src &#39;unsafe-inline&#39;; script-src &#39;unsafe-inline&#39;; form-action &#39;none&#39;; object-src &#39;none&#39;">' +
+        '<title>' + title + '</title><style>' +
+        ':root{color-scheme:light dark}*{box-sizing:border-box}html,body{margin:0;padding:0;overflow:hidden}' +
+        'body{position:relative;background:transparent;font-family:system-ui,sans-serif}' +
+        '#iv-static-image{display:block;width:100%;height:auto;cursor:pointer}' +
+        '.iv-static-fallback{min-height:120px;display:flex;align-items:center;justify-content:center;' +
+        'border:1px solid rgba(128,128,128,.3);border-radius:12px;color:#888;background:rgba(128,128,128,.06)}' +
+        '#iv-static-activate{position:absolute;right:10px;top:10px;padding:7px 11px;border:1px solid rgba(128,128,128,.4);' +
+        'border-radius:8px;background:rgba(24,24,27,.88);color:#fff;font:12px system-ui,sans-serif;cursor:pointer}' +
+        '</style></head><body>' + imageMarkup +
+        '<button id="iv-static-activate" type="button">Restore interactivity</button>' +
+        openScript + behavior + closeScript + '</body></html>';
+    }
+
+    function connectedLiveFrames(exclude) {
+      var result = [];
+      frames.forEach(function(frame) {
+        if (!frame || !frame.isConnected) { frames.delete(frame); return; }
+        var record = records.get(frame);
+        if (frame !== exclude && record && record.state === 'live') result.push(frame);
+      });
+      result.sort(function(a, b) {
+        return records.get(a).lastActive - records.get(b).lastActive;
+      });
+      return result;
+    }
+
+    function snapshotWithTimeout(frame) {
+      return new Promise(function(resolve) {
+        var settled = false;
+        function finish(value) {
+          if (settled) return;
+          settled = true;
+          resolve(value || null);
+        }
+        var timer = setTimeout(function() { finish(null); }, 15000);
+        try {
+          var creator = frame.contentWindow && frame.contentWindow._ivCreateSnapshot;
+          if (typeof creator !== 'function') { clearTimeout(timer); finish(null); return; }
+          Promise.resolve(creator()).then(function(value) {
+            clearTimeout(timer);
+            finish(value);
+          }, function() {
+            clearTimeout(timer);
+            finish(null);
+          });
+        } catch(e) {
+          clearTimeout(timer);
+          finish(null);
+        }
+      });
+    }
+
+    async function suspend(frame) {
+      var record = records.get(frame);
+      if (!record || record.state !== 'live' || !frame.isConnected) return false;
+      setState(frame, record, 'suspending');
+      try {
+        var rect = frame.getBoundingClientRect();
+        record.height = Math.max(1, Math.round(rect.height || 0));
+      } catch(e) {}
+      try {
+        var doc = frame.contentDocument;
+        if (doc && doc.title) record.title = doc.title;
+      } catch(e) {}
+      var snapshot = await snapshotWithTimeout(frame);
+      if (!frame.isConnected) return false;
+      record.snapshot = snapshot;
+      setState(frame, record, 'static');
+      try {
+        frame.setAttribute('srcdoc', staticDocument(record, snapshot));
+        if (record.height > 0) frame.style.height = record.height + 'px';
+      } catch(e) {
+        setState(frame, record, 'live');
+        return false;
+      }
+      return true;
+    }
+
+    async function enforceLimit(exclude) {
+      if (enforcing || maxActive === 0) return;
+      enforcing = true;
+      try {
+        var active = connectedLiveFrames(exclude);
+        while (active.length > maxActive) {
+          if (!await suspend(active.shift())) break;
+          active = connectedLiveFrames(exclude);
+        }
+      } finally {
+        enforcing = false;
+      }
+    }
+
+    function messageFor(frame) {
+      try {
+        return frame.closest('[id^="message-"]') || frame.parentElement;
+      } catch(e) { return null; }
+    }
+
+    function notifyTouched(recordsList) {
+      frames.forEach(function(frame) {
+        if (!frame || !frame.isConnected) { frames.delete(frame); return; }
+        var record = records.get(frame);
+        if (!record || record.state === 'static' || record.state === 'suspending') return;
+        var message = messageFor(frame);
+        if (!message) return;
+        var touched = false;
+        for (var i = 0; i < recordsList.length; i++) {
+          var target = recordsList[i] && recordsList[i].target;
+          if (!target) continue;
+          try {
+            if (message.contains(target) || target.contains(message)) { touched = true; break; }
+          } catch(e) { touched = true; break; }
+        }
+        if (!touched) return;
+        try {
+          var callback = frame.contentWindow && frame.contentWindow.__ivHandleParentMutation;
+          if (typeof callback === 'function') callback();
+        } catch(e) {}
+      });
+    }
+
+    var observer = new MutationObserver(function(recordsList) {
+      for (var i = 0; i < recordsList.length; i++) {
+        pendingMutationRecords.push(recordsList[i]);
+      }
+      if (observerRaf) return;
+      observerRaf = requestAnimationFrame(function() {
+        observerRaf = 0;
+        var batch = pendingMutationRecords;
+        pendingMutationRecords = [];
+        notifyTouched(batch);
+      });
+    });
+    try {
+      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    } catch(e) {}
+
+    window.__ivLifecycleV1 = {
+      watch: function(frame, config) {
+        if (!frame || !config || Number(config.lifecycleVersion) !== 1) return;
+        maxActive = boundedMax(config.maxActiveVisualizations);
+        var record = recordFor(frame, config);
+        if (record.state !== 'activating') setState(frame, record, 'streaming');
+      },
+      live: function(frame, config) {
+        if (!frame || !config || Number(config.lifecycleVersion) !== 1) return;
+        maxActive = boundedMax(config.maxActiveVisualizations);
+        var record = recordFor(frame, config);
+        record.lastActive = ++sequence;
+        try {
+          var doc = frame.contentDocument;
+          if (doc && doc.title) record.title = doc.title;
+        } catch(e) {}
+        setState(frame, record, 'live');
+        enforceLimit(null);
+      },
+      activate: async function(frame) {
+        var record = records.get(frame);
+        if (!record || record.state !== 'static' || !record.originalSrcdoc) return;
+        setState(frame, record, 'activating');
+        record.lastActive = ++sequence;
+        if (maxActive > 0) {
+          var active = connectedLiveFrames(frame);
+          while (active.length >= maxActive) {
+            if (!await suspend(active.shift())) break;
+            active = connectedLiveFrames(frame);
+          }
+        }
+        if (!frame.isConnected) return;
+        try { frame.setAttribute('srcdoc', record.originalSrcdoc); }
+        catch(e) { setState(frame, record, 'static'); }
+      },
+      state: function(frame) {
+        var record = records.get(frame);
+        return record ? record.state : null;
+      }
+    };
+  }
+
+  try {
+    if (!parent.__ivLifecycleV1) {
+      var installer = parent.document.createElement('script');
+      installer.textContent = '(' + installLifecycleManager.toString() + ')();';
+      (parent.document.head || parent.document.body).appendChild(installer);
+      installer.remove();
+    }
+    window.__ivLifecycleManager = parent.__ivLifecycleV1 || null;
+    if (window.__ivLifecycleManager) {
+      window.__ivLifecycleManager.watch(window.frameElement, window.__ivRuntimeConfig || {});
+    }
+  } catch(e) {
+    window.__ivLifecycleManager = null;
+  }
+
+  window.__ivLifecycleLive = function() {
+    try {
+      if (window.__ivLifecycleManager) {
+        window.__ivLifecycleManager.live(window.frameElement, window.__ivRuntimeConfig || {});
+      }
+    } catch(e) {}
+  };
+})();
+</script>
+"""
 
 # ---------------------------------------------------------------------------
 # Injected CSS — Theme variables (light default, dark via data-theme)
@@ -1932,6 +2416,143 @@ function _ivDomToPng() {
   } catch (e) { _ivHtml2Png(); }
 }
 
+// Lightweight capture used by the lifecycle manager. Unlike the download
+// path it renders at CSS-pixel scale and caps decoded raster work at 2 MP.
+// The returned data URL is self-contained; null selects a static fallback.
+window._ivCreateSnapshot = function() {
+  return new Promise(function(resolve) {
+    var finished = false;
+    function done(value) {
+      if (finished) return;
+      finished = true;
+      resolve(value || null);
+    }
+    function capCanvas(source, width, height) {
+      try {
+        var maxPixels = 2000000;
+        var scale = Math.min(1, Math.sqrt(maxPixels / Math.max(1, width * height)));
+        var out = document.createElement('canvas');
+        out.width = Math.max(1, Math.round(width * scale));
+        out.height = Math.max(1, Math.round(height * scale));
+        var ctx = out.getContext('2d');
+        ctx.fillStyle = _ivResolvedBg();
+        ctx.fillRect(0, 0, out.width, out.height);
+        ctx.drawImage(source, 0, 0, out.width, out.height);
+        done({
+          url: out.toDataURL('image/png'),
+          width: width,
+          height: height
+        });
+      } catch(e) { done(null); }
+    }
+    function html2canvasFallback() {
+      function run() {
+        var dlWrap = document.getElementById('iv-dl-wrap');
+        if (dlWrap) dlWrap.style.visibility = 'hidden';
+        try {
+          window.html2canvas(document.body, {
+            backgroundColor: _ivResolvedBg(), scale: 1, logging: false
+          }).then(function(canvas) {
+            if (dlWrap) dlWrap.style.visibility = '';
+            capCanvas(canvas, canvas.width || 1, canvas.height || 1);
+          }).catch(function() {
+            if (dlWrap) dlWrap.style.visibility = '';
+            done(null);
+          });
+        } catch(e) {
+          if (dlWrap) dlWrap.style.visibility = '';
+          done(null);
+        }
+      }
+      if (window.html2canvas) { run(); return; }
+      try {
+        var loader = document.createElement('script');
+        loader.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
+        loader.onload = run;
+        loader.onerror = function() { done(null); };
+        document.head.appendChild(loader);
+      } catch(e) { done(null); }
+    }
+    try {
+      var svg = _ivFirstSvg();
+      if (svg) {
+        var svgRect = svg.getBoundingClientRect();
+        var bodyWidth = document.body.scrollWidth || 1;
+        var bodyHeight = document.body.scrollHeight || 1;
+        if ((svgRect.width * svgRect.height) / (bodyWidth * bodyHeight) >= 0.5) {
+          var size = _ivSvgSize(svg);
+          done({
+            url: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(_ivSerializedSvg(svg)),
+            width: size.w,
+            height: size.h
+          });
+          return;
+        }
+      }
+
+      var pageWidth = Math.max(
+        document.documentElement.scrollWidth,
+        document.body.scrollWidth,
+        document.body.offsetWidth,
+        1
+      );
+      var pageHeight = Math.max(
+        document.documentElement.scrollHeight,
+        document.body.scrollHeight,
+        document.body.offsetHeight,
+        1
+      );
+      var clone = document.documentElement.cloneNode(true);
+      var props = [
+        'color', 'background-color', 'border-top-color', 'border-right-color',
+        'border-bottom-color', 'border-left-color', 'fill', 'stroke', 'box-shadow'
+      ];
+      var liveNodes = document.documentElement.querySelectorAll('*');
+      var cloneNodes = clone.querySelectorAll('*');
+      for (var n = 0; n < liveNodes.length && n < cloneNodes.length; n++) {
+        try {
+          var computed = window.getComputedStyle(liveNodes[n]);
+          cloneNodes[n].style.opacity = computed.opacity;
+          if (computed.visibility !== 'visible') cloneNodes[n].style.visibility = computed.visibility;
+          if (computed.transform && computed.transform !== 'none') cloneNodes[n].style.transform = computed.transform;
+          for (var p = 0; p < props.length; p++) {
+            var value = computed.getPropertyValue(props[p]);
+            if (value) cloneNodes[n].style.setProperty(props[p], value);
+          }
+        } catch(e) {}
+      }
+      var noMotion = document.createElement('style');
+      noMotion.textContent = '* { animation: none !important; transition: none !important; }';
+      var cloneHead = clone.querySelector('head');
+      if (cloneHead) cloneHead.appendChild(noMotion);
+      var junk = clone.querySelectorAll('#iv-dl-wrap, script');
+      for (var j = 0; j < junk.length; j++) {
+        if (junk[j].parentNode) junk[j].parentNode.removeChild(junk[j]);
+      }
+      var liveCanvases = document.querySelectorAll('canvas');
+      var cloneCanvases = clone.querySelectorAll('canvas');
+      for (var c = 0; c < liveCanvases.length && c < cloneCanvases.length; c++) {
+        try {
+          var canvasImage = document.createElement('img');
+          canvasImage.src = liveCanvases[c].toDataURL('image/png');
+          var canvasRect = liveCanvases[c].getBoundingClientRect();
+          canvasImage.style.width = canvasRect.width + 'px';
+          canvasImage.style.height = canvasRect.height + 'px';
+          cloneCanvases[c].parentNode.replaceChild(canvasImage, cloneCanvases[c]);
+        } catch(e) {}
+      }
+      clone.style.background = _ivResolvedBg();
+      var xml = new XMLSerializer().serializeToString(clone);
+      var wrapper = '<svg xmlns="http://www.w3.org/2000/svg" width="' + pageWidth + '" height="' + pageHeight + '">'
+        + '<foreignObject width="100%" height="100%">' + xml + '</foreignObject></svg>';
+      var image = new Image();
+      image.onload = function() { capCanvas(image, pageWidth, pageHeight); };
+      image.onerror = html2canvasFallback;
+      image.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(wrapper);
+    } catch(e) { html2canvasFallback(); }
+  });
+};
+
 function _ivDownloadPNG() {
   // Pure/dominant SVG: crisp vector rasterization.
   // HTML or mixed layouts: native foreignObject screenshot (theme-faithful);
@@ -3548,6 +4169,12 @@ STREAMING_OBSERVER_SCRIPT = """
     scheduleHeight();
     setTimeout(scheduleHeight, 120);
     setTimeout(scheduleHeight, 400);
+    // The parent manager now owns settled-message monitoring. Stop this
+    // iframe's streaming-only observers and polling before registering live.
+    stopLocalWatchers();
+    try {
+      if (typeof window.__ivLifecycleLive === 'function') window.__ivLifecycleLive();
+    } catch(e) {}
     // Done/failed announcement — only on live streams, not on rehydration.
     if (wasStreaming) {
       var failed = _ivRecovery === 'failed';
@@ -3849,11 +4476,22 @@ STREAMING_OBSERVER_SCRIPT = """
     } catch(e) {}
   }
 
-  // Defense in depth: outer observer on parent.document.body sees new
-  // messages as chat scrolls / navigates; inner observer on our own
-  // message catches every streaming text mutation; 400ms poll is a
-  // safety net in case the observers miss anything.
+  // Streaming-only observer. Parent-document mutations are multiplexed by
+  // the single lifecycle manager; the short poll exists only until this
+  // observer attaches and never survives finalization.
   var innerObserver = null;
+  var pollInterval = null;
+  function stopLocalWatchers() {
+    if (pollInterval !== null) {
+      clearInterval(pollInterval);
+      pollInterval = null;
+    }
+    if (innerObserver) {
+      try { innerObserver.disconnect(); } catch(e) {}
+      innerObserver = null;
+    }
+  }
+
   function attachInnerObserver() {
     if (innerObserver) return;
     var msg = findMyMessage();
@@ -3866,34 +4504,36 @@ STREAMING_OBSERVER_SCRIPT = """
       innerObserver.observe(msg, {
         childList: true, subtree: true, characterData: true
       });
+      if (pollInterval !== null) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
     } catch(e) {}
   }
 
   function pollTick() {
+    if (finalized || innerObserver) {
+      if (pollInterval !== null) clearInterval(pollInterval);
+      pollInterval = null;
+      return;
+    }
     try { tick(false); } catch(e) {}
     try { attachInnerObserver(); } catch(e) {}
   }
 
-  // Each bootstrap step is independently guarded — any one of them
-  // failing must not prevent the polling timer from being installed.
-  // Without the timer the iframe goes silently dormant.
+  window.__ivHandleParentMutation = function() {
+    _ivHealDirty = true;
+    try { tick(true); } catch(e) {}
+    if (!finalized) {
+      try { attachInnerObserver(); } catch(e) {}
+    }
+  };
+
+  // Each bootstrap step is independently guarded. Poll only while the
+  // message element is not available; the parent manager will also wake us.
   try { tick(false); } catch(e) {}
   try { attachInnerObserver(); } catch(e) {}
-  try {
-    new MutationObserver(function(records) {
-      // childList touching OUR message can mean it was rebuilt
-      // wholesale — flag the self-heal for that case too. Scoped so a
-      // busy chat (other messages streaming) doesn't make every
-      // settled viz iframe re-walk its message on each flush.
-      var hasChildList = _ivHasChildListMutation(records);
-      if (hasChildList && _ivRecordsTouchMyMessage(records)) _ivHealDirty = true;
-      try { tick(hasChildList); } catch(e) {}
-      try { attachInnerObserver(); } catch(e) {}
-    }).observe(parent.document.body, {
-      childList: true, subtree: true, characterData: true
-    });
-  } catch(e) {}
-  setInterval(pollTick, 400);
+  if (!finalized && !innerObserver) pollInterval = setInterval(pollTick, 400);
 })();
 </script>
 """
@@ -3972,6 +4612,8 @@ _IFRAME_EMBEDDED_SCRIPTS = {
     "BODY_SCRIPTS": BODY_SCRIPTS,
     "CHIME_SCRIPT": CHIME_SCRIPT,
     "STRICT_SECURITY_SCRIPT": STRICT_SECURITY_SCRIPT,
+    "DOWNSAMPLING_SCRIPT": DOWNSAMPLING_SCRIPT,
+    "LIFECYCLE_BOOTSTRAP_SCRIPT": LIFECYCLE_BOOTSTRAP_SCRIPT,
     "STREAMING_OBSERVER_SCRIPT": STREAMING_OBSERVER_SCRIPT,
 }
 for _name, _body in _IFRAME_EMBEDDED_SCRIPTS.items():
@@ -4088,6 +4730,8 @@ def _build_html(
     lang: str = "en",
     chime: bool = True,
     tool_data_bridge: str = "",
+    max_active_visualizations: int = 2,
+    point_density: float = 1.0,
 ) -> str:
     """Wrap the streaming visualization shell: empty render area + observer.
 
@@ -4115,6 +4759,10 @@ def _build_html(
     body_scripts = BODY_SCRIPTS.replace(
         "/*__CHIME_BLOCK__*/", CHIME_SCRIPT if chime else ""
     )
+    runtime_config = _build_runtime_config(
+        max_active_visualizations=max_active_visualizations,
+        point_density=point_density,
+    )
 
     # Loader sits *below* the render area so content appears to flow
     # downward toward the pulsing dots — like a cursor following a pen.
@@ -4126,8 +4774,11 @@ def _build_html(
         '<div class="iv-loading-label">Rendering visualization\u2026</div>'
         "</div>\n"
         f"{DOWNLOAD_BUTTON}\n"
+        f"{runtime_config}"
         f"{body_scripts}"
         f"{tool_data_bridge}"
+        f"{DOWNSAMPLING_SCRIPT}"
+        f"{LIFECYCLE_BOOTSTRAP_SCRIPT}"
         f"{STREAMING_OBSERVER_SCRIPT}"
         f"{strict_script}"
     )
@@ -4208,6 +4859,18 @@ class Tools:
         chime: bool = Field(
             default=True,
             description="Play a soft three-note chime when a live-streamed visualization finishes. When off, the chime script is omitted from the iframe entirely (not shipped as a no-op).",
+        )
+        max_active_visualizations: int = Field(
+            default=2,
+            ge=0,
+            le=10,
+            description="Maximum interactive Tool Result visualizations kept alive on the page. Older completed visualizations become restorable static previews. Set to 0 to disable suspension.",
+        )
+        point_density: float = Field(
+            default=1.0,
+            ge=0,
+            le=4,
+            description="Display-point budget per CSS pixel exposed through ivPointBudget and ivDownsample. Set to 0 to disable the budget.",
         )
 
     def __init__(self):
@@ -4363,6 +5026,8 @@ return (() => {
             lang,
             chime=self.valves.chime,
             tool_data_bridge=tool_data_bridge,
+            max_active_visualizations=self.valves.max_active_visualizations,
+            point_density=self.valves.point_density,
         )
         response = HTMLResponse(
             content=html,

@@ -72,6 +72,33 @@ If an ID occurs more than once, the newest matching result is selected. Only the
 
 JSON strings are parsed before injection. Ordinary text remains a string and JSON `null` becomes JavaScript `null`.
 
+## Browser performance
+
+The tool keeps at most two completed visualizations interactive by default. When a third visualization completes, the least recently activated iframe is captured at CSS-pixel resolution and replaced with a static preview. Click the preview or **Restore interactivity** to reload it; the least recently active live visualization is suspended in exchange. Streaming visualizations are never suspended.
+
+Static previews are session-local. They are regenerated after a page reload and are not written to the chat or IndexedDB. The lifecycle manager applies only to visualizations created by builds that provide lifecycle version 1; older saved embeds are not migrated.
+
+Configure this behavior in the Tool valves:
+
+- `max_active_visualizations` defaults to `2` (`0` disables suspension; maximum `10`).
+- `point_density` defaults to `1.0` display point per CSS pixel (`0` disables point budgeting; maximum `4`).
+
+`getToolData()` always returns the complete source result. For dense line and scatter series, reduce only the display array:
+
+```js
+const rows = getToolData();
+const chart = document.getElementById('chart');
+const displayRows = ivDownsample(rows, {
+  container: chart,
+  x: 'date',
+  y: 'value',
+  mode: 'line',
+  seriesCount: 1
+});
+```
+
+`ivPointBudget(container, seriesCount)` returns the per-series budget. `ivDownsample(points, options)` uses LTTB for lines and spatial binning for scatter plots, never mutates the source array, and falls back to endpoint-preserving even sampling when coordinates are invalid. Keep calculations and aggregates on the original `rows` value.
+
 ## Security
 
 The selected result is serialized into a non-executable `<script type="application/json">` element. HTML delimiters and Unicode line separators are escaped before insertion. A result that cannot be serialized produces a controlled error and no iframe is mounted.
