@@ -15,11 +15,12 @@ Use this skill only when a system or developer instruction explicitly tells you 
 2. Wait until that tool call has fully completed.
 3. Identify the completed call containing the required data and read its explicit `tool_call_id` or `call_id` from the structured conversation context.
 4. Copy the complete identifier character-for-character.
-5. In a later sequential tool round, call `visualize_tool_result(title="…", source_tool_call_id="<exact copied ID>")`. YOU MUST CALL THE TOOL, otherwise the visualization will not render.
-6. Wait for `visualize_tool_result()` to complete successfully. It mounts an iframe wrapper sandbox in the chat and injects the selected result as `getToolData()`.
-7. Emit `@@@VIZ-START` on its own line.
-8. Emit exactly one HTML/SVG fragment with `<style>` first, visible content next, and `<script>` last. Access the source result with `getToolData()`.
-9. Emit `@@@VIZ-END` on its own line, then continue with any brief explanation for the user.
+5. In a later sequential tool round, call `visualize_tool_result(title="…", source_tool_call_id="<exact copied ID>")`. Leave `retry_attempt` at its default `0`. YOU MUST CALL THE TOOL, otherwise the visualization will not render.
+6. If the tool returns `status="retry_required"`, call `visualize_tool_result()` exactly once in the next sequential tool round using `retry.arguments` exactly. Reuse the existing source call; never rerun the producer to recover the visualization.
+7. Wait for `visualize_tool_result()` to complete successfully. It mounts an iframe wrapper sandbox in the chat and injects the selected result as `getToolData()`.
+8. Emit `@@@VIZ-START` on its own line.
+9. Emit exactly one HTML/SVG fragment with `<style>` first, visible content next, and `<script>` last. Access the source result with `getToolData()`.
+10. Emit `@@@VIZ-END` on its own line, then continue with any brief explanation for the user.
 
 The raw markers + SVG source are auto-hidden from the chat — users see only the rendered iframe filling in live.
 
@@ -77,9 +78,9 @@ The value is already parsed when possible: JSON strings become objects, arrays, 
 
 Each visualization accepts exactly one `source_tool_call_id`. If the visualization requires several related datasets, have one producer call return them together as a combined result.
 
-Never call the producer and `visualize_tool_result()` in the same parallel batch. The result is unavailable until the producer call has finished and Open WebUI has recorded it.
+Never call the producer and `visualize_tool_result()` in the same parallel batch. The result is unavailable until the producer call has finished and Open WebUI has recorded it. If the provider batches them despite this rule, follow the returned `retry.arguments` in the next round.
 
-If `visualize_tool_result()` returns `Invalid source_tool_call_id` or `Tool result not found`, re-read the explicit ID attached to the completed source call and copy it again. Do not attempt to repair the ID, and do not retry a side-effecting producer merely to recover its result.
+`retry_required` is a bounded visualization retry, not a request for fresh data. Call only `visualize_tool_result()` with the supplied arguments. If that retry returns `Tool result not found`, stop visualization recovery and report that the existing result could not be resolved. For `Invalid source_tool_call_id`, re-read the explicit ID attached to the completed source call; never construct or repair it.
 
 ### Pre-styled form elements
 

@@ -312,6 +312,15 @@ def test_source_tool_call_id_is_required_in_public_signature():
     assert parameter.annotation is str
 
 
+def test_retry_attempt_is_bounded_in_public_signature():
+    parameter = inspect.signature(iv.Tools.visualize_tool_result).parameters[
+        "retry_attempt"
+    ]
+
+    assert parameter.default == 0
+    assert parameter.annotation == iv.Literal[0, 1]
+
+
 def test_visualize_without_event_emitter_returns_html_response_tuple():
     response, context = run(
         iv.Tools().visualize_tool_result(
@@ -325,7 +334,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.0.0' in response.body
+    assert b'tool-result-1.0.1' in response.body
 
 
 def test_visualize_injects_only_the_selected_result():
@@ -414,7 +423,7 @@ def test_empty_source_tool_call_id_is_a_controlled_error(source_tool_call_id):
     assert events == []
 
 
-def test_unknown_or_unfinished_source_tool_call_id_is_a_controlled_error(
+def test_unknown_or_unfinished_source_tool_call_id_requests_one_retry(
     monkeypatch,
 ):
     async def load_outputs(request, metadata):
@@ -437,10 +446,69 @@ def test_unknown_or_unfinished_source_tool_call_id_is_a_controlled_error(
         __messages__=[],
     )
 
+    assert result["status"] == "retry_required"
+    assert result["code"] == "source_result_not_visible_yet"
+    assert result["source_tool_call_id"] == "call-pending"
+    assert result["retry"] == {
+        "tool": "visualize_tool_result",
+        "arguments": {
+            "source_tool_call_id": "call-pending",
+            "title": "Tool Result Visualization",
+            "retry_attempt": 1,
+        },
+    }
+    assert "do not run the data-producing tool again" in result["message"]
+    assert html is None
+    assert events == []
+
+
+def test_second_missing_attempt_is_a_controlled_error(monkeypatch):
+    async def load_outputs(request, metadata):
+        return []
+
+    monkeypatch.setattr(iv, "_load_current_message_outputs", load_outputs)
+
+    result, html, events = capture_visualize(
+        iv.Tools(),
+        source_tool_call_id="call-still-missing",
+        title="Retry",
+        retry_attempt=1,
+        __messages__=[],
+    )
+
     assert result["status"] == "error"
     assert result["error"] == "Tool result not found"
-    assert result["source_tool_call_id"] == "call-pending"
-    assert "later tool round" in result["message"]
+    assert result["source_tool_call_id"] == "call-still-missing"
+    assert "single visualization retry" in result["message"]
+    assert "do not rerun the data-producing tool" in result["message"]
+    assert html is None
+    assert events == []
+
+
+def test_retry_succeeds_when_source_result_becomes_visible():
+    result, html, events = capture_visualize(
+        iv.Tools(),
+        source_tool_call_id="call-data",
+        title="Retry success",
+        retry_attempt=1,
+        __messages__=[tool_message("call-data", [{"value": 42}])],
+    )
+
+    assert "waiting for content" in result
+    assert extract_tool_json(html) == [{"value": 42}]
+    assert len(events) == 1
+
+
+def test_invalid_retry_attempt_is_a_controlled_error():
+    result, html, events = capture_visualize(
+        iv.Tools(),
+        source_tool_call_id="call-data",
+        retry_attempt=2,
+        __messages__=[tool_message("call-data", [{"value": 42}])],
+    )
+
+    assert result["status"] == "error"
+    assert result["error"] == "Invalid retry_attempt"
     assert html is None
     assert events == []
 

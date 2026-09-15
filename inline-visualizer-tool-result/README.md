@@ -14,10 +14,13 @@
 visualize_tool_result(
     source_tool_call_id: str,
     title: str = "Tool Result Visualization",
+    retry_attempt: Literal[0, 1] = 0,
 )
 ```
 
 `source_tool_call_id` is required. It must be the complete `tool_call_id` or `call_id` copied from the completed source call. It is treated as an opaque string and matched exactly.
+
+`retry_attempt` is a bounded recovery control. Omit it on the initial call. If the result is not visible yet, the tool returns `status="retry_required"` with exact `retry.arguments`; call `visualize_tool_result()` once more in the next sequential tool round using those arguments. The retry keeps the original source call ID and sets `retry_attempt=1`.
 
 ## Workflow
 
@@ -55,6 +58,8 @@ After the tool succeeds, emit one visualization block:
 
 The producer and `visualize_tool_result()` cannot be called in the same parallel batch because the source result is not available until Open WebUI records the completed producer call.
 
+If a provider nevertheless puts them in one batch, the initial visualizer call returns `retry_required` instead of an error. Retry only `visualize_tool_result()` in the next tool round with the supplied arguments. Reuse the existing producer result; never rerun the producer to recover a visualization. A missing result after that single retry becomes `Tool result not found`, preventing an unbounded loop.
+
 ## Result resolution
 
 The tool searches for an exact matching call ID in this order:
@@ -74,10 +79,12 @@ The selected result is serialized into a non-executable `<script type="applicati
 ## Errors
 
 - `Invalid source_tool_call_id`: the required ID is empty or invalid.
-- `Tool result not found`: no completed result with the exact ID is available in the current conversation.
+- `Invalid retry_attempt`: the retry control is outside its supported `0`/`1` range.
+- `retry_required`: the initial call could not see the source result yet; retry the visualizer once with the supplied arguments.
+- `Tool result not found`: the single visualization retry still could not resolve the exact ID.
 - `Tool result cannot be serialized`: the selected result cannot be safely encoded as JSON.
 
-When the tool returns an error, do not emit a `@@@VIZ-START` block.
+When the tool returns `retry_required` or an error, do not emit a `@@@VIZ-START` block.
 
 ## Standard visualizations
 

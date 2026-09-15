@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.0.0
+version: 1.0.1
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -16,7 +16,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.0.0"
+_IV_BUILD = "tool-result-1.0.1"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -4217,6 +4217,7 @@ class Tools:
         self,
         source_tool_call_id: str,
         title: str = "Tool Result Visualization",
+        retry_attempt: Literal[0, 1] = 0,
         __messages__=None,
         __request__=None,
         __metadata__=None,
@@ -4232,6 +4233,7 @@ class Tools:
         Use this tool only when a system or developer instruction explicitly requires a visualization based on the result of another tool call.
         Never use it for an ordinary visualization; use visualize() for that workflow.
         The data-producing call MUST finish before this tool is called. Never place the producer and visualize_tool_result() in the same parallel tool batch.
+        If this tool returns status="retry_required", call visualize_tool_result exactly once in the next tool round using retry.arguments exactly. Reuse the existing source call; never rerun the data-producing tool to recover a visualization.
         Copy source_tool_call_id character-for-character from the completed source call's explicit tool_call_id or call_id. It is a call ID, not a tool name. Never construct, shorten, normalize, or repair it.
 
         IMPORTANT:
@@ -4258,6 +4260,7 @@ class Tools:
 
         :param source_tool_call_id: Required complete tool_call_id/call_id copied character-for-character from the completed source tool call. Preserve every prefix, separator, and numeric suffix. This is a call ID, not a tool name; never construct or modify it.
         :param title: Short descriptive title for the visualization.
+        :param retry_attempt: Retry control. Leave at 0 for the initial call. Set to 1 only when a prior retry_required result supplies retry.arguments.
         :return: Interactive rich embed rendered in the chat, with LLM context.
         """
         if not isinstance(source_tool_call_id, str) or not source_tool_call_id.strip():
@@ -4268,16 +4271,49 @@ class Tools:
                 "message": "Copy the complete call_id from the completed source tool call.",
             }
 
+        if retry_attempt not in (0, 1):
+            return {
+                "status": "error",
+                "error": "Invalid retry_attempt",
+                "source_tool_call_id": source_tool_call_id,
+                "message": "Use retry_attempt=0 initially or the retry_attempt=1 value supplied by a retry_required result.",
+            }
+
         has_tool_data, tool_result = await _resolve_tool_result(
             source_tool_call_id, __request__, __metadata__, __messages__
         )
 
         if not has_tool_data:
+            if retry_attempt == 0:
+                return {
+                    "status": "retry_required",
+                    "code": "source_result_not_visible_yet",
+                    "source_tool_call_id": source_tool_call_id,
+                    "message": (
+                        "Call visualize_tool_result exactly once in the next "
+                        "sequential tool round using retry.arguments exactly. "
+                        "Reuse the existing source call; do not run the "
+                        "data-producing tool again."
+                    ),
+                    "retry": {
+                        "tool": "visualize_tool_result",
+                        "arguments": {
+                            "source_tool_call_id": source_tool_call_id,
+                            "title": title,
+                            "retry_attempt": 1,
+                        },
+                    },
+                }
             return {
                 "status": "error",
                 "error": "Tool result not found",
                 "source_tool_call_id": source_tool_call_id,
-                "message": "No completed tool result with this exact ID is available in the current conversation. Run the data-producing tool first, then call visualize_tool_result in a later tool round.",
+                "message": (
+                    "The single visualization retry could not find a completed "
+                    "tool result with this exact ID. Verify the ID against the "
+                    "existing source call; do not rerun the data-producing tool "
+                    "solely to recover the visualization."
+                ),
             }
 
         try:
