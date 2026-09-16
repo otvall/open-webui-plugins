@@ -336,7 +336,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.1.8' in response.body
+    assert b'tool-result-1.1.9' in response.body
     runtime = re.search(
         rb'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
         response.body,
@@ -620,7 +620,7 @@ const childWindow = {{frameElement:null,__ivRuntimeConfig:{{}}}};
 new Function('window','parent','document','MutationObserver','requestAnimationFrame',
   {json.dumps(match.group(1))}
 )(childWindow,parentWindow,{{}},FakeMutationObserver,raf);
-const manager = parentWindow.__ivLifecycleV2;
+const manager = parentWindow.__ivLifecycleV3;
 {assertion_source}
 """
     completed = subprocess.run(
@@ -650,8 +650,8 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.1.8",
-        "lifecycleVersion": 2,
+        "build": "tool-result-1.1.9",
+        "lifecycleVersion": 3,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
     }
@@ -745,6 +745,13 @@ def test_lifecycle_static_shell_excludes_live_payloads_and_libraries():
     assert "Chart.js" not in source
 
 
+def test_lifecycle_parent_observer_cannot_loop_on_streaming_style_writes():
+    source = iv.LIFECYCLE_BOOTSTRAP_SCRIPT
+    assert "attributes: true" not in source
+    assert "attributeFilter" not in source
+    assert "window.__ivLifecycleV3" in source
+
+
 def test_lifecycle_reload_keeps_latest_dom_frames_and_waits_before_snapshot():
     result = _run_lifecycle_js(
         """
@@ -768,7 +775,7 @@ function frame(order) {
 function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
 (async function(){
   const frames=[frame(1),frame(2),frame(3),frame(4)];
-  const config={lifecycleVersion:2,maxActiveVisualizations:2};
+  const config={lifecycleVersion:3,maxActiveVisualizations:2};
   frames.forEach(function(item){manager.watch(item,config);});
   [frames[3],frames[0],frames[2],frames[1]].forEach(function(item){manager.live(item,config);});
   await pause();
@@ -824,14 +831,14 @@ function frame(source, order) {
 function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
 (async function(){
   const reused=frame('old-visualization',1);
-  manager.watch(reused,{lifecycleVersion:2,lifecycleKey:'old',maxActiveVisualizations:1});
-  manager.live(reused,{lifecycleVersion:2,lifecycleKey:'old',maxActiveVisualizations:1});
+  manager.watch(reused,{lifecycleVersion:3,lifecycleKey:'old',maxActiveVisualizations:1});
+  manager.live(reused,{lifecycleVersion:3,lifecycleKey:'old',maxActiveVisualizations:1});
   reused.setAttribute('srcdoc','new-visualization');
-  manager.watch(reused,{lifecycleVersion:2,lifecycleKey:'new',maxActiveVisualizations:1});
-  manager.live(reused,{lifecycleVersion:2,lifecycleKey:'new',maxActiveVisualizations:1});
+  manager.watch(reused,{lifecycleVersion:3,lifecycleKey:'new',maxActiveVisualizations:1});
+  manager.live(reused,{lifecycleVersion:3,lifecycleKey:'new',maxActiveVisualizations:1});
   const latest=frame('latest-visualization',2);
-  manager.watch(latest,{lifecycleVersion:2,lifecycleKey:'latest',maxActiveVisualizations:1});
-  manager.live(latest,{lifecycleVersion:2,lifecycleKey:'latest',maxActiveVisualizations:1});
+  manager.watch(latest,{lifecycleVersion:3,lifecycleKey:'latest',maxActiveVisualizations:1});
+  manager.live(latest,{lifecycleVersion:3,lifecycleKey:'latest',maxActiveVisualizations:1});
   await pause();
   const suspended=reused.getAttribute('data-iv-state');
   manager.activate(reused);
@@ -871,7 +878,7 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
 (async function(){
   const missing=frame(1,null);
   const available=frame(2,{url:'data:image/png;base64,eA=='});
-  const config={lifecycleVersion:2,maxActiveVisualizations:1};
+  const config={lifecycleVersion:3,maxActiveVisualizations:1};
   [missing,available].forEach(function(item){manager.watch(item,config);manager.live(item,config);});
   await pause();
   console.log(JSON.stringify({
@@ -911,7 +918,7 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
   const hidden=frame(1,false);
   const first=frame(2,true);
   const second=frame(3,true);
-  const config={lifecycleVersion:2,maxActiveVisualizations:1};
+  const config={lifecycleVersion:3,maxActiveVisualizations:1};
   [hidden,first,second].forEach(function(item){manager.watch(item,config);manager.live(item,config);});
   await pause();
   console.log(JSON.stringify({
@@ -945,7 +952,7 @@ function frame(order) {
 function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
 (async function(){
   const frames=[frame(1),frame(2),frame(3),frame(4)];
-  const config={lifecycleVersion:2,maxActiveVisualizations:0};
+  const config={lifecycleVersion:3,maxActiveVisualizations:0};
   frames.forEach(function(item){manager.watch(item,config);manager.live(item,config);});
   await pause();
   console.log(JSON.stringify(frames.map(function(item){return item.getAttribute('data-iv-state');})));

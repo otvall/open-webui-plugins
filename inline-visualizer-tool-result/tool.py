@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.8
+version: 1.1.9
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -17,7 +17,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.8"
+_IV_BUILD = "tool-result-1.1.9"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -197,7 +197,7 @@ def _build_runtime_config(
     """Serialize bounded browser-runtime settings into inert JSON."""
     config = {
         "build": _IV_BUILD,
-        "lifecycleVersion": 2,
+        "lifecycleVersion": 3,
         "maxActiveVisualizations": max_active_visualizations,
         "pointDensity": point_density,
     }
@@ -402,7 +402,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
   'use strict';
 
   function installLifecycleManager() {
-    if (window.__ivLifecycleV2) return;
+    if (window.__ivLifecycleV3) return;
     var records = new WeakMap();
     var frames = new Set();
     var sequence = 0;
@@ -421,7 +421,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
     function setState(frame, record, state) {
       record.state = state;
       try {
-        frame.setAttribute('data-iv-lifecycle-version', '2');
+        frame.setAttribute('data-iv-lifecycle-version', '3');
         frame.setAttribute('data-iv-state', state);
       } catch(e) {}
     }
@@ -490,12 +490,12 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       var closeScript = '</scr' + 'ipt>';
       var behavior = "(function(){" +
         "function report(){try{parent.postMessage({type:'iframe:height',height:document.documentElement.scrollHeight},'*');}catch(e){}}" +
-        "function activate(){try{var m=parent.__ivLifecycleV2;if(m)m.activate(window.frameElement);}catch(e){}}" +
+        "function activate(){try{var m=parent.__ivLifecycleV3;if(m)m.activate(window.frameElement);}catch(e){}}" +
         "var button=document.getElementById('iv-static-activate');if(button)button.addEventListener('click',activate);" +
         "var image=document.getElementById('iv-static-image');if(image)image.addEventListener('click',activate);" +
         "window.addEventListener('load',report);setTimeout(report,0);" +
         "})();";
-      return '<!doctype html><html data-iv-static="2"><head><meta charset="utf-8">' +
+      return '<!doctype html><html data-iv-static="3"><head><meta charset="utf-8">' +
         '<meta name="viewport" content="width=device-width,initial-scale=1">' +
         '<meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; img-src data: blob:; style-src &#39;unsafe-inline&#39;; script-src &#39;unsafe-inline&#39;; form-action &#39;none&#39;; object-src &#39;none&#39;">' +
         '<title>' + title + '</title><style>' +
@@ -694,8 +694,10 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         var batch = pendingMutationRecords;
         pendingMutationRecords = [];
         notifyTouched(batch);
-        // SPA chat switches commonly toggle class/style without reloading an
-        // iframe. Re-evaluate the limit against only the currently visible chat.
+        // Chat route changes rebuild message subtrees. Re-evaluate the limit
+        // here, but deliberately do not observe class/style attributes: the
+        // streaming renderer changes styles while hiding VIZ source, and an
+        // attribute observer would feed those writes back into tick().
         enforceLimit(null);
       });
     });
@@ -703,21 +705,19 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       observer.observe(document.body, {
         childList: true,
         subtree: true,
-        characterData: true,
-        attributes: true,
-        attributeFilter: ['class', 'style', 'hidden']
+        characterData: true
       });
     } catch(e) {}
 
-    window.__ivLifecycleV2 = {
+    window.__ivLifecycleV3 = {
       watch: function(frame, config) {
-        if (!frame || !config || Number(config.lifecycleVersion) !== 2) return;
+        if (!frame || !config || Number(config.lifecycleVersion) !== 3) return;
         maxActive = boundedMax(config.maxActiveVisualizations);
         var record = recordFor(frame, config);
         if (record.state !== 'activating') setState(frame, record, 'streaming');
       },
       live: function(frame, config) {
-        if (!frame || !config || Number(config.lifecycleVersion) !== 2) return;
+        if (!frame || !config || Number(config.lifecycleVersion) !== 3) return;
         maxActive = boundedMax(config.maxActiveVisualizations);
         var record = recordFor(frame, config);
         try {
@@ -748,13 +748,13 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
   }
 
   try {
-    if (!parent.__ivLifecycleV2) {
+    if (!parent.__ivLifecycleV3) {
       var installer = parent.document.createElement('script');
       installer.textContent = '(' + installLifecycleManager.toString() + ')();';
       (parent.document.head || parent.document.body).appendChild(installer);
       installer.remove();
     }
-    window.__ivLifecycleManager = parent.__ivLifecycleV2 || null;
+    window.__ivLifecycleManager = parent.__ivLifecycleV3 || null;
     if (window.__ivLifecycleManager) {
       window.__ivLifecycleManager.watch(window.frameElement, window.__ivRuntimeConfig || {});
     }
