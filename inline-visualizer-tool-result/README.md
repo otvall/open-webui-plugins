@@ -72,6 +72,12 @@ If an ID occurs more than once, the newest matching result is selected. Only the
 
 JSON strings are parsed before injection. Ordinary text remains a string and JSON `null` becomes JavaScript `null`.
 
+The wrapper is returned as an inline `HTMLResponse` through Open WebUI's normal
+tool-result pipeline. This ensures the embed is attached to the completed
+`function_call_output` before the frontend receives the corresponding
+`chat:completion` update; emitting an early standalone `embeds` event can be
+persisted while still being missed by the live page.
+
 ## Browser performance
 
 The tool keeps at most two completed visualizations interactive by default. On page reload, completed visualizations are ranked by their stable order in the chat, so the newest two remain interactive regardless of iframe load timing. When another visualization completes, the oldest eligible iframe is captured at CSS-pixel resolution and replaced with a static preview. Click the preview or **Restore interactivity** to reload it immediately; after that iframe finishes rendering, the oldest eligible live visualization is suspended in exchange. Streaming visualizations are never suspended.

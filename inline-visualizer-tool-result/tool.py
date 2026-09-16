@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.2
+version: 1.1.4
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -16,7 +16,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.2"
+_IV_BUILD = "tool-result-1.1.4"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -3078,18 +3078,21 @@ STREAMING_OBSERVER_SCRIPT = """
   var finalizedText = null;
 
   function findMyMessage() {
-    if (myMessage && parent.document.contains(myMessage)) return myMessage;
     try {
       var frame = window.frameElement;
-      if (!frame) return null;
+      if (!frame) return myMessage && parent.document.contains(myMessage) ? myMessage : null;
       // chat-assistant wrapper holds both streaming-time buffer and
       // settled content; response-content-container only populates on
       // rehydrate. Toolbar / suggestions row are siblings, not
-      // descendants, so we won't scoop them up.
-      myMessage = (frame.closest && frame.closest('.chat-assistant'))
+      // descendants, so we won't scoop them up. Re-resolve on every live
+      // tick because Svelte may replace the response wrapper while leaving
+      // the iframe mounted under a new ancestor.
+      var current = (frame.closest && frame.closest('.chat-assistant'))
         || (frame.closest && frame.closest('#response-content-container'))
         || (frame.closest && frame.closest('[id^="message-"]'))
         || null;
+      if (current) myMessage = current;
+      else if (myMessage && !parent.document.contains(myMessage)) myMessage = null;
       return myMessage;
     } catch(e) { return null; }
   }
@@ -4592,9 +4595,13 @@ STREAMING_OBSERVER_SCRIPT = """
   }
 
   // Streaming-only observer. Parent-document mutations are multiplexed by
-  // the single lifecycle manager; the short poll exists only until this
-  // observer attaches and never survives finalization.
+  // the single lifecycle manager. Keep the short poll for the whole live
+  // stream: Open WebUI can replace/reparent its response subtree after the
+  // iframe mounts, leaving an otherwise healthy observer attached to a
+  // stale node. The poll is the safety net for that transition and is
+  // stopped immediately on finalization, so settled embeds pay no cost.
   var innerObserver = null;
+  var observedMessage = null;
   var pollInterval = null;
   function stopLocalWatchers() {
     if (pollInterval !== null) {
@@ -4605,12 +4612,17 @@ STREAMING_OBSERVER_SCRIPT = """
       try { innerObserver.disconnect(); } catch(e) {}
       innerObserver = null;
     }
+    observedMessage = null;
   }
 
   function attachInnerObserver() {
-    if (innerObserver) return;
     var msg = findMyMessage();
     if (!msg) return;
+    if (innerObserver && observedMessage === msg) return;
+    if (innerObserver) {
+      try { innerObserver.disconnect(); } catch(e) {}
+      innerObserver = null;
+    }
     try {
       innerObserver = new MutationObserver(function(records) {
         _ivHealDirty = true;
@@ -4619,15 +4631,12 @@ STREAMING_OBSERVER_SCRIPT = """
       innerObserver.observe(msg, {
         childList: true, subtree: true, characterData: true
       });
-      if (pollInterval !== null) {
-        clearInterval(pollInterval);
-        pollInterval = null;
-      }
+      observedMessage = msg;
     } catch(e) {}
   }
 
   function pollTick() {
-    if (finalized || innerObserver) {
+    if (finalized) {
       if (pollInterval !== null) clearInterval(pollInterval);
       pollInterval = null;
       return;
@@ -4644,11 +4653,12 @@ STREAMING_OBSERVER_SCRIPT = """
     }
   };
 
-  // Each bootstrap step is independently guarded. Poll only while the
-  // message element is not available; the parent manager will also wake us.
+  // Each bootstrap step is independently guarded. Poll for the duration of
+  // streaming even after the observer attaches: the first observed node is
+  // not guaranteed to remain Open WebUI's live response node.
   try { tick(false); } catch(e) {}
   try { attachInnerObserver(); } catch(e) {}
-  if (!finalized && !innerObserver) pollInterval = setInterval(pollTick, 400);
+  if (!finalized) pollInterval = setInterval(pollTick, 400);
 })();
 </script>
 """
@@ -5164,10 +5174,12 @@ return (() => {
             f"the HTML source itself. Emit exactly ONE @@@VIZ-START/@@@VIZ-END pair "
             f"for this tool call."
         )
-        # Under native tool calling the embeds attached to the per-tool-call result item are not painted by the frontend,
-        # whereas the message-level "embeds" channel is path-independent and always renders (it is the same channel legacy already uses).
-        # Fall back to the original HTMLResponse return when no event emitter is available to preserve prior behavior.
-        if __event_emitter__:
-            await __event_emitter__({"type": "embeds", "data": {"embeds": [html]}})
-            return result_context
+        # Return the embed through Open WebUI's tool-result pipeline instead of
+        # emitting an early message-level `embeds` event ourselves.  The early
+        # event can arrive before the live frontend has incorporated this tool
+        # result into message.output: it is persisted by the backend, but the
+        # active page drops it and only shows it after a reload.  Returning the
+        # HTMLResponse lets OWUI attach it to function_call_output first and
+        # then publish the authoritative chat:completion update.  Legacy tool
+        # paths also convert this tuple to their normal message-level embed.
         return response, result_context
