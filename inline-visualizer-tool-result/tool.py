@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.9
+version: 1.1.10
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -17,7 +17,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.9"
+_IV_BUILD = "tool-result-1.1.10"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -193,6 +193,8 @@ def _build_runtime_config(
     max_active_visualizations: int = 2,
     point_density: float = 1.0,
     lifecycle_key: str = "",
+    chat_id: str = "",
+    message_id: str = "",
 ) -> str:
     """Serialize bounded browser-runtime settings into inert JSON."""
     config = {
@@ -203,6 +205,10 @@ def _build_runtime_config(
     }
     if lifecycle_key:
         config["lifecycleKey"] = lifecycle_key
+    if chat_id:
+        config["chatId"] = chat_id
+    if message_id:
+        config["messageId"] = message_id
     return (
         '<script id="iv-runtime-config" type="application/json">'
         f"{_safe_json_for_html(config)}</script>"
@@ -3151,8 +3157,28 @@ STREAMING_OBSERVER_SCRIPT = """
   var finalized = false;
   var finalizedText = null;
 
+  function configuredMessage() {
+    var cfg = window.__ivRuntimeConfig || {};
+    var messageId = cfg.messageId == null ? '' : String(cfg.messageId);
+    if (!messageId) return null;
+    try {
+      // ResponseMessage uses message-{id}; getElementById avoids CSS escaping
+      // problems for provider-generated ids containing punctuation.
+      var direct = parent.document.getElementById('message-' + messageId);
+      if (direct) return direct;
+      direct = parent.document.getElementById(messageId);
+      if (direct) return direct;
+    } catch(e) {}
+    return null;
+  }
+
   function findMyMessage() {
     try {
+      // The server knows the authoritative assistant message id. Prefer it
+      // during live generation because message-level embeds may temporarily
+      // be mounted outside the final ResponseMessage subtree.
+      var configured = configuredMessage();
+      if (configured) { myMessage = configured; return myMessage; }
       var frame = window.frameElement;
       if (!frame) return myMessage && parent.document.contains(myMessage) ? myMessage : null;
       // chat-assistant wrapper holds both streaming-time buffer and
@@ -4384,14 +4410,19 @@ STREAMING_OBSERVER_SCRIPT = """
   function _ivChatContext() {
     var chatId = null, messageId = null;
     try {
-      var pathMatch = parent.location.pathname.match(/\\/c\\/([^\\/?#]+)/);
-      chatId = pathMatch ? pathMatch[1] : null;
+      var cfg = window.__ivRuntimeConfig || {};
+      chatId = cfg.chatId == null ? null : String(cfg.chatId);
+      messageId = cfg.messageId == null ? null : String(cfg.messageId);
+      if (!chatId) {
+        var pathMatch = parent.location.pathname.match(/\\/c\\/([^\\/?#]+)/);
+        chatId = pathMatch ? pathMatch[1] : null;
+      }
       var frame = window.frameElement;
       var embedContainer = frame && frame.closest && frame.closest('[id*="-embeds-"]');
       var idMatch = embedContainer && embedContainer.id.match(/^(.+)-embeds-\\d+$/);
-      if (idMatch) {
+      if (!messageId && idMatch) {
         messageId = idMatch[1];
-      } else {
+      } else if (!messageId) {
         // The tool-response path mounts the iframe outside an embeds container.
         var msgEl = frame && frame.closest && frame.closest('[id^="message-"]');
         if (msgEl) messageId = msgEl.id.slice('message-'.length);
@@ -5072,6 +5103,8 @@ def _build_html(
     max_active_visualizations: int = 2,
     point_density: float = 1.0,
     lifecycle_key: str = "",
+    chat_id: str = "",
+    message_id: str = "",
 ) -> str:
     """Wrap the streaming visualization shell: empty render area + observer.
 
@@ -5103,6 +5136,8 @@ def _build_html(
         max_active_visualizations=max_active_visualizations,
         point_density=point_density,
         lifecycle_key=lifecycle_key,
+        chat_id=chat_id,
+        message_id=message_id,
     )
 
     # Loader sits *below* the render area so content appears to flow
@@ -5359,6 +5394,12 @@ return (() => {
             except Exception:
                 pass
 
+        metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+        chat_id = str(metadata.get("chat_id") or "")
+        message_id = str(
+            metadata.get("message_id") or metadata.get("assistant_message_id") or ""
+        )
+
         html = _build_html(
             self.valves.security_level,
             title,
@@ -5368,6 +5409,8 @@ return (() => {
             max_active_visualizations=self.valves.max_active_visualizations,
             point_density=self.valves.point_density,
             lifecycle_key=uuid.uuid4().hex,
+            chat_id=chat_id,
+            message_id=message_id,
         )
         response = HTMLResponse(
             content=html,

@@ -329,6 +329,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
             source_tool_call_id="call-data",
             title="Fallback",
             __messages__=[tool_message("call-data", [{"x": 1}])],
+            __metadata__={"chat_id": "chat/live", "message_id": "msg:live"},
         )
     )
 
@@ -336,13 +337,16 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.1.9' in response.body
+    assert b'tool-result-1.1.10' in response.body
     runtime = re.search(
         rb'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
         response.body,
     )
     assert runtime is not None
-    assert re.fullmatch(r"[0-9a-f]{32}", json.loads(runtime.group(1))["lifecycleKey"])
+    config = json.loads(runtime.group(1))
+    assert re.fullmatch(r"[0-9a-f]{32}", config["lifecycleKey"])
+    assert config["chatId"] == "chat/live"
+    assert config["messageId"] == "msg:live"
 
 
 def test_visualize_injects_only_the_selected_result():
@@ -650,7 +654,7 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.1.9",
+        "build": "tool-result-1.1.10",
         "lifecycleVersion": 3,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
@@ -984,6 +988,24 @@ def test_live_stream_poll_survives_observer_attachment_until_finalize():
     assert source.index("stopLocalWatchers();") < source.index(
         "window.__ivLifecycleLive"
     )
+
+
+def test_live_stream_uses_server_message_identity_before_dom_ancestry():
+    source = iv.STREAMING_OBSERVER_SCRIPT
+    configured_start = source.index("function configuredMessage()")
+    finder_start = source.index("function findMyMessage()")
+    finder_end = source.index("function determineIndex()", finder_start)
+    finder = source[finder_start:finder_end]
+    assert configured_start < finder_start
+    assert "parent.document.getElementById('message-' + messageId)" in source
+    assert finder.index("var configured = configuredMessage();") < finder.index(
+        "var frame = window.frameElement;"
+    )
+    context_start = source.index("function _ivChatContext()")
+    context_end = source.index("function _ivStartRecovery", context_start)
+    context = source[context_start:context_end]
+    assert "cfg.chatId" in context
+    assert "cfg.messageId" in context
 
 
 def test_external_libraries_preload_and_ready_waits_for_script_chain():
