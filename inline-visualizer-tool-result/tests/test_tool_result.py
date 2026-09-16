@@ -336,7 +336,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.1.1' in response.body
+    assert b'tool-result-1.1.2' in response.body
 
 
 def test_visualize_injects_only_the_selected_result():
@@ -642,7 +642,7 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.1.1",
+        "build": "tool-result-1.1.2",
         "lifecycleVersion": 1,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
@@ -765,12 +765,18 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
   [frames[3],frames[0],frames[2],frames[1]].forEach(function(item){manager.live(item,config);});
   await pause();
   const reloadStates=frames.map(function(item){return item.getAttribute('data-iv-state');});
-  await manager.activate(frames[0]);
+  const eventsBeforeRestore=events.length;
+  manager.activate(frames[0]);
+  const restoredImmediately=frames[0].getAttribute('srcdoc') === 'original-1' &&
+    frames[0].getAttribute('data-iv-state') === 'activating';
+  const restoreStartedSnapshot=events.length !== eventsBeforeRestore;
   manager.live(frames[0],config);
   await pause();
   console.log(JSON.stringify({
     reloadStates:reloadStates,
     restoredStates:frames.map(function(item){return item.getAttribute('data-iv-state');}),
+    restoredImmediately:restoredImmediately,
+    restoreStartedSnapshot:restoreStartedSnapshot,
     events:events
   }));
 })();
@@ -778,6 +784,8 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
     )
     assert result["reloadStates"] == ["static", "static", "live", "live"]
     assert result["restoredStates"] == ["live", "static", "static", "live"]
+    assert result["restoredImmediately"] is True
+    assert result["restoreStartedSnapshot"] is False
     assert len(result["events"]) >= 6
     for index in range(0, len(result["events"]), 2):
         assert result["events"][index].startswith("ready-")
@@ -790,9 +798,17 @@ def test_snapshot_readiness_waits_for_scripts_and_fade_animation():
     source = iv.STREAMING_OBSERVER_SCRIPT
     assert "window.__ivSnapshotReady = function()" in source
     assert "Promise.resolve(_ivScriptChain)" in source
-    assert "}, 550);" in source
+    assert "if (_ivSnapshotReadyPromise) return _ivSnapshotReadyPromise" in source
+    assert "}, 1100);" in source
     lifecycle = iv.LIFECYCLE_BOOTSTRAP_SCRIPT
     assert lifecycle.index("return ready();") < lifecycle.index("return creator();")
+
+
+def test_snapshot_rejects_blank_rasters_and_prefers_dominant_canvas():
+    source = iv.BODY_SCRIPTS
+    assert "function canvasLooksBlank(canvas)" in source
+    assert "if (canvasLooksBlank(out))" in source
+    assert "dominantArea / Math.max(1, pageWidth * pageHeight) >= 0.55" in source
 
 
 def test_all_iframe_scripts_keep_the_srcdoc_safety_invariant():
@@ -805,9 +821,10 @@ def test_all_iframe_scripts_keep_the_srcdoc_safety_invariant():
     [
         iv.DOWNSAMPLING_SCRIPT,
         iv.LIFECYCLE_BOOTSTRAP_SCRIPT,
+        iv.BODY_SCRIPTS,
         iv.STREAMING_OBSERVER_SCRIPT,
     ],
-    ids=["downsampling", "lifecycle", "streaming-observer"],
+    ids=["downsampling", "lifecycle", "body-scripts", "streaming-observer"],
 )
 def test_new_browser_scripts_parse_after_python_string_decoding(source):
     node = shutil.which("node")

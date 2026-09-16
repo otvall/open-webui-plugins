@@ -74,9 +74,9 @@ JSON strings are parsed before injection. Ordinary text remains a string and JSO
 
 ## Browser performance
 
-The tool keeps at most two completed visualizations interactive by default. On page reload, completed visualizations are ranked by their stable order in the chat, so the newest two remain interactive regardless of iframe load timing. When another visualization completes, the oldest eligible iframe is captured at CSS-pixel resolution and replaced with a static preview. Click the preview or **Restore interactivity** to reload it; this explicit user choice takes priority and the oldest eligible live visualization is suspended in exchange. Streaming visualizations are never suspended.
+The tool keeps at most two completed visualizations interactive by default. On page reload, completed visualizations are ranked by their stable order in the chat, so the newest two remain interactive regardless of iframe load timing. When another visualization completes, the oldest eligible iframe is captured at CSS-pixel resolution and replaced with a static preview. Click the preview or **Restore interactivity** to reload it immediately; after that iframe finishes rendering, the oldest eligible live visualization is suspended in exchange. Streaming visualizations are never suspended.
 
-Static previews are session-local. They are regenerated after a page reload and are not written to the chat or IndexedDB. Preview capture waits for imported scripts and the built-in fade-in to settle, preventing an empty canvas or transparent first frame from being frozen. The lifecycle manager applies only to visualizations created by builds that provide lifecycle version 1; older saved embeds are not migrated.
+Static previews are session-local. They are regenerated after a page reload and are not written to the chat or IndexedDB. Preview capture waits once for imported scripts, chart animation, and the built-in fade-in to settle. Canvas-first charts are captured directly, and blank raster output falls back to the secondary capture path instead of being frozen as a white rectangle. The lifecycle manager applies only to visualizations created by builds that provide lifecycle version 1; older saved embeds are not migrated.
 
 Configure this behavior in the Tool valves:
 

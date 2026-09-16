@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.1
+version: 1.1.2
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -16,7 +16,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.1"
+_IV_BUILD = "tool-result-1.1.2"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -654,18 +654,14 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         setState(frame, record, 'live');
         enforceLimit(null);
       },
-      activate: async function(frame) {
+      activate: function(frame) {
         var record = records.get(frame);
         if (!record || record.state !== 'static' || !record.originalSrcdoc) return;
         setState(frame, record, 'activating');
         record.activationOrder = ++sequence;
-        if (maxActive > 0) {
-          var active = connectedLiveFrames(frame);
-          while (active.length >= maxActive) {
-            if (!await suspend(active.shift())) break;
-            active = connectedLiveFrames(frame);
-          }
-        }
+        // Restore immediately. Once this iframe finishes rendering, live()
+        // enforces the limit and suspends the oldest eligible frame. Waiting
+        // for that victim's snapshot here made the Restore button feel stuck.
         if (!frame.isConnected) return;
         try { frame.setAttribute('srcdoc', record.originalSrcdoc); }
         catch(e) { setState(frame, record, 'static'); }
@@ -2459,7 +2455,31 @@ window._ivCreateSnapshot = function() {
       finished = true;
       resolve(value || null);
     }
-    function capCanvas(source, width, height) {
+    function canvasLooksBlank(canvas) {
+      try {
+        var ctx = canvas.getContext('2d');
+        var pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+        if (!pixels || pixels.length < 4) return true;
+        var r = pixels[0], g = pixels[1], b = pixels[2], a = pixels[3];
+        var pixelCount = pixels.length / 4;
+        var stepPixels = Math.max(1, Math.floor(pixelCount / 25000));
+        var step = stepPixels * 4;
+        var different = 0;
+        for (var i = step; i < pixels.length; i += step) {
+          if (Math.abs(pixels[i] - r) > 10 ||
+              Math.abs(pixels[i + 1] - g) > 10 ||
+              Math.abs(pixels[i + 2] - b) > 10 ||
+              Math.abs(pixels[i + 3] - a) > 10) {
+            if (++different >= 3) return false;
+          }
+        }
+        return true;
+      } catch(e) {
+        // A tainted canvas cannot be inspected, but may still be drawable.
+        return false;
+      }
+    }
+    function capCanvas(source, width, height, fallbackOnBlank) {
       try {
         var maxPixels = 2000000;
         var scale = Math.min(1, Math.sqrt(maxPixels / Math.max(1, width * height)));
@@ -2470,6 +2490,11 @@ window._ivCreateSnapshot = function() {
         ctx.fillStyle = _ivResolvedBg();
         ctx.fillRect(0, 0, out.width, out.height);
         ctx.drawImage(source, 0, 0, out.width, out.height);
+        if (canvasLooksBlank(out)) {
+          if (fallbackOnBlank) { html2canvasFallback(); return; }
+          done(null);
+          return;
+        }
         done({
           url: out.toDataURL('image/png'),
           width: width,
@@ -2486,7 +2511,7 @@ window._ivCreateSnapshot = function() {
             backgroundColor: _ivResolvedBg(), scale: 1, logging: false
           }).then(function(canvas) {
             if (dlWrap) dlWrap.style.visibility = '';
-            capCanvas(canvas, canvas.width || 1, canvas.height || 1);
+            capCanvas(canvas, canvas.width || 1, canvas.height || 1, false);
           }).catch(function() {
             if (dlWrap) dlWrap.style.visibility = '';
             done(null);
@@ -2534,6 +2559,37 @@ window._ivCreateSnapshot = function() {
         document.body.offsetHeight,
         1
       );
+
+      // Canvas-first charts (Chart.js, ECharts, Plotly WebGL) are more
+      // reliably captured from their real backing canvas than through an
+      // SVG foreignObject clone. Use the shortcut only when one canvas owns
+      // most of the visualization, so mixed KPI/dashboard layouts stay whole.
+      var renderRoot = document.getElementById('iv-render') || document.body;
+      var chartCanvases = renderRoot.querySelectorAll('canvas');
+      var dominantCanvas = null;
+      var dominantRect = null;
+      var dominantArea = 0;
+      for (var canvasIndex = 0; canvasIndex < chartCanvases.length; canvasIndex++) {
+        try {
+          var candidateRect = chartCanvases[canvasIndex].getBoundingClientRect();
+          var candidateArea = Math.max(0, candidateRect.width * candidateRect.height);
+          if (candidateArea > dominantArea) {
+            dominantCanvas = chartCanvases[canvasIndex];
+            dominantRect = candidateRect;
+            dominantArea = candidateArea;
+          }
+        } catch(e) {}
+      }
+      if (dominantCanvas && dominantArea / Math.max(1, pageWidth * pageHeight) >= 0.55) {
+        capCanvas(
+          dominantCanvas,
+          Math.max(1, Math.round(dominantRect.width)),
+          Math.max(1, Math.round(dominantRect.height)),
+          true
+        );
+        return;
+      }
+
       var clone = document.documentElement.cloneNode(true);
       var props = [
         'color', 'background-color', 'border-top-color', 'border-right-color',
@@ -2578,7 +2634,7 @@ window._ivCreateSnapshot = function() {
       var wrapper = '<svg xmlns="http://www.w3.org/2000/svg" width="' + pageWidth + '" height="' + pageHeight + '">'
         + '<foreignObject width="100%" height="100%">' + xml + '</foreignObject></svg>';
       var image = new Image();
-      image.onload = function() { capCanvas(image, pageWidth, pageHeight); };
+      image.onload = function() { capCanvas(image, pageWidth, pageHeight, true); };
       image.onerror = html2canvasFallback;
       image.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(wrapper);
     } catch(e) { html2canvasFallback(); }
@@ -3765,6 +3821,7 @@ STREAMING_OBSERVER_SCRIPT = """
   // so we chain the insertions to enforce source order.
   var _ivScriptChain = Promise.resolve();
   var _ivEnqueuedScripts = Object.create(null);
+  var _ivSnapshotReadyPromise = null;
 
   // The lifecycle manager can ask for a preview immediately after finalize.
   // Wait for imported libraries + the model's inline script, then let the
@@ -3772,16 +3829,18 @@ STREAMING_OBSERVER_SCRIPT = """
   // this handshake a reload can permanently freeze opacity:0 or an empty
   // canvas into the static preview.
   window.__ivSnapshotReady = function() {
-    return Promise.resolve(_ivScriptChain).catch(function() {}).then(function() {
+    if (_ivSnapshotReadyPromise) return _ivSnapshotReadyPromise;
+    _ivSnapshotReadyPromise = Promise.resolve(_ivScriptChain).catch(function() {}).then(function() {
       return new Promise(function(resolve) {
         setTimeout(function() {
           var raf = typeof requestAnimationFrame === 'function'
             ? requestAnimationFrame
             : function(callback) { return setTimeout(callback, 16); };
           raf(function() { raf(resolve); });
-        }, 550);
+        }, 1100);
       });
     });
+    return _ivSnapshotReadyPromise;
   };
 
   // FNV-1a content hash, used to dedupe script bodies across
@@ -4219,6 +4278,12 @@ STREAMING_OBSERVER_SCRIPT = """
     scheduleHeight();
     setTimeout(scheduleHeight, 120);
     setTimeout(scheduleHeight, 400);
+    // Start the one-shot readiness clock for every iframe concurrently.
+    // The lifecycle manager may suspend this frame later; by then the cached
+    // promise is normally already resolved and does not delay user actions.
+    try {
+      if (typeof window.__ivSnapshotReady === 'function') window.__ivSnapshotReady();
+    } catch(e) {}
     // The parent manager now owns settled-message monitoring. Stop this
     // iframe's streaming-only observers and polling before registering live.
     stopLocalWatchers();
