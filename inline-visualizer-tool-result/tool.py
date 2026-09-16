@@ -3,20 +3,21 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.7
+version: 1.1.8
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
 
 import json
 import re
+import uuid
 from typing import Any, Literal
 
 # Build marker embedded into the rendered iframe so the running
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.7"
+_IV_BUILD = "tool-result-1.1.8"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -191,14 +192,17 @@ def _build_tool_data_bridge(result: Any) -> str:
 def _build_runtime_config(
     max_active_visualizations: int = 2,
     point_density: float = 1.0,
+    lifecycle_key: str = "",
 ) -> str:
     """Serialize bounded browser-runtime settings into inert JSON."""
     config = {
         "build": _IV_BUILD,
-        "lifecycleVersion": 1,
+        "lifecycleVersion": 2,
         "maxActiveVisualizations": max_active_visualizations,
         "pointDensity": point_density,
     }
+    if lifecycle_key:
+        config["lifecycleKey"] = lifecycle_key
     return (
         '<script id="iv-runtime-config" type="application/json">'
         f"{_safe_json_for_html(config)}</script>"
@@ -398,7 +402,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
   'use strict';
 
   function installLifecycleManager() {
-    if (window.__ivLifecycleV1) return;
+    if (window.__ivLifecycleV2) return;
     var records = new WeakMap();
     var frames = new Set();
     var sequence = 0;
@@ -417,24 +421,50 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
     function setState(frame, record, state) {
       record.state = state;
       try {
-        frame.setAttribute('data-iv-lifecycle-version', '1');
+        frame.setAttribute('data-iv-lifecycle-version', '2');
         frame.setAttribute('data-iv-state', state);
       } catch(e) {}
     }
 
+    function sourceFor(frame) {
+      try { return frame.getAttribute('srcdoc') || ''; }
+      catch(e) { return ''; }
+    }
+
+    function identityFor(frame, config) {
+      var configured = config && config.lifecycleKey;
+      if (configured != null && String(configured)) return String(configured);
+      var source = sourceFor(frame);
+      return source.indexOf('data-iv-static=') < 0 ? source : '';
+    }
+
+    function newRecord(frame, config, identity) {
+      return {
+        state: 'streaming',
+        identity: identity || '',
+        originalSrcdoc: sourceFor(frame),
+        title: 'Visualization',
+        height: 0,
+        registrationOrder: ++sequence,
+        activationOrder: 0,
+        protectedUntil: 0,
+        snapshotFailedAt: 0,
+        config: config || {},
+        snapshot: null
+      };
+    }
+
     function recordFor(frame, config) {
       var record = records.get(frame);
+      var identity = identityFor(frame, config);
+      // Open WebUI reuses iframe DOM nodes while navigating between chats.
+      // A WeakMap entry therefore belongs to the visualization identity, not
+      // unconditionally to the node for the rest of the page session.
+      if (record && identity && record.identity !== identity) {
+        record = null;
+      }
       if (!record) {
-        record = {
-          state: 'streaming',
-          originalSrcdoc: frame.getAttribute('srcdoc') || '',
-          title: 'Visualization',
-          height: 0,
-          registrationOrder: ++sequence,
-          activationOrder: 0,
-          config: config || {},
-          snapshot: null
-        };
+        record = newRecord(frame, config, identity);
         records.set(frame, record);
         frames.add(frame);
       }
@@ -460,12 +490,12 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       var closeScript = '</scr' + 'ipt>';
       var behavior = "(function(){" +
         "function report(){try{parent.postMessage({type:'iframe:height',height:document.documentElement.scrollHeight},'*');}catch(e){}}" +
-        "function activate(){try{var m=parent.__ivLifecycleV1;if(m)m.activate(window.frameElement);}catch(e){}}" +
+        "function activate(){try{var m=parent.__ivLifecycleV2;if(m)m.activate(window.frameElement);}catch(e){}}" +
         "var button=document.getElementById('iv-static-activate');if(button)button.addEventListener('click',activate);" +
         "var image=document.getElementById('iv-static-image');if(image)image.addEventListener('click',activate);" +
         "window.addEventListener('load',report);setTimeout(report,0);" +
         "})();";
-      return '<!doctype html><html data-iv-static="1"><head><meta charset="utf-8">' +
+      return '<!doctype html><html data-iv-static="2"><head><meta charset="utf-8">' +
         '<meta name="viewport" content="width=device-width,initial-scale=1">' +
         '<meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; img-src data: blob:; style-src &#39;unsafe-inline&#39;; script-src &#39;unsafe-inline&#39;; form-action &#39;none&#39;; object-src &#39;none&#39;">' +
         '<title>' + title + '</title><style>' +
@@ -481,12 +511,29 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         openScript + behavior + closeScript + '</body></html>';
     }
 
+    function isFrameVisible(frame) {
+      if (!frame || !frame.isConnected) return false;
+      try {
+        if (typeof frame.getClientRects === 'function' && frame.getClientRects().length === 0) return false;
+      } catch(e) {}
+      try {
+        var rect = frame.getBoundingClientRect();
+        if (rect && ((typeof rect.width === 'number' && rect.width <= 0) ||
+          (typeof rect.height === 'number' && rect.height <= 0))) return false;
+      } catch(e) {}
+      try {
+        var style = window.getComputedStyle && window.getComputedStyle(frame);
+        if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+      } catch(e) {}
+      return true;
+    }
+
     function connectedLiveFrames(exclude) {
       var result = [];
       frames.forEach(function(frame) {
         if (!frame || !frame.isConnected) { frames.delete(frame); return; }
         var record = records.get(frame);
-        if (frame !== exclude && record && record.state === 'live') result.push(frame);
+        if (frame !== exclude && record && record.state === 'live' && isFrameVisible(frame)) result.push(frame);
       });
       result.sort(function(a, b) {
         var aRecord = records.get(a);
@@ -555,8 +602,14 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         if (doc && doc.title) record.title = doc.title;
       } catch(e) {}
       var snapshot = await snapshotWithTimeout(frame);
-      if (!frame.isConnected) return false;
+      if (!frame.isConnected || records.get(frame) !== record) return false;
+      if (!snapshot || !snapshot.url) {
+        record.snapshotFailedAt = Date.now();
+        setState(frame, record, 'live');
+        return false;
+      }
       record.snapshot = snapshot;
+      record.snapshotFailedAt = 0;
       setState(frame, record, 'static');
       try {
         frame.setAttribute('srcdoc', staticDocument(record, snapshot));
@@ -582,7 +635,18 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
           enforcePending = false;
           var active = connectedLiveFrames(exclude);
           while (active.length > maxActive) {
-            if (!await suspend(active.shift())) break;
+            var now = Date.now();
+            var candidate = null;
+            for (var i = 0; i < active.length; i++) {
+              var candidateRecord = records.get(active[i]);
+              if (!candidateRecord) continue;
+              if (candidateRecord.protectedUntil > now) continue;
+              if (candidateRecord.snapshotFailedAt && now - candidateRecord.snapshotFailedAt < 5000) continue;
+              candidate = active[i];
+              break;
+            }
+            if (!candidate) break;
+            await suspend(candidate);
             active = connectedLiveFrames(exclude);
           }
         } while (enforcePending);
@@ -630,21 +694,30 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         var batch = pendingMutationRecords;
         pendingMutationRecords = [];
         notifyTouched(batch);
+        // SPA chat switches commonly toggle class/style without reloading an
+        // iframe. Re-evaluate the limit against only the currently visible chat.
+        enforceLimit(null);
       });
     });
     try {
-      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['class', 'style', 'hidden']
+      });
     } catch(e) {}
 
-    window.__ivLifecycleV1 = {
+    window.__ivLifecycleV2 = {
       watch: function(frame, config) {
-        if (!frame || !config || Number(config.lifecycleVersion) !== 1) return;
+        if (!frame || !config || Number(config.lifecycleVersion) !== 2) return;
         maxActive = boundedMax(config.maxActiveVisualizations);
         var record = recordFor(frame, config);
         if (record.state !== 'activating') setState(frame, record, 'streaming');
       },
       live: function(frame, config) {
-        if (!frame || !config || Number(config.lifecycleVersion) !== 1) return;
+        if (!frame || !config || Number(config.lifecycleVersion) !== 2) return;
         maxActive = boundedMax(config.maxActiveVisualizations);
         var record = recordFor(frame, config);
         try {
@@ -659,6 +732,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         if (!record || record.state !== 'static' || !record.originalSrcdoc) return;
         setState(frame, record, 'activating');
         record.activationOrder = ++sequence;
+        record.protectedUntil = Date.now() + 5000;
         // Restore immediately. Once this iframe finishes rendering, live()
         // enforces the limit and suspends the oldest eligible frame. Waiting
         // for that victim's snapshot here made the Restore button feel stuck.
@@ -674,13 +748,13 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
   }
 
   try {
-    if (!parent.__ivLifecycleV1) {
+    if (!parent.__ivLifecycleV2) {
       var installer = parent.document.createElement('script');
       installer.textContent = '(' + installLifecycleManager.toString() + ')();';
       (parent.document.head || parent.document.body).appendChild(installer);
       installer.remove();
     }
-    window.__ivLifecycleManager = parent.__ivLifecycleV1 || null;
+    window.__ivLifecycleManager = parent.__ivLifecycleV2 || null;
     if (window.__ivLifecycleManager) {
       window.__ivLifecycleManager.watch(window.frameElement, window.__ivRuntimeConfig || {});
     }
@@ -4997,6 +5071,7 @@ def _build_html(
     tool_data_bridge: str = "",
     max_active_visualizations: int = 2,
     point_density: float = 1.0,
+    lifecycle_key: str = "",
 ) -> str:
     """Wrap the streaming visualization shell: empty render area + observer.
 
@@ -5027,6 +5102,7 @@ def _build_html(
     runtime_config = _build_runtime_config(
         max_active_visualizations=max_active_visualizations,
         point_density=point_density,
+        lifecycle_key=lifecycle_key,
     )
 
     # Loader sits *below* the render area so content appears to flow
@@ -5291,6 +5367,7 @@ return (() => {
             tool_data_bridge=tool_data_bridge,
             max_active_visualizations=self.valves.max_active_visualizations,
             point_density=self.valves.point_density,
+            lifecycle_key=uuid.uuid4().hex,
         )
         response = HTMLResponse(
             content=html,

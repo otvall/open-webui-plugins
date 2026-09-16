@@ -336,7 +336,13 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.1.7' in response.body
+    assert b'tool-result-1.1.8' in response.body
+    runtime = re.search(
+        rb'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
+        response.body,
+    )
+    assert runtime is not None
+    assert re.fullmatch(r"[0-9a-f]{32}", json.loads(runtime.group(1))["lifecycleKey"])
 
 
 def test_visualize_injects_only_the_selected_result():
@@ -614,7 +620,7 @@ const childWindow = {{frameElement:null,__ivRuntimeConfig:{{}}}};
 new Function('window','parent','document','MutationObserver','requestAnimationFrame',
   {json.dumps(match.group(1))}
 )(childWindow,parentWindow,{{}},FakeMutationObserver,raf);
-const manager = parentWindow.__ivLifecycleV1;
+const manager = parentWindow.__ivLifecycleV2;
 {assertion_source}
 """
     completed = subprocess.run(
@@ -644,8 +650,8 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.1.7",
-        "lifecycleVersion": 1,
+        "build": "tool-result-1.1.8",
+        "lifecycleVersion": 2,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
     }
@@ -762,7 +768,7 @@ function frame(order) {
 function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
 (async function(){
   const frames=[frame(1),frame(2),frame(3),frame(4)];
-  const config={lifecycleVersion:1,maxActiveVisualizations:2};
+  const config={lifecycleVersion:2,maxActiveVisualizations:2};
   frames.forEach(function(item){manager.watch(item,config);});
   [frames[3],frames[0],frames[2],frames[1]].forEach(function(item){manager.live(item,config);});
   await pause();
@@ -794,6 +800,159 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
         assert result["events"][index + 1] == result["events"][index].replace(
             "ready-", "snapshot-"
         )
+
+
+def test_lifecycle_resets_cached_srcdoc_when_spa_reuses_an_iframe_node():
+    result = _run_lifecycle_js(
+        """
+function frame(source, order) {
+  const attrs = {srcdoc:source};
+  return {
+    order:order,isConnected:true,style:{},parentElement:null,
+    contentDocument:{title:'Chart'},
+    contentWindow:{
+      _ivCreateSnapshot:function(){return Promise.resolve({url:'data:image/png;base64,eA=='});}
+    },
+    getAttribute:function(name){return attrs[name] || '';},
+    setAttribute:function(name,value){attrs[name]=String(value);},
+    getBoundingClientRect:function(){return {width:600,height:120};},
+    getClientRects:function(){return [{}];},
+    compareDocumentPosition:function(other){return order < other.order ? 4 : 2;},
+    closest:function(){return null;}
+  };
+}
+function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
+(async function(){
+  const reused=frame('old-visualization',1);
+  manager.watch(reused,{lifecycleVersion:2,lifecycleKey:'old',maxActiveVisualizations:1});
+  manager.live(reused,{lifecycleVersion:2,lifecycleKey:'old',maxActiveVisualizations:1});
+  reused.setAttribute('srcdoc','new-visualization');
+  manager.watch(reused,{lifecycleVersion:2,lifecycleKey:'new',maxActiveVisualizations:1});
+  manager.live(reused,{lifecycleVersion:2,lifecycleKey:'new',maxActiveVisualizations:1});
+  const latest=frame('latest-visualization',2);
+  manager.watch(latest,{lifecycleVersion:2,lifecycleKey:'latest',maxActiveVisualizations:1});
+  manager.live(latest,{lifecycleVersion:2,lifecycleKey:'latest',maxActiveVisualizations:1});
+  await pause();
+  const suspended=reused.getAttribute('data-iv-state');
+  manager.activate(reused);
+  console.log(JSON.stringify({
+    suspended:suspended,
+    restored:reused.getAttribute('srcdoc'),
+    state:reused.getAttribute('data-iv-state')
+  }));
+})();
+"""
+    )
+    assert result == {
+        "suspended": "static",
+        "restored": "new-visualization",
+        "state": "activating",
+    }
+
+
+def test_lifecycle_never_replaces_a_live_frame_with_a_missing_preview():
+    result = _run_lifecycle_js(
+        """
+function frame(order, snapshot) {
+  const attrs = {srcdoc:'visualization-' + order};
+  return {
+    order:order,isConnected:true,style:{},parentElement:null,
+    contentDocument:{title:'Chart ' + order},
+    contentWindow:{_ivCreateSnapshot:function(){return Promise.resolve(snapshot);}},
+    getAttribute:function(name){return attrs[name] || '';},
+    setAttribute:function(name,value){attrs[name]=String(value);},
+    getBoundingClientRect:function(){return {width:600,height:120};},
+    getClientRects:function(){return [{}];},
+    compareDocumentPosition:function(other){return order < other.order ? 4 : 2;},
+    closest:function(){return null;}
+  };
+}
+function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
+(async function(){
+  const missing=frame(1,null);
+  const available=frame(2,{url:'data:image/png;base64,eA=='});
+  const config={lifecycleVersion:2,maxActiveVisualizations:1};
+  [missing,available].forEach(function(item){manager.watch(item,config);manager.live(item,config);});
+  await pause();
+  console.log(JSON.stringify({
+    missingState:missing.getAttribute('data-iv-state'),
+    missingSource:missing.getAttribute('srcdoc'),
+    availableState:available.getAttribute('data-iv-state')
+  }));
+})();
+"""
+    )
+    assert result == {
+        "missingState": "live",
+        "missingSource": "visualization-1",
+        "availableState": "static",
+    }
+
+
+def test_lifecycle_limit_ignores_iframes_hidden_by_spa_chat_switching():
+    result = _run_lifecycle_js(
+        """
+function frame(order, visible) {
+  const attrs = {srcdoc:'visualization-' + order};
+  return {
+    order:order,isConnected:true,style:{},parentElement:null,
+    contentDocument:{title:'Chart ' + order},
+    contentWindow:{_ivCreateSnapshot:function(){return Promise.resolve({url:'data:image/png;base64,eA=='});}},
+    getAttribute:function(name){return attrs[name] || '';},
+    setAttribute:function(name,value){attrs[name]=String(value);},
+    getBoundingClientRect:function(){return visible ? {width:600,height:120} : {width:0,height:0};},
+    getClientRects:function(){return visible ? [{}] : [];},
+    compareDocumentPosition:function(other){return order < other.order ? 4 : 2;},
+    closest:function(){return null;}
+  };
+}
+function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
+(async function(){
+  const hidden=frame(1,false);
+  const first=frame(2,true);
+  const second=frame(3,true);
+  const config={lifecycleVersion:2,maxActiveVisualizations:1};
+  [hidden,first,second].forEach(function(item){manager.watch(item,config);manager.live(item,config);});
+  await pause();
+  console.log(JSON.stringify({
+    hidden:hidden.getAttribute('data-iv-state'),
+    first:first.getAttribute('data-iv-state'),
+    second:second.getAttribute('data-iv-state')
+  }));
+})();
+"""
+    )
+    assert result == {"hidden": "live", "first": "static", "second": "live"}
+
+
+def test_zero_active_limit_disables_lifecycle_suspension():
+    result = _run_lifecycle_js(
+        """
+function frame(order) {
+  const attrs = {srcdoc:'visualization-' + order};
+  return {
+    order:order,isConnected:true,style:{},parentElement:null,
+    contentDocument:{title:'Chart ' + order},
+    contentWindow:{_ivCreateSnapshot:function(){return Promise.resolve({url:'data:image/png;base64,eA=='});}},
+    getAttribute:function(name){return attrs[name] || '';},
+    setAttribute:function(name,value){attrs[name]=String(value);},
+    getBoundingClientRect:function(){return {width:600,height:120};},
+    getClientRects:function(){return [{}];},
+    compareDocumentPosition:function(other){return order < other.order ? 4 : 2;},
+    closest:function(){return null;}
+  };
+}
+function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
+(async function(){
+  const frames=[frame(1),frame(2),frame(3),frame(4)];
+  const config={lifecycleVersion:2,maxActiveVisualizations:0};
+  frames.forEach(function(item){manager.watch(item,config);manager.live(item,config);});
+  await pause();
+  console.log(JSON.stringify(frames.map(function(item){return item.getAttribute('data-iv-state');})));
+})();
+"""
+    )
+    assert result == ["live", "live", "live", "live"]
 
 
 def test_snapshot_readiness_waits_for_scripts_and_fade_animation():
