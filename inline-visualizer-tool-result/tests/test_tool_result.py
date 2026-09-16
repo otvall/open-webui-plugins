@@ -336,7 +336,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.1.0' in response.body
+    assert b'tool-result-1.1.1' in response.body
 
 
 def test_visualize_injects_only_the_selected_result():
@@ -584,6 +584,48 @@ def _run_downsampling_js(assertion_source, point_density=1):
     return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
+def _run_lifecycle_js(assertion_source):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for executable lifecycle tests")
+    match = re.fullmatch(
+        r"\s*<script>\s*(.*?)\s*</script>\s*",
+        iv.LIFECYCLE_BOOTSTRAP_SCRIPT,
+        re.DOTALL,
+    )
+    assert match is not None
+    source = f"""
+class FakeMutationObserver {{ constructor(callback) {{ this.callback = callback; }} observe() {{}} }}
+function raf(callback) {{ callback(); return 1; }}
+const parentWindow = {{}};
+const parentDocument = {{
+  body: {{}},
+  createElement: function() {{ return {{textContent:'', remove:function(){{}}}}; }}
+}};
+parentDocument.head = {{appendChild:function(element) {{
+  new Function('window','document','MutationObserver','requestAnimationFrame',element.textContent)(
+    parentWindow, parentDocument, FakeMutationObserver, raf
+  );
+}}}};
+parentWindow.document = parentDocument;
+const childWindow = {{frameElement:null,__ivRuntimeConfig:{{}}}};
+new Function('window','parent','document','MutationObserver','requestAnimationFrame',
+  {json.dumps(match.group(1))}
+)(childWindow,parentWindow,{{}},FakeMutationObserver,raf);
+const manager = parentWindow.__ivLifecycleV1;
+{assertion_source}
+"""
+    completed = subprocess.run(
+        [node],
+        input=source,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout.strip().splitlines()[-1])
+
+
 def test_runtime_config_and_valve_defaults_are_injected():
     valves = iv.Tools.Valves()
     assert valves.max_active_visualizations == 2
@@ -600,7 +642,7 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.1.0",
+        "build": "tool-result-1.1.1",
         "lifecycleVersion": 1,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
@@ -695,6 +737,64 @@ def test_lifecycle_static_shell_excludes_live_payloads_and_libraries():
     assert "Chart.js" not in source
 
 
+def test_lifecycle_reload_keeps_latest_dom_frames_and_waits_before_snapshot():
+    result = _run_lifecycle_js(
+        """
+const events = [];
+function frame(order) {
+  const attrs = {srcdoc:'original-' + order};
+  return {
+    order:order,isConnected:true,style:{},parentElement:null,
+    contentDocument:{title:'Chart ' + order},
+    contentWindow:{
+      __ivSnapshotReady:function(){events.push('ready-' + order);return Promise.resolve();},
+      _ivCreateSnapshot:function(){events.push('snapshot-' + order);return Promise.resolve({url:'data:image/png;base64,eA=='});}
+    },
+    getAttribute:function(name){return attrs[name] || '';},
+    setAttribute:function(name,value){attrs[name]=String(value);},
+    getBoundingClientRect:function(){return {height:120};},
+    compareDocumentPosition:function(other){return order < other.order ? 4 : 2;},
+    closest:function(){return null;}
+  };
+}
+function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
+(async function(){
+  const frames=[frame(1),frame(2),frame(3),frame(4)];
+  const config={lifecycleVersion:1,maxActiveVisualizations:2};
+  frames.forEach(function(item){manager.watch(item,config);});
+  [frames[3],frames[0],frames[2],frames[1]].forEach(function(item){manager.live(item,config);});
+  await pause();
+  const reloadStates=frames.map(function(item){return item.getAttribute('data-iv-state');});
+  await manager.activate(frames[0]);
+  manager.live(frames[0],config);
+  await pause();
+  console.log(JSON.stringify({
+    reloadStates:reloadStates,
+    restoredStates:frames.map(function(item){return item.getAttribute('data-iv-state');}),
+    events:events
+  }));
+})();
+"""
+    )
+    assert result["reloadStates"] == ["static", "static", "live", "live"]
+    assert result["restoredStates"] == ["live", "static", "static", "live"]
+    assert len(result["events"]) >= 6
+    for index in range(0, len(result["events"]), 2):
+        assert result["events"][index].startswith("ready-")
+        assert result["events"][index + 1] == result["events"][index].replace(
+            "ready-", "snapshot-"
+        )
+
+
+def test_snapshot_readiness_waits_for_scripts_and_fade_animation():
+    source = iv.STREAMING_OBSERVER_SCRIPT
+    assert "window.__ivSnapshotReady = function()" in source
+    assert "Promise.resolve(_ivScriptChain)" in source
+    assert "}, 550);" in source
+    lifecycle = iv.LIFECYCLE_BOOTSTRAP_SCRIPT
+    assert lifecycle.index("return ready();") < lifecycle.index("return creator();")
+
+
 def test_all_iframe_scripts_keep_the_srcdoc_safety_invariant():
     for name, source in iv._IFRAME_EMBEDDED_SCRIPTS.items():
         iv._assert_srcdoc_safe(name, source)
@@ -702,7 +802,12 @@ def test_all_iframe_scripts_keep_the_srcdoc_safety_invariant():
 
 @pytest.mark.parametrize(
     "source",
-    [iv.DOWNSAMPLING_SCRIPT, iv.LIFECYCLE_BOOTSTRAP_SCRIPT],
+    [
+        iv.DOWNSAMPLING_SCRIPT,
+        iv.LIFECYCLE_BOOTSTRAP_SCRIPT,
+        iv.STREAMING_OBSERVER_SCRIPT,
+    ],
+    ids=["downsampling", "lifecycle", "streaming-observer"],
 )
 def test_new_browser_scripts_parse_after_python_string_decoding(source):
     node = shutil.which("node")

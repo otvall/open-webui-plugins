@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.0
+version: 1.1.1
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -16,7 +16,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.0"
+_IV_BUILD = "tool-result-1.1.1"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -404,6 +404,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
     var sequence = 0;
     var maxActive = 2;
     var enforcing = false;
+    var enforcePending = false;
     var observerRaf = 0;
     var pendingMutationRecords = [];
 
@@ -429,7 +430,8 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
           originalSrcdoc: frame.getAttribute('srcdoc') || '',
           title: 'Visualization',
           height: 0,
-          lastActive: ++sequence,
+          registrationOrder: ++sequence,
+          activationOrder: 0,
           config: config || {},
           snapshot: null
         };
@@ -487,7 +489,22 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         if (frame !== exclude && record && record.state === 'live') result.push(frame);
       });
       result.sort(function(a, b) {
-        return records.get(a).lastActive - records.get(b).lastActive;
+        var aRecord = records.get(a);
+        var bRecord = records.get(b);
+        // A restored preview is an explicit user choice and therefore wins
+        // over passively rehydrated frames. Among untouched frames, chat DOM
+        // order is the stable chronology; iframe load/finalize order is not.
+        if (aRecord.activationOrder || bRecord.activationOrder) {
+          if (aRecord.activationOrder !== bRecord.activationOrder) {
+            return aRecord.activationOrder - bRecord.activationOrder;
+          }
+        }
+        try {
+          var position = a.compareDocumentPosition(b);
+          if (position & 4) return -1; // a precedes b
+          if (position & 2) return 1;  // a follows b
+        } catch(e) {}
+        return aRecord.registrationOrder - bRecord.registrationOrder;
       });
       return result;
     }
@@ -502,15 +519,22 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         }
         var timer = setTimeout(function() { finish(null); }, 15000);
         try {
-          var creator = frame.contentWindow && frame.contentWindow._ivCreateSnapshot;
+          var childWindow = frame.contentWindow;
+          var creator = childWindow && childWindow._ivCreateSnapshot;
+          var ready = childWindow && childWindow.__ivSnapshotReady;
           if (typeof creator !== 'function') { clearTimeout(timer); finish(null); return; }
-          Promise.resolve(creator()).then(function(value) {
-            clearTimeout(timer);
-            finish(value);
-          }, function() {
-            clearTimeout(timer);
-            finish(null);
-          });
+          var readiness = typeof ready === 'function'
+            ? Promise.resolve().then(function() { return ready(); })
+            : Promise.resolve();
+          readiness.catch(function() {}).then(function() {
+            return creator();
+          }).then(function(value) {
+              clearTimeout(timer);
+              finish(value);
+            }, function() {
+              clearTimeout(timer);
+              finish(null);
+            });
         } catch(e) {
           clearTimeout(timer);
           finish(null);
@@ -545,14 +569,23 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
     }
 
     async function enforceLimit(exclude) {
-      if (enforcing || maxActive === 0) return;
+      if (maxActive === 0) return;
+      if (enforcing) {
+        // A later iframe may become live while an older one is still being
+        // captured. Do not drop that enforcement request.
+        enforcePending = true;
+        return;
+      }
       enforcing = true;
       try {
-        var active = connectedLiveFrames(exclude);
-        while (active.length > maxActive) {
-          if (!await suspend(active.shift())) break;
-          active = connectedLiveFrames(exclude);
-        }
+        do {
+          enforcePending = false;
+          var active = connectedLiveFrames(exclude);
+          while (active.length > maxActive) {
+            if (!await suspend(active.shift())) break;
+            active = connectedLiveFrames(exclude);
+          }
+        } while (enforcePending);
       } finally {
         enforcing = false;
       }
@@ -614,7 +647,6 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         if (!frame || !config || Number(config.lifecycleVersion) !== 1) return;
         maxActive = boundedMax(config.maxActiveVisualizations);
         var record = recordFor(frame, config);
-        record.lastActive = ++sequence;
         try {
           var doc = frame.contentDocument;
           if (doc && doc.title) record.title = doc.title;
@@ -626,7 +658,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         var record = records.get(frame);
         if (!record || record.state !== 'static' || !record.originalSrcdoc) return;
         setState(frame, record, 'activating');
-        record.lastActive = ++sequence;
+        record.activationOrder = ++sequence;
         if (maxActive > 0) {
           var active = connectedLiveFrames(frame);
           while (active.length >= maxActive) {
@@ -2159,7 +2191,7 @@ function _ivDlMenu(ev) {
 }
 
 function _ivBaseName() {
-  var name = (document.title || 'visualization').replace(/[<>:"\\/|?*]+/g, '-').replace(/\s+/g, ' ').trim();
+  var name = (document.title || 'visualization').replace(/[<>:"\\/|?*]+/g, '-').replace(/\\s+/g, ' ').trim();
   if (!name) name = 'visualization';
   if (name.length > 200) name = name.substring(0, 200).trim();
   return name;
@@ -2597,7 +2629,7 @@ function _ivDownload() {
   if (dlWrap) document.body.appendChild(dlWrap);
   html = html.replace('html, body { overflow: hidden; }', '');
 
-  var fileName = (document.title || 'visualization').replace(/[<>:"\\/|?*]+/g, '-').replace(/\s+/g, ' ').trim();
+  var fileName = (document.title || 'visualization').replace(/[<>:"\\/|?*]+/g, '-').replace(/\\s+/g, ' ').trim();
   if (!fileName) fileName = 'visualization';
   // Cap at 200 chars to stay under the Windows 255-char filename limit.
   if (fileName.length > 200) fileName = fileName.substring(0, 200).trim();
@@ -3734,6 +3766,24 @@ STREAMING_OBSERVER_SCRIPT = """
   var _ivScriptChain = Promise.resolve();
   var _ivEnqueuedScripts = Object.create(null);
 
+  // The lifecycle manager can ask for a preview immediately after finalize.
+  // Wait for imported libraries + the model's inline script, then let the
+  // built-in 500 ms fade and the first chart animation frames settle. Without
+  // this handshake a reload can permanently freeze opacity:0 or an empty
+  // canvas into the static preview.
+  window.__ivSnapshotReady = function() {
+    return Promise.resolve(_ivScriptChain).catch(function() {}).then(function() {
+      return new Promise(function(resolve) {
+        setTimeout(function() {
+          var raf = typeof requestAnimationFrame === 'function'
+            ? requestAnimationFrame
+            : function(callback) { return setTimeout(callback, 16); };
+          raf(function() { raf(resolve); });
+        }, 550);
+      });
+    });
+  };
+
   // FNV-1a content hash, used to dedupe script bodies across
   // reconciler branches that may re-encounter the same node.
   function _ivHashScript(str) {
@@ -3876,7 +3926,7 @@ STREAMING_OBSERVER_SCRIPT = """
   // as text. Re-inflate consecutive bare CSS rules so the iframe can
   // apply them. Strict pattern + ≥2 adjacent rules guards against
   // accidental matches on JSON / object literals.
-  var _ivCssRule = /[A-Za-z@.#:*\[\]>+\-,\s_~()='"&]+\{\s*(?:[A-Za-z-]+\s*:\s*[^;{}<>]+;\s*)+\}/g;
+  var _ivCssRule = /[A-Za-z@.#:*\\[\\]>+\\-,\\s_~()='"&]+\\{\\s*(?:[A-Za-z-]+\\s*:\\s*[^;{}<>]+;\\s*)+\\}/g;
   function reinflateBareCSS(text) {
     if (/<style[\\s>]/i.test(text)) return text;
     _ivCssRule.lastIndex = 0;
@@ -3898,7 +3948,7 @@ STREAMING_OBSERVER_SCRIPT = """
       var group = groups[g];
       var slice = text.substring(group.start, group.end);
       // Require multiple rules in the group
-      var braces = slice.match(/\{/g);
+      var braces = slice.match(/\\{/g);
       if (!braces || braces.length < 2) continue;
       text = text.substring(0, group.start) + '<style>' + slice + '</style>' + text.substring(group.end);
     }
@@ -3996,8 +4046,8 @@ STREAMING_OBSERVER_SCRIPT = """
       var cleaned = value
         .split(START_MARK).join('')
         .split(END_MARK).join('')
-        .replace(/<\/[a-z][a-z0-9]*\s*>/gi, '');
-      try { textNode.nodeValue = cleaned.replace(/^\s+|\s+$/g, '') ? cleaned : ''; }
+        .replace(/<\\/[a-z][a-z0-9]*\\s*>/gi, '');
+      try { textNode.nodeValue = cleaned.replace(/^\\s+|\\s+$/g, '') ? cleaned : ''; }
       catch(e) {}
     }
   }
