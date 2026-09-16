@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.10
+version: 1.1.12
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -17,7 +17,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.10"
+_IV_BUILD = "tool-result-1.1.12"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -5432,11 +5432,19 @@ return (() => {
             f"the HTML source itself. Emit exactly ONE @@@VIZ-START/@@@VIZ-END pair "
             f"for this tool call."
         )
-        # Mount the wrapper immediately, before the model starts streaming the
-        # marker block in its next response. This is what allows the iframe to
-        # paint the visualization token by token instead of appearing only
-        # after the tool-result pipeline publishes its completion update.
+        # Persist the message-level embed for SPA chat restoration and mount it
+        # immediately in the live message. ALWAYS return the HTMLResponse too:
+        # native tool calling publishes authoritative chat:completion snapshots
+        # after the tool returns, and the response copy attached to the
+        # function_call_output keeps the current turn resilient to those
+        # snapshots. Open WebUI renders message.embeds after a chat switch but
+        # does not promote function_call_output.embeds back to message.embeds,
+        # so both storage paths are intentional and serve different lifecycles.
         if __event_emitter__:
-            await __event_emitter__({"type": "embeds", "data": {"embeds": [html]}})
-            return result_context
+            await __event_emitter__(
+                {
+                    "type": "embeds",
+                    "data": {"embeds": [html], "replace": False},
+                }
+            )
         return response, result_context

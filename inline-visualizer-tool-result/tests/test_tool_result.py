@@ -92,7 +92,8 @@ def capture_visualize(tool, **kwargs):
     async def emitter(event):
         events.append(event)
 
-    result = run(tool.visualize_tool_result(__event_emitter__=emitter, **kwargs))
+    returned = run(tool.visualize_tool_result(__event_emitter__=emitter, **kwargs))
+    result = returned[1] if isinstance(returned, tuple) else returned
     html = events[0]["data"]["embeds"][0] if events else None
     return result, html, events
 
@@ -337,7 +338,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.1.10' in response.body
+    assert b'tool-result-1.1.12' in response.body
     runtime = re.search(
         rb'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
         response.body,
@@ -347,6 +348,34 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert re.fullmatch(r"[0-9a-f]{32}", config["lifecycleKey"])
     assert config["chatId"] == "chat/live"
     assert config["messageId"] == "msg:live"
+
+
+def test_event_emitter_persists_message_embed_and_html_response_is_still_returned():
+    events = []
+
+    async def emitter(event):
+        events.append(event)
+
+    response, context = run(
+        iv.Tools().visualize_tool_result(
+            source_tool_call_id="call-data",
+            title="Dual path",
+            __messages__=[tool_message("call-data", [{"x": 1}])],
+            __event_emitter__=emitter,
+        )
+    )
+
+    assert isinstance(response, iv.HTMLResponse)
+    assert "waiting for content" in context
+    assert events == [
+        {
+            "type": "embeds",
+            "data": {
+                "embeds": [response.body.decode("utf-8")],
+                "replace": False,
+            },
+        }
+    ]
 
 
 def test_visualize_injects_only_the_selected_result():
@@ -654,7 +683,7 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.1.10",
+        "build": "tool-result-1.1.12",
         "lifecycleVersion": 3,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
