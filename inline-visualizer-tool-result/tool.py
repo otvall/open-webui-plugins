@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.4
+version: 1.1.5
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -16,7 +16,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.4"
+_IV_BUILD = "tool-result-1.1.5"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -3907,6 +3907,19 @@ STREAMING_OBSERVER_SCRIPT = """
     }
   }
 
+  // Start fetching referenced libraries as soon as their complete opening tag
+  // reaches the live message. This applies equally to same-origin /static
+  // assets and remote URLs. Inline code remains deferred until finalize, but
+  // first-load fetch, parse and compilation can overlap the model stream.
+  function enqueueExternalScripts(html) {
+    if (!html || html.indexOf('src=') === -1) return;
+    var temp = document.createElement('div');
+    try { temp.innerHTML = html; } catch(e) { return; }
+    var scripts;
+    try { scripts = temp.querySelectorAll('script[src]'); } catch(e) { return; }
+    for (var i = 0; i < scripts.length; i++) enqueueScript(scripts[i]);
+  }
+
   // importNode preserves SVG namespaces. Scripts go through
   // enqueueScript for source-order execution.
   function importAndAppend(parent, incoming) {
@@ -4275,33 +4288,39 @@ STREAMING_OBSERVER_SCRIPT = """
       _ivHealDirty = false;
     }, 1000);
     setTimeout(function() { clearInterval(stripInterval); }, 30000);
-    hideLoader();
     markAndAnimate(renderArea);
     // Nudge the height reporter across layout settle.
     scheduleHeight();
-    setTimeout(scheduleHeight, 120);
-    setTimeout(scheduleHeight, 400);
     // Start the one-shot readiness clock for every iframe concurrently.
     // The lifecycle manager may suspend this frame later; by then the cached
     // promise is normally already resolved and does not delay user actions.
     try {
       if (typeof window.__ivSnapshotReady === 'function') window.__ivSnapshotReady();
     } catch(e) {}
-    // The parent manager now owns settled-message monitoring. Stop this
-    // iframe's streaming-only observers and polling before registering live.
+    // The marker block is closed, so streaming observation can stop now.
     stopLocalWatchers();
-    try {
-      if (typeof window.__ivLifecycleLive === 'function') window.__ivLifecycleLive();
-    } catch(e) {}
-    // Done/failed announcement — only on live streams, not on rehydration.
-    if (wasStreaming) {
-      var failed = _ivRecovery === 'failed';
+    // A completed marker block does not mean an external chart library has
+    // finished loading. Keep the loader visible and announce readiness only
+    // after the exact script chain enqueued above has executed. For cached or
+    // script-free visualizations this resolves in the next microtask.
+    Promise.resolve(_ivScriptChain).catch(function() {}).then(function() {
+      hideLoader();
+      scheduleHeight();
+      setTimeout(scheduleHeight, 120);
+      setTimeout(scheduleHeight, 400);
       try {
-        var table = failed ? _ivScriptErrStr : _ivDoneStr;
-        if (typeof toast === 'function') toast(table[_ivLang] || table.en, failed ? 'error' : 'success');
+        if (typeof window.__ivLifecycleLive === 'function') window.__ivLifecycleLive();
       } catch(e) {}
-      try { if (!failed && typeof playDoneSound === 'function') playDoneSound(); } catch(e) {}
-    }
+      // Done/failed announcement — only on live streams, not on rehydration.
+      if (wasStreaming) {
+        var failed = _ivRecovery === 'failed';
+        try {
+          var table = failed ? _ivScriptErrStr : _ivDoneStr;
+          if (typeof toast === 'function') toast(table[_ivLang] || table.en, failed ? 'error' : 'success');
+        } catch(e) {}
+        try { if (!failed && typeof playDoneSound === 'function') playDoneSound(); } catch(e) {}
+      }
+    });
   }
 
   function isBlockClosed() {
@@ -4450,6 +4469,10 @@ STREAMING_OBSERVER_SCRIPT = """
 
     var raw = readSource();
     if (raw === null) return;
+    // Warm referenced imports while the rest of the visualization is still
+    // arriving. enqueueScript deduplicates them when finalize sees the same
+    // tags again and keeps the later inline consumer behind them in order.
+    enqueueExternalScripts(raw);
     if (raw === lastRawText) {
       scheduleFinalize(raw);
       return;
@@ -5174,12 +5197,11 @@ return (() => {
             f"the HTML source itself. Emit exactly ONE @@@VIZ-START/@@@VIZ-END pair "
             f"for this tool call."
         )
-        # Return the embed through Open WebUI's tool-result pipeline instead of
-        # emitting an early message-level `embeds` event ourselves.  The early
-        # event can arrive before the live frontend has incorporated this tool
-        # result into message.output: it is persisted by the backend, but the
-        # active page drops it and only shows it after a reload.  Returning the
-        # HTMLResponse lets OWUI attach it to function_call_output first and
-        # then publish the authoritative chat:completion update.  Legacy tool
-        # paths also convert this tuple to their normal message-level embed.
+        # Mount the wrapper immediately, before the model starts streaming the
+        # marker block in its next response. This is what allows the iframe to
+        # paint the visualization token by token instead of appearing only
+        # after the tool-result pipeline publishes its completion update.
+        if __event_emitter__:
+            await __event_emitter__({"type": "embeds", "data": {"embeds": [html]}})
+            return result_context
         return response, result_context

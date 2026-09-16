@@ -93,16 +93,7 @@ def capture_visualize(tool, **kwargs):
         events.append(event)
 
     result = run(tool.visualize_tool_result(__event_emitter__=emitter, **kwargs))
-    html = None
-    if (
-        isinstance(result, tuple)
-        and len(result) == 2
-        and isinstance(result[0], iv.HTMLResponse)
-    ):
-        response, result = result
-        html = response.body.decode("utf-8")
-    elif events:
-        html = events[0]["data"]["embeds"][0]
+    html = events[0]["data"]["embeds"][0] if events else None
     return result, html, events
 
 
@@ -345,20 +336,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.1.4' in response.body
-
-
-def test_visualize_with_event_emitter_still_uses_tool_result_pipeline():
-    result, html, events = capture_visualize(
-        iv.Tools(),
-        source_tool_call_id="call-data",
-        title="Pipeline",
-        __messages__=[tool_message("call-data", [{"x": 1}])],
-    )
-
-    assert "waiting for content" in result
-    assert extract_tool_json(html) == [{"x": 1}]
-    assert events == []
+    assert b'tool-result-1.1.5' in response.body
 
 
 def test_visualize_injects_only_the_selected_result():
@@ -520,7 +498,7 @@ def test_retry_succeeds_when_source_result_becomes_visible():
 
     assert "waiting for content" in result
     assert extract_tool_json(html) == [{"value": 42}]
-    assert events == []
+    assert len(events) == 1
 
 
 def test_invalid_retry_attempt_is_a_controlled_error():
@@ -664,7 +642,7 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.1.4",
+        "build": "tool-result-1.1.5",
         "lifecycleVersion": 1,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
@@ -837,6 +815,30 @@ def test_live_stream_poll_survives_observer_attachment_until_finalize():
     assert "observedMessage = msg;" in source
     assert source.index("stopLocalWatchers();") < source.index(
         "window.__ivLifecycleLive"
+    )
+
+
+def test_external_libraries_preload_and_ready_waits_for_script_chain():
+    source = iv.STREAMING_OBSERVER_SCRIPT
+    assert "function enqueueExternalScripts(html)" in source
+    assert "enqueueExternalScripts(raw);" in source
+    assert source.index("enqueueExternalScripts(raw);") < source.index(
+        "var cut = findSafeCut(raw);"
+    )
+    finalize_start = source.index("function finalize(fullText)")
+    finalize_end = source.index("function isBlockClosed()", finalize_start)
+    finalize_source = source[finalize_start:finalize_end]
+    assert finalize_source.index("renderSafeInto(fullText, true);") < finalize_source.index(
+        "Promise.resolve(_ivScriptChain)"
+    )
+    assert finalize_source.index("Promise.resolve(_ivScriptChain)") < finalize_source.index(
+        "hideLoader();"
+    )
+    assert finalize_source.index("hideLoader();") < finalize_source.index(
+        "window.__ivLifecycleLive"
+    )
+    assert finalize_source.index("window.__ivLifecycleLive") < finalize_source.index(
+        "if (wasStreaming)"
     )
 
 
