@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.5
+version: 1.1.7
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -16,7 +16,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.5"
+_IV_BUILD = "tool-result-1.1.7"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -2333,8 +2333,8 @@ function _ivSvgToPng(onFail) {
 
 function _ivHtml2Png() {
   // Screenshot the full visualization via html2canvas.
-  // The CDN is permitted by the iframe CSP (script-src includes jsdelivr);
-  // no data leaves the iframe (connect-src stays 'none').
+  // The helper is served by the Open WebUI origin, so it remains available
+  // when the iframe CSP permits only same-origin scripts.
   var run = function() {
     var dlWrap = document.getElementById('iv-dl-wrap');
     if (dlWrap) dlWrap.style.visibility = 'hidden';
@@ -2354,7 +2354,7 @@ function _ivHtml2Png() {
   };
   if (window.html2canvas) { run(); return; }
   var scriptEl = document.createElement('script');
-  scriptEl.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
+  scriptEl.src = '/static/html2canvs.js';
   scriptEl.onload = run;
   scriptEl.onerror = function() { _ivSvgToPng(); };
   document.head.appendChild(scriptEl);
@@ -2524,7 +2524,7 @@ window._ivCreateSnapshot = function() {
       if (window.html2canvas) { run(); return; }
       try {
         var loader = document.createElement('script');
-        loader.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
+        loader.src = '/static/html2canvs.js';
         loader.onload = run;
         loader.onerror = function() { done(null); };
         document.head.appendChild(loader);
@@ -3893,16 +3893,37 @@ STREAMING_OBSERVER_SCRIPT = """
         });
       }).catch(function() {});
     } else {
+      var isModule = false;
+      for (var m = 0; m < attrs.length; m++) {
+        if (String(attrs[m][0]).toLowerCase() === 'type' &&
+            String(attrs[m][1]).toLowerCase() === 'module') {
+          isModule = true;
+          break;
+        }
+      }
       _ivScriptChain = _ivScriptChain.then(function() {
-        try {
+        function createInlineScript() {
           var scriptEl = document.createElement('script');
           attrs.forEach(function(pair) {
             try { scriptEl.setAttribute(pair[0], pair[1]); } catch(_){}
           });
           scriptEl.setAttribute('data-iv-imported', '1');
           scriptEl.textContent = code;
-          document.head.appendChild(scriptEl);
-        } catch(e) {}
+          return scriptEl;
+        }
+        if (!isModule) {
+          try { document.head.appendChild(createInlineScript()); } catch(e) {}
+          return;
+        }
+        // Inline modules execute asynchronously, especially when they import
+        // a same-origin asset. Keep readiness behind their load event too.
+        return new Promise(function(resolve) {
+          try {
+            var moduleEl = createInlineScript();
+            moduleEl.onload = moduleEl.onerror = function() { resolve(); };
+            document.head.appendChild(moduleEl);
+          } catch(e) { resolve(); }
+        });
       }).catch(function() {});
     }
   }
@@ -3918,6 +3939,103 @@ STREAMING_OBSERVER_SCRIPT = """
     var scripts;
     try { scripts = temp.querySelectorAll('script[src]'); } catch(e) { return; }
     for (var i = 0; i < scripts.length; i++) enqueueScript(scripts[i]);
+  }
+
+  function _ivDispatchResize() {
+    try {
+      var event;
+      try { event = new Event('resize'); }
+      catch(e) {
+        event = document.createEvent('Event');
+        event.initEvent('resize', false, false);
+      }
+      window.dispatchEvent(event);
+    } catch(e) {}
+
+    // Responsive canvas libraries can initialize while their iframe is still
+    // settling and keep a zero-sized backing store until the host later
+    // changes layout. Resize known instances now instead of waiting for the
+    // assistant response to finish and trigger that host-side layout pass.
+    try {
+      var chartInstances = window.Chart && window.Chart.instances;
+      if (chartInstances) {
+        Object.keys(chartInstances).forEach(function(key) {
+          var chart = chartInstances[key];
+          try { if (chart && typeof chart.resize === 'function') chart.resize(); } catch(e) {}
+        });
+      }
+    } catch(e) {}
+    try {
+      if (window.echarts && typeof window.echarts.getInstanceByDom === 'function') {
+        var echartsNodes = document.querySelectorAll('[_echarts_instance_]');
+        for (var i = 0; i < echartsNodes.length; i++) {
+          try {
+            var echartsInstance = window.echarts.getInstanceByDom(echartsNodes[i]);
+            if (echartsInstance && typeof echartsInstance.resize === 'function') echartsInstance.resize();
+          } catch(e) {}
+        }
+      }
+    } catch(e) {}
+    try {
+      if (window.Plotly && window.Plotly.Plots && typeof window.Plotly.Plots.resize === 'function') {
+        var plotlyNodes = document.querySelectorAll('.js-plotly-plot');
+        for (var p = 0; p < plotlyNodes.length; p++) {
+          try { window.Plotly.Plots.resize(plotlyNodes[p]); } catch(e) {}
+        }
+      }
+    } catch(e) {}
+  }
+
+  function _ivHasPaintedCanvas() {
+    var canvases;
+    try { canvases = renderArea.querySelectorAll('canvas'); } catch(e) { return true; }
+    if (!canvases.length) return true;
+    for (var i = 0; i < canvases.length; i++) {
+      var canvas = canvases[i];
+      if (!(canvas.width > 0 && canvas.height > 0)) continue;
+      try {
+        var probe = document.createElement('canvas');
+        probe.width = 24;
+        probe.height = 24;
+        var ctx = probe.getContext('2d');
+        ctx.drawImage(canvas, 0, 0, probe.width, probe.height);
+        var pixels = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        for (var j = 3; j < pixels.length; j += 4) {
+          if (pixels[j] !== 0) return true;
+        }
+      } catch(e) {
+        // Tainted or non-2D canvases cannot be inspected. Treat them as ready;
+        // their owning library has already completed its synchronous setup.
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function _ivWaitForFirstPaint() {
+    return new Promise(function(resolve) {
+      var started = Date.now();
+      var nudgedAgain = false;
+      var raf = typeof requestAnimationFrame === 'function'
+        ? requestAnimationFrame
+        : function(callback) { return setTimeout(callback, 16); };
+      _ivDispatchResize();
+      function check() {
+        raf(function() {
+          var elapsed = Date.now() - started;
+          if (_ivHasPaintedCanvas() || elapsed >= 2000) {
+            raf(resolve);
+            return;
+          }
+          if (!nudgedAgain && elapsed >= 350) {
+            nudgedAgain = true;
+            _ivDispatchResize();
+          }
+          setTimeout(check, 60);
+        });
+      }
+      check();
+    });
   }
 
   // importNode preserves SVG namespaces. Scripts go through
@@ -4304,6 +4422,8 @@ STREAMING_OBSERVER_SCRIPT = """
     // after the exact script chain enqueued above has executed. For cached or
     // script-free visualizations this resolves in the next microtask.
     Promise.resolve(_ivScriptChain).catch(function() {}).then(function() {
+      return _ivWaitForFirstPaint();
+    }).then(function() {
       hideLoader();
       scheduleHeight();
       setTimeout(scheduleHeight, 120);
@@ -4794,16 +4914,13 @@ DOWNLOAD_BUTTON = (
 # CSP generation per security level
 # ---------------------------------------------------------------------------
 
-_KNOWN_CDNS = (
-    "https://cdnjs.cloudflare.com" " https://cdn.jsdelivr.net" " https://unpkg.com"
-)
+_KNOWN_CDNS = ""
 
-# The strict and balanced tags interpolate the (constant) CDN allowlist, so
-# assemble them once at import instead of rebuilding the string on every render.
+# Strict and balanced allow script execution only from the Open WebUI origin.
 _CSP_STRICT = (
     '<meta http-equiv="Content-Security-Policy" content="'
     f"default-src 'self'; "
-    f"script-src 'unsafe-inline' 'unsafe-eval' {_KNOWN_CDNS}; "
+    f"script-src 'self' 'unsafe-inline' 'unsafe-eval' {_KNOWN_CDNS}; "
     "style-src 'self' 'unsafe-inline'; "
     "connect-src 'none'; "
     "form-action 'none'; "
@@ -4817,7 +4934,7 @@ _CSP_STRICT = (
 _CSP_BALANCED = (
     '<meta http-equiv="Content-Security-Policy" content="'
     f"default-src 'self'; "
-    f"script-src 'unsafe-inline' 'unsafe-eval' {_KNOWN_CDNS}; "
+    f"script-src 'self' 'unsafe-inline' 'unsafe-eval' {_KNOWN_CDNS}; "
     "style-src 'self' 'unsafe-inline'; "
     "connect-src 'none'; "
     "form-action 'none'; "
@@ -4955,8 +5072,8 @@ def _build_html(
 #              additional hygiene (query-only; does not cover path or
 #              fragment, and does not intercept location.assign/replace).
 #              Script execution within the visualization is intentionally
-#              allowed ('unsafe-inline' + CDN allowlist) — this is
-#              required for Chart.js, D3, and interactive visualizations.
+#              allowed from 'self' plus inline/eval — this is required for
+#              locally hosted chart libraries and interactive visualizations.
 #
 #   BALANCED — Same as STRICT but allows external image loading (img-src *).
 #              No URL parameter stripping. Note: img-src * permits
@@ -4967,9 +5084,7 @@ def _build_html(
 #              requests. Use only for visualizations that fetch live API
 #              data (CORS restrictions still apply).
 #
-#   OFFLINE  — Nothing leaves the Open WebUI host. Same as STRICT but
-#              the public CDN hosts are dropped from script-src and
-#              'self' is allowed instead, so chart libraries must be
+#   OFFLINE  — Nothing leaves the Open WebUI host. Chart libraries must be
 #              served by the Open WebUI instance itself (drop the pinned
 #              files under its /static directory — see the README
 #              section "Offline mode"). External scripts, images, fonts
@@ -4990,10 +5105,10 @@ class Tools:
 
     Security is controlled via the ``security_level`` valve, which applies
     a Content Security Policy to the rendered iframe.  Defaults to STRICT,
-    which blocks outbound network requests (fetch/XHR) and form submissions
-    while allowlisting three public script CDNs.  OFFLINE additionally
-    drops the CDN allowlist for zero external connections (self-hosted
-    libraries under the instance's /static directory still load).
+    which blocks outbound network requests (fetch/XHR) and form submissions.
+    Scripts load only from the Open WebUI origin; self-hosted libraries under
+    the instance's /static directory remain available. OFFLINE additionally
+    blocks external images.
     Script execution is always permitted — it is required for interactive
     visualizations, Chart.js, and D3.  See the developer reference above
     for the full security model and its limitations.
@@ -5002,7 +5117,7 @@ class Tools:
     class Valves(BaseModel):
         security_level: Literal["strict", "balanced", "none", "offline"] = Field(
             default="strict",
-            description="Strict (default): blocks outbound fetch/XHR, images, and forms; scripts always allowed (3 public CDNs allowlisted). Offline: like Strict but with ZERO external connections — even the CDNs are blocked; libraries self-hosted under Open WebUI's /static folder still load (see README). Balanced: like Strict but also allows external images. None: no restrictions.",
+            description="Strict (default): blocks outbound fetch/XHR, images, and forms; scripts load only from the Open WebUI origin, including /static. Offline: like Strict with zero external connections. Balanced: like Strict but also allows external images. None: no restrictions.",
         )
         chime: bool = Field(
             default=True,

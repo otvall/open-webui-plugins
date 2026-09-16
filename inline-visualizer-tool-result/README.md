@@ -81,6 +81,13 @@ imports in source order. The loader and "Visualization ready" notification
 remain active until that script chain has actually completed, so the first
 library load no longer produces a false-ready blank frame.
 
+After the script chain completes, the wrapper immediately dispatches a resize
+and calls the public resize hooks exposed by Chart.js, ECharts, and Plotly.
+Canvas-based charts are kept in the loading state until their first painted
+frame (with a two-second safety timeout). This prevents responsive line charts
+from remaining blank until the surrounding assistant response finishes and
+causes Open WebUI to perform another layout pass.
+
 The tool keeps at most two completed visualizations interactive by default. On page reload, completed visualizations are ranked by their stable order in the chat, so the newest two remain interactive regardless of iframe load timing. When another visualization completes, the oldest eligible iframe is captured at CSS-pixel resolution and replaced with a static preview. Click the preview or **Restore interactivity** to reload it immediately; after that iframe finishes rendering, the oldest eligible live visualization is suspended in exchange. Streaming visualizations are never suspended.
 
 Static previews are session-local. They are regenerated after a page reload and are not written to the chat or IndexedDB. Preview capture waits once for imported scripts, chart animation, and the built-in fade-in to settle. Canvas-first charts are captured directly, and blank raster output falls back to the secondary capture path instead of being frozen as a white rectangle. The lifecycle manager applies only to visualizations created by builds that provide lifecycle version 1; older saved embeds are not migrated.

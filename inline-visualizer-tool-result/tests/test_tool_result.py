@@ -336,7 +336,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.1.5' in response.body
+    assert b'tool-result-1.1.7' in response.body
 
 
 def test_visualize_injects_only_the_selected_result():
@@ -542,9 +542,11 @@ def test_tool_data_bridge_preserves_original_runtime_and_csp_order():
 
     assert html.index("function sendPrompt") < html.index('id="iv-tool-data"')
     assert html.index("getToolData") < html.index("var START_MARK")
-    assert "cdnjs.cloudflare.com" in html
-    assert "cdn.jsdelivr.net" in html
-    assert "unpkg.com" in html
+    assert "script-src 'self' 'unsafe-inline' 'unsafe-eval'" in html
+    assert "cdnjs.cloudflare.com" not in html
+    assert "cdn.jsdelivr.net" not in html
+    assert "unpkg.com" not in html
+    assert "/static/html2canvs.js" in html
     assert "'unsafe-eval'" in html
     assert "if (src)" in html
     assert "_ivIsBlockedScript" not in html
@@ -642,7 +644,7 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.1.5",
+        "build": "tool-result-1.1.7",
         "lifecycleVersion": 1,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
@@ -832,6 +834,9 @@ def test_external_libraries_preload_and_ready_waits_for_script_chain():
         "Promise.resolve(_ivScriptChain)"
     )
     assert finalize_source.index("Promise.resolve(_ivScriptChain)") < finalize_source.index(
+        "_ivWaitForFirstPaint()"
+    )
+    assert finalize_source.index("_ivWaitForFirstPaint()") < finalize_source.index(
         "hideLoader();"
     )
     assert finalize_source.index("hideLoader();") < finalize_source.index(
@@ -840,6 +845,20 @@ def test_external_libraries_preload_and_ready_waits_for_script_chain():
     assert finalize_source.index("window.__ivLifecycleLive") < finalize_source.index(
         "if (wasStreaming)"
     )
+
+
+def test_canvas_first_paint_is_nudged_before_ready():
+    source = iv.STREAMING_OBSERVER_SCRIPT
+    assert "Inline modules execute asynchronously" in source
+    assert "moduleEl.onload = moduleEl.onerror" in source
+    assert "function _ivDispatchResize()" in source
+    assert "window.dispatchEvent(event);" in source
+    assert "window.Chart && window.Chart.instances" in source
+    assert "window.echarts.getInstanceByDom" in source
+    assert "window.Plotly.Plots.resize" in source
+    assert "function _ivHasPaintedCanvas()" in source
+    assert "function _ivWaitForFirstPaint()" in source
+    assert "elapsed >= 2000" in source
 
 
 def test_snapshot_rejects_blank_rasters_and_prefers_dominant_canvas():
