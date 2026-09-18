@@ -35,7 +35,28 @@ def host(monkeypatch):
     saved = {"embeds": ["https://example.org/existing"]}
     events, calls = [], []
     h = SimpleNamespace(request=request, saved=saved, events=events, calls=calls,
-                        access=True, model_error=None, result=None, started=None, release=None)
+                        access=True, model_error=None, result=None, started=None, release=None,
+                        model_records={}, model_checks=[], denied_models=set(), refreshed_models=None, refresh_count=0)
+
+    class Models:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            info = h.model_records.get(model_id)
+            if info is None:
+                return None
+            return SimpleNamespace(base_model_id=info.get("base_model_id"), model_dump=lambda: copy.deepcopy(info))
+
+    async def check_model_access(user, model):
+        h.model_checks.append(model["id"])
+        if model["id"] in h.denied_models:
+            raise ValueError("Access denied")
+
+    async def get_all_models(request, refresh=False, user=None):
+        assert refresh is True
+        h.refresh_count += 1
+        if h.refreshed_models is not None:
+            request.app.state.MODELS = copy.deepcopy(h.refreshed_models)
+        return list(request.app.state.MODELS.values())
 
     class Chats:
         @staticmethod
@@ -56,6 +77,7 @@ def host(monkeypatch):
             return SimpleNamespace(id="u", role="user")
 
     async def completion(child, body, **kwargs):
+        await check_model_access(kwargs["user"], {"id": body["model"]})
         calls.append((child, copy.deepcopy(body), kwargs))
         assert events and "Загрузка" in events[0]["data"]["embeds"][-1]
         if h.started:
@@ -75,6 +97,8 @@ def host(monkeypatch):
     for name, attributes in {
         "open_webui.models.chats": {"Chats": Chats},
         "open_webui.models.users": {"Users": Users},
+        "open_webui.models.models": {"Models": Models},
+        "open_webui.utils.models": {"check_model_access": check_model_access, "get_all_models": get_all_models},
         "open_webui.utils.chat": {"generate_chat_completion": completion},
         "open_webui.utils.chat_id": {"is_saved_chat_id": lambda chat_id: chat_id == "c"},
     }.items():
@@ -189,6 +213,79 @@ def test_request_isolation_context_and_model_override(host):
     assert "Build a chart" in json.dumps(body)
     assert "never forward" not in json.dumps(body)
     assert all(m["role"] != "tool" and "tool_calls" not in m for m in body["messages"])
+
+
+@pytest.mark.parametrize("source", ["cache", "database"])
+def test_workspace_agent_uses_physical_kimi_without_preset_configuration(host, source):
+    info = {"id": "main", "base_model_id": "Kimi_K2.6", "is_active": True,
+            "params": {"system": "PRESET_SYSTEM", "temperature": 0.9},
+            "meta": {"toolIds": ["private-tool"], "skillIds": ["private-skill"]}}
+    host.request.app.state.MODELS["Kimi_K2.6"] = {"id": "Kimi_K2.6", "owned_by": "openai"}
+    if source == "database":
+        del host.request.app.state.MODELS["main"]
+        host.model_records["main"] = info
+    else:
+        host.request.app.state.MODELS["main"] = {"id": "main", "preset": True, "info": info}
+    original_state = copy.deepcopy(host.request.scope["state"])
+    response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    assert artifact(response.body.decode())["data"] == {"value": 42}
+    child, body, options = host.calls[0]
+    assert body["model"] == "Kimi_K2.6"
+    assert host.model_checks == ["main", "Kimi_K2.6"]
+    assert options["bypass_filter"] is False
+    assert "PRESET_SYSTEM" not in json.dumps(body) and "private-tool" not in json.dumps(body)
+    assert "private-skill" not in json.dumps(body) and "temperature" not in body
+    assert "Build a chart" in json.dumps(body)
+    assert host.request.scope["state"] == original_state
+
+
+def test_nested_workspace_alias_and_explicit_override(host):
+    host.request.app.state.MODELS.update({
+        "override": {"id": "override", "info": {"base_model_id": "middle"}},
+        "middle": {"id": "middle", "info": {"base_model_id": "fast"}},
+    })
+    tool = iv.Tools()
+    tool.valves.generation_model_id = "override"
+    asyncio.run(tool.visualize_tool_result(**host.kwargs))
+    assert host.calls[0][1]["model"] == "fast"
+    assert host.model_checks == ["override", "middle", "fast"]
+
+
+def test_missing_base_cache_refreshes_once(host):
+    host.request.app.state.MODELS["main"] = {"id": "main", "info": {"base_model_id": "Kimi_K2.6"}}
+    host.refreshed_models = {"Kimi_K2.6": {"id": "Kimi_K2.6"}}
+    asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    assert host.refresh_count == 1 and host.calls[0][1]["model"] == "Kimi_K2.6"
+
+
+@pytest.mark.parametrize("denied", ["main", "fast"])
+def test_unwrapping_does_not_bypass_preset_or_base_permissions(host, denied):
+    host.request.app.state.MODELS["main"] = {"id": "main", "info": {"base_model_id": "fast"}}
+    host.denied_models.add(denied)
+    response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    assert "failed" in context and not host.calls
+    assert 'role="alert"' in response.body.decode()
+
+
+@pytest.mark.parametrize("kind, expected", [
+    ("cycle", "циклическая"), ("missing", "не найдена"), ("disabled", "отключена"),
+    ("pipe", "Pipe или Arena"), ("direct", "напрямую из браузера"),
+])
+def test_bad_workspace_routes_have_specific_visible_errors(host, kind, expected):
+    host.request.app.state.MODELS["main"] = {"id": "main", "info": {"base_model_id": "fast"}}
+    if kind == "cycle":
+        host.request.app.state.MODELS["fast"]["info"] = {"base_model_id": "main"}
+    elif kind == "missing":
+        del host.request.app.state.MODELS["fast"]
+    elif kind == "disabled":
+        host.request.app.state.MODELS["main"]["info"]["is_active"] = False
+    elif kind == "pipe":
+        host.request.app.state.MODELS["fast"]["pipe"] = True
+    else:
+        host.request.app.state.MODELS["fast"]["connection_type"] = "direct"
+    response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    assert expected in response.body.decode() and expected in context
+    assert not host.calls
 
 
 def test_context_normalizes_completed_outputs_and_drops_dangling_protocol():

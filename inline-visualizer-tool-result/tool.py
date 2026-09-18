@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.4.1
+version: 1.4.2
 required_open_webui_version: 0.10.2
 description: Shows a loading embed, generates HTML in a separate model request, then saves a self-contained visualization of one completed tool result. Pass the exact source call ID and a short instruction, not HTML. Requires native tool calling and a saved chat.
 """
@@ -25,7 +25,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.4.1"
+_IV_BUILD = "tool-result-1.4.2"
 _ARTIFACT_VERSION = 1
 
 _CHARTJS_URL = "/static/chart.umd.min.js"
@@ -128,6 +128,59 @@ def _generation_messages(messages, metadata, data, instruction, title):
     return result
 
 
+class _GenerationModelError(ValueError):
+    """Safe, actionable routing errors that may be displayed in the embed."""
+
+
+async def _resolve_generation_model(request, user, model_id):
+    """Unwrap workspace presets using server records, never names or guessed IDs."""
+    from open_webui.models.models import Models
+    from open_webui.utils.models import check_model_access, get_all_models
+
+    visited = set()
+    refreshed = False
+    for _ in range(8):
+        if model_id in visited:
+            raise _GenerationModelError("В настройках workspace-моделей обнаружена циклическая ссылка base_model_id.")
+        visited.add(model_id)
+        model = (getattr(request.app.state, "MODELS", None) or {}).get(model_id)
+        if model is None:
+            # Presets can be missing from the runtime cache even though the
+            # current conversation legitimately uses them. Read server-owned DB.
+            record = await Models.get_model_by_id(model_id)
+            if record is not None and record.base_model_id:
+                model = {"id": model_id, "preset": True, "info": record.model_dump()}
+            else:
+                if not refreshed:
+                    await get_all_models(request, refresh=True, user=user)
+                    refreshed = True
+                model = (getattr(request.app.state, "MODELS", None) or {}).get(model_id)
+        if not isinstance(model, dict):
+            raise _GenerationModelError("Модель не найдена среди серверных подключений OWUI. Проверьте base_model_id или generation_model_id.")
+        info = model.get("info") or {}
+        if info.get("is_active") is False:
+            raise _GenerationModelError("Выбранная workspace-модель отключена в OWUI.")
+        base_id = info.get("base_model_id")
+        if base_id:
+            if not isinstance(base_id, str):
+                raise _GenerationModelError("Некорректный base_model_id в настройках workspace-модели.")
+            # Unwrapping a preset must not grant access to an inaccessible agent.
+            # The final physical model is checked again by generate_chat_completion.
+            if user.role == "user":
+                try:
+                    await check_model_access(user, model)
+                except Exception as exc:
+                    raise _GenerationModelError("Нет доступа к выбранной workspace-модели или её базовой модели.") from exc
+            model_id = base_id
+            continue
+        if model.get("pipe") or model.get("owned_by") == "arena" or model.get("arena"):
+            raise _GenerationModelError("Базовая модель является Pipe или Arena. Укажите ID физической модели в generation_model_id.")
+        if model.get("connection_type") == "direct":
+            raise _GenerationModelError("Базовая модель подключена напрямую из браузера. Нужна серверная модель в generation_model_id.")
+        return model_id
+    raise _GenerationModelError("Слишком длинная цепочка base_model_id (более 8 моделей).")
+
+
 async def _generate_fragment(request, user_info, model_id, messages, max_tokens):
     """Isolate child request state; never inherit tools, chat IDs or event emitters."""
     from starlette.requests import Request
@@ -137,15 +190,14 @@ async def _generate_fragment(request, user_info, model_id, messages, max_tokens)
     user = await Users.get_user_by_id(user_info["id"])
     if user is None:
         raise ValueError("User not found")
-    model = request.app.state.MODELS.get(model_id)
-    if not model or model.get("pipe") or model.get("owned_by") == "arena":
-        raise ValueError("Choose a server-connected model, not a Pipe, Arena or direct browser model")
     scope = dict(request.scope)
     scope["state"] = {"metadata": {"iv_generation": True}, "user": user}
     child = Request(scope)
+    physical_model_id = await _resolve_generation_model(child, user, model_id)
+    log.info("Visualization generation model resolved: %s -> %s", model_id, physical_model_id)
     response = await generate_chat_completion(
         child,
-        {"model": model_id, "messages": messages, "stream": False, "max_tokens": max_tokens},
+        {"model": physical_model_id, "messages": messages, "stream": False, "max_tokens": max_tokens},
         user=user, bypass_filter=False, bypass_system_prompt=True,
     )
     if not isinstance(response, dict) or not response.get("choices"):
@@ -6410,7 +6462,7 @@ class Tools:
     """
 
     class Valves(BaseModel):
-        generation_model_id: str = Field(default="", description="Internal HTML model. Empty uses the current model. Must be server-connected, not Pipe/Arena/browser-direct.")
+        generation_model_id: str = Field(default="", description="Internal HTML model override. Empty resolves the current workspace model to its physical base_model_id, without preset tools/skills. Explicit preset IDs are also resolved. Final target must be server-connected, not Pipe/Arena/browser-direct.")
         generation_timeout_seconds: int = Field(default=120, ge=10, le=600, description="Internal generation timeout. No automatic paid retry.")
         generation_max_tokens: int = Field(default=8000, ge=256, le=64000, description="Internal request output token limit.")
         generation_context_max_chars: int = Field(default=400000, ge=1000, le=4000000, description="Serialized context safety ceiling. Oversized history fails visibly, never silently truncates.")
@@ -6547,11 +6599,15 @@ class Tools:
             except Exception:
                 log.warning("Could not persist cancellation for %s", visualization_id)
             raise
-        except Exception:
+        except Exception as exc:
             log.exception("Visualization generation failed %s", visualization_id)
+            message = str(exc) if isinstance(exc, _GenerationModelError) else (
+                "Не удалось создать визуализацию. Запрос прерван, превышен лимит или модель вернула ошибку.")
             document = _build_progress(visualization_id, title, deadline,
-                                       "Не удалось создать визуализацию. Запрос прерван, превышен лимит или модель вернула ошибку.")
+                                       message)
             context = f"Visualization generation failed (ID: {visualization_id}). Explain the failure. Do not retry automatically."
+            if isinstance(exc, _GenerationModelError):
+                context += " " + message
         else:
             context = (f'Visualization "{title}" generated as a self-contained embed (ID: {visualization_id}). '
                        'HTML and data are included for restoration; browser rendering is not verified. '

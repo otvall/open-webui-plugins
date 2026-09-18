@@ -11,8 +11,12 @@ VIZ markers, assistant-message DOM, a new producer call, or an old browser cache
 - Install both `tool.py` and the `visualize-tool-result` skill.
 - Use native function calling in a saved chat. The tool requires authenticated
   user/request context and the server's event emitter; temporary chats are rejected.
-- Internal generation uses `generation_model_id` (empty: current model). Select
-  a server-connected model, not a Pipe, Arena or browser-direct connection.
+- Internal generation uses `generation_model_id` (empty: current model's physical
+  base). Since 1.4.2, workspace presets are unwrapped through `info.base_model_id`
+  in the server registry, with a database fallback for uncached presets. For example,
+  a workspace agent backed by `Kimi_K2.6` generates HTML through `Kimi_K2.6` directly.
+  Explicit override IDs are unwrapped too. The final target must be server-connected,
+  not a Pipe, Arena or browser-direct connection.
 - Serve Chart.js at `/static/chart.umd.min.js` and Plotly at
   `/static/plotly.umd.min.js`. These are the only supported libraries.
   The tool does not install them. Override `chartjs_url` / `plotly_url` in
@@ -66,6 +70,14 @@ reference messages, not active tool calls. Tool schemas, reasoning fields, priva
 request metadata and chat/session event routing are not forwarded. This is not a
 claim to reproduce the provider's exact original prompt or hidden model state.
 Original request state is untouched. Model access checks remain enabled.
+
+Preset tools, skills, parameters and system prompts are not applied again to the
+child request. Already available conversation instructions and historical skill/tool
+results remain part of its context. Each workspace hop is access-checked for regular
+users; the physical target still uses OWUI's normal access checks (no bypass flag).
+Missing server models trigger at most one registry refresh. Cycles, disabled presets,
+missing targets and unsupported routes produce specific visible routing errors.
+No model ID is guessed from a display name, and no provider keys are copied into HTML.
 
 Valves: `generation_timeout_seconds=120`, `generation_max_tokens=8000`,
 `generation_context_max_chars=400000`. The context ceiling rejects oversized input
