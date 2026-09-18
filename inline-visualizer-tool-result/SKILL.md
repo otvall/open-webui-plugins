@@ -47,12 +47,13 @@ The chart shows the main changes in the completed result.
 - Structure the content as always: <style> first → visible content → <script> last.
 - Do NOT describe the HTML source in prose — users don't see it. Describe what the visualization **shows**.
 - Requires **iframe Sandbox Allow Same Origin** in Open WebUI Settings → Interface. If disabled, the wrapper shows a notice — and the user won't see the visualization itself, just the notice.
-- Any <script> you include runs **once**, **after** the full block has streamed in.
+- Inline <script> code runs **once**, **after** the full block has streamed in and its library dependencies are ready. External library downloads can start earlier.
 
 ## What's auto-injected
 
 - Theme CSS, SVG classes, color ramps, height reporting, sendPrompt() bridge, and openLink() bridge
 - The `getToolData()` bridge containing only the selected completed call's textual result
+- Chart.js (`window.Chart`) and Plotly (`window.Plotly`), loaded in parallel when the runtime is admitted. Mark consumers with `data-iv-libraries="chartjs"`, `"plotly"`, or `"chartjs plotly"`; they wait only for their dependencies. Do not add imports for these libraries.
 - `ivPointBudget()` and `ivDownsample()` for density-limited line and scatter rendering
 - Automatic suspension of older completed visualizations; static previews can be reactivated by the user
 - Pre-styled bare-tag form elements (see below) — saves tokens on simple forms
@@ -374,16 +375,20 @@ the thing itself**, not a labeled diagram about it.
 
 ## Charts (Chart.js)
 
-Load Chart.js in your HTML fragment:
-
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+Chart.js and Plotly are loaded automatically in parallel when the lifecycle
+manager admits the iframe runtime. Use `Chart` or `Plotly` directly; declare
+`data-iv-libraries="chartjs"` or `data-iv-libraries="plotly"` on the consumer
+script (space-separated for both). It runs after the full block arrives and its
+declared dependencies are ready. Do not emit another loader for either library.
+An unused library's failure does not block your script. A required library's
+failure produces an error; the administrator must correct its asset URL.
 
 Setup pattern:
 
 <div style="position: relative; height: 300px;">
   <canvas id="chart"></canvas>
 </div>
-<script>
+<script data-iv-libraries="chartjs">
 const ctx = document.getElementById('chart').getContext('2d');
 const s = getComputedStyle(document.documentElement);
 const textColor = s.getPropertyValue('--color-text-secondary').trim();
@@ -742,12 +747,14 @@ Values are JSON-serialized. If localStorage is blocked (private browsing, sandbo
 
 ---
 
-## CDN libraries
+## Chart libraries and security
 
-Strict-mode CSP allowlists three CDN hosts. Anything served from them
-loads — no plugin tweaking needed, even in strict security mode.
+Strict and balanced modes load scripts only from the Open WebUI origin.
+Use administrator-provided files under `/static/iv-libs/`, or build the chart
+as inline SVG. Public CDN libraries require `security_level="none"` and should
+be used only when that policy has been explicitly configured.
 
-Allowed hosts:
+Common public hosts when unrestricted mode is intentionally enabled:
 - cdnjs.cloudflare.com — widest coverage
 - cdn.jsdelivr.net — npm / GitHub backed, supports minor-version pinning
 - unpkg.com — npm mirror
@@ -756,22 +763,22 @@ Common picks:
 
 | Library | Why reach for it | Example loader |
 |---------|------------------|----------------|
-| **Chart.js** | Bar / line / doughnut / scatter with animation out of the box | <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script> |
+| **Chart.js** | Bar / line / doughnut / scatter with animation out of the box | Automatic: `window.Chart`; no loader needed |
 | **D3.js** | Custom data-driven SVG (force graphs, arcs, maps, non-standard charts) | <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script> |
 | **Vega-Lite** | Declarative grammar of graphics — feed it a JSON spec, it draws the chart | <script src="https://cdn.jsdelivr.net/npm/vega@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script> |
 | **ECharts** | Rich interactive dashboards, advanced chart types | <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js"></script> |
-| **Plotly** | Scientific / 3D plots, statistical charts | <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist@2"></script> |
+| **Plotly** | Scientific / 3D plots, statistical charts | Automatic: `window.Plotly`; no loader needed |
 | **vis-network** | Force-directed network / node-link graphs | <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script> (the **standalone** UMD bundle — exposes vis.Network *and* vis.DataSet. The bare vis-network.min.js on cdnjs is the *peer* build and requires vis-data loaded separately, otherwise new vis.DataSet(...) throws vis is not defined.) |
 | **Tone.js / Wavesurfer** | Audio synthesis, waveform visualisation | <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/15.0.4/Tone.js"></script> |
 
-Anything else on those three CDNs is fair game — apexcharts, d3-force,
-konva, flatpickr, etc. Pick whatever fits the topic.
+In explicitly configured unrestricted mode, other libraries on those hosts are
+also available. In strict or balanced mode, use only same-origin assets.
 
 ---
 
 ## Library init
 
-Two patterns to follow when using a CDN library:
+Two patterns to follow when using a chart library:
 
 ### 1 · Wrap a Chart.js canvas in a fixed-height container
 
@@ -791,10 +798,9 @@ If the canvas has no intrinsic height (e.g. inside a flex column without a heigh
 
 ### 2 · Source order matters
 
-Put external <script src="…"> tags **before** the inline <script> that
-uses them. They execute in order, so a consumer that runs before its
-library is loaded will fail with Chart is not defined.
+Chart.js and Plotly load automatically; declare the used library names in
+`data-iv-libraries` on each inline consumer. For other libraries, put <script src="…"> tags **before** the
+inline <script> that uses them. Additional imports execute in source order.
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script src="/static/iv-libs/d3.min.js"></script>
 <script>/* uses Chart and d3 */</script>

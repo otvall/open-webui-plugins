@@ -338,7 +338,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.1.12' in response.body
+    assert b'tool-result-1.2.0' in response.body
     runtime = re.search(
         rb'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
         response.body,
@@ -636,9 +636,11 @@ def _run_lifecycle_js(assertion_source):
     )
     assert match is not None
     source = f"""
-class FakeMutationObserver {{ constructor(callback) {{ this.callback = callback; }} observe() {{}} }}
+const observers = [];
+const parentHandlers = {{}};
+class FakeMutationObserver {{ constructor(callback) {{ this.callback = callback; observers.push(this); }} observe() {{}} disconnect() {{this.disconnected=true;}} }}
 function raf(callback) {{ callback(); return 1; }}
-const parentWindow = {{}};
+const parentWindow = {{addEventListener:function(name,callback){{parentHandlers[name]=callback;}}}};
 const parentDocument = {{
   body: {{}},
   createElement: function() {{ return {{textContent:'', remove:function(){{}}}}; }}
@@ -652,8 +654,20 @@ parentWindow.document = parentDocument;
 const childWindow = {{frameElement:null,__ivRuntimeConfig:{{}}}};
 new Function('window','parent','document','MutationObserver','requestAnimationFrame',
   {json.dumps(match.group(1))}
-)(childWindow,parentWindow,{{}},FakeMutationObserver,raf);
-const manager = parentWindow.__ivLifecycleV3;
+)(childWindow,parentWindow,{{getElementById:()=>null}},FakeMutationObserver,raf);
+const manager = parentWindow.__ivLifecycleV4;
+function makeTestFrame(order, source='source-'+order, snapshot=null) {{
+  const attrs = {{srcdoc:source}};
+  return {{order, isConnected:true, style:{{}}, parentElement:null,
+    contentDocument:{{title:'Chart'}},
+    contentWindow:{{_ivCreateSnapshot:()=>Promise.resolve(snapshot)}},
+    getAttribute:name=>attrs[name] || '',
+    setAttribute:(name,value)=>{{attrs[name]=String(value);}},
+    getBoundingClientRect:()=>({{width:600,height:200}}),
+    getClientRects:()=>[{{}}], closest:()=>null,
+    compareDocumentPosition:other=>order<other.order?4:2
+  }};
+}}
 {assertion_source}
 """
     completed = subprocess.run(
@@ -671,10 +685,14 @@ def test_runtime_config_and_valve_defaults_are_injected():
     valves = iv.Tools.Valves()
     assert valves.max_active_visualizations == 2
     assert valves.point_density == 1.0
+    assert valves.chartjs_url == "/static/iv-libs/chart.umd.min.js"
+    assert valves.plotly_url == "/static/iv-libs/plotly.min.js"
 
     html = iv._build_html(
         max_active_visualizations=4,
         point_density=1.5,
+        chartjs_url="/static/custom/chart.js",
+        plotly_url="/static/custom/plotly.js",
     )
     config_match = re.search(
         r'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
@@ -683,11 +701,34 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.1.12",
-        "lifecycleVersion": 3,
+        "build": "tool-result-1.2.0",
+        "lifecycleVersion": 4,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
+        "chartjsUrl": "/static/custom/chart.js",
+        "plotlyUrl": "/static/custom/plotly.js",
     }
+
+
+def test_tool_forwards_startup_library_valves_and_instructs_model_not_to_import():
+    tool = iv.Tools()
+    tool.valves.chartjs_url = "/assets/chart.js"
+    tool.valves.plotly_url = "/assets/plotly.js"
+    response, context = run(
+        tool.visualize_tool_result(
+            source_tool_call_id="call-data",
+            __messages__=[tool_message("call-data", [{"x": 1}])],
+        )
+    )
+    match = re.search(
+        rb'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
+        response.body,
+    )
+    assert match is not None
+    config = json.loads(match.group(1))
+    assert config["chartjsUrl"] == "/assets/chart.js"
+    assert config["plotlyUrl"] == "/assets/plotly.js"
+    assert "Do not add script tags or other loaders for Chart.js or Plotly" in context
 
 
 @pytest.mark.parametrize(
@@ -782,7 +823,7 @@ def test_lifecycle_parent_observer_cannot_loop_on_streaming_style_writes():
     source = iv.LIFECYCLE_BOOTSTRAP_SCRIPT
     assert "attributes: true" not in source
     assert "attributeFilter" not in source
-    assert "window.__ivLifecycleV3" in source
+    assert "window.__ivLifecycleV4" in source
 
 
 def test_lifecycle_reload_keeps_latest_dom_frames_and_waits_before_snapshot():
@@ -808,22 +849,24 @@ function frame(order) {
 function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
 (async function(){
   const frames=[frame(1),frame(2),frame(3),frame(4)];
-  const config={lifecycleVersion:3,maxActiveVisualizations:2};
+  const config={lifecycleVersion:4,maxActiveVisualizations:2};
   frames.forEach(function(item){manager.watch(item,config);});
   [frames[3],frames[0],frames[2],frames[1]].forEach(function(item){manager.live(item,config);});
   await pause();
   const reloadStates=frames.map(function(item){return item.getAttribute('data-iv-state');});
   const eventsBeforeRestore=events.length;
   manager.activate(frames[0]);
-  const restoredImmediately=frames[0].getAttribute('srcdoc') === 'original-1' &&
-    frames[0].getAttribute('data-iv-state') === 'activating';
+  const queuedBeforeRestore=frames[0].getAttribute('data-iv-state') === 'queued';
   const restoreStartedSnapshot=events.length !== eventsBeforeRestore;
+  await new Promise(resolve=>setTimeout(resolve,60));
+  const restoredAfterAdmission=frames[0].getAttribute('srcdoc') === 'original-1';
   manager.live(frames[0],config);
   await pause();
   console.log(JSON.stringify({
     reloadStates:reloadStates,
     restoredStates:frames.map(function(item){return item.getAttribute('data-iv-state');}),
-    restoredImmediately:restoredImmediately,
+    queuedBeforeRestore:queuedBeforeRestore,
+    restoredAfterAdmission:restoredAfterAdmission,
     restoreStartedSnapshot:restoreStartedSnapshot,
     events:events
   }));
@@ -832,7 +875,8 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
     )
     assert result["reloadStates"] == ["static", "static", "live", "live"]
     assert result["restoredStates"] == ["live", "static", "static", "live"]
-    assert result["restoredImmediately"] is True
+    assert result["queuedBeforeRestore"] is True
+    assert result["restoredAfterAdmission"] is True
     assert result["restoreStartedSnapshot"] is False
     assert len(result["events"]) >= 6
     for index in range(0, len(result["events"]), 2):
@@ -864,17 +908,18 @@ function frame(source, order) {
 function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
 (async function(){
   const reused=frame('old-visualization',1);
-  manager.watch(reused,{lifecycleVersion:3,lifecycleKey:'old',maxActiveVisualizations:1});
-  manager.live(reused,{lifecycleVersion:3,lifecycleKey:'old',maxActiveVisualizations:1});
+  manager.watch(reused,{lifecycleVersion:4,lifecycleKey:'old',maxActiveVisualizations:1});
+  manager.live(reused,{lifecycleVersion:4,lifecycleKey:'old',maxActiveVisualizations:1});
   reused.setAttribute('srcdoc','new-visualization');
-  manager.watch(reused,{lifecycleVersion:3,lifecycleKey:'new',maxActiveVisualizations:1});
-  manager.live(reused,{lifecycleVersion:3,lifecycleKey:'new',maxActiveVisualizations:1});
+  manager.watch(reused,{lifecycleVersion:4,lifecycleKey:'new',maxActiveVisualizations:1});
+  manager.live(reused,{lifecycleVersion:4,lifecycleKey:'new',maxActiveVisualizations:1});
   const latest=frame('latest-visualization',2);
-  manager.watch(latest,{lifecycleVersion:3,lifecycleKey:'latest',maxActiveVisualizations:1});
-  manager.live(latest,{lifecycleVersion:3,lifecycleKey:'latest',maxActiveVisualizations:1});
+  manager.watch(latest,{lifecycleVersion:4,lifecycleKey:'latest',maxActiveVisualizations:1});
+  manager.live(latest,{lifecycleVersion:4,lifecycleKey:'latest',maxActiveVisualizations:1});
   await pause();
   const suspended=reused.getAttribute('data-iv-state');
   manager.activate(reused);
+  await new Promise(resolve=>setTimeout(resolve,60));
   console.log(JSON.stringify({
     suspended:suspended,
     restored:reused.getAttribute('srcdoc'),
@@ -886,11 +931,11 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
     assert result == {
         "suspended": "static",
         "restored": "new-visualization",
-        "state": "activating",
+        "state": "loading",
     }
 
 
-def test_lifecycle_never_replaces_a_live_frame_with_a_missing_preview():
+def test_lifecycle_releases_live_frame_even_with_missing_preview():
     result = _run_lifecycle_js(
         """
 function frame(order, snapshot) {
@@ -911,25 +956,25 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
 (async function(){
   const missing=frame(1,null);
   const available=frame(2,{url:'data:image/png;base64,eA=='});
-  const config={lifecycleVersion:3,maxActiveVisualizations:1};
+  const config={lifecycleVersion:4,maxActiveVisualizations:1};
   [missing,available].forEach(function(item){manager.watch(item,config);manager.live(item,config);});
   await pause();
   console.log(JSON.stringify({
     missingState:missing.getAttribute('data-iv-state'),
-    missingSource:missing.getAttribute('srcdoc'),
+    hasRestore:missing.getAttribute('srcdoc').includes('Restore interactivity'),
     availableState:available.getAttribute('data-iv-state')
   }));
 })();
 """
     )
     assert result == {
-        "missingState": "live",
-        "missingSource": "visualization-1",
-        "availableState": "static",
+        "missingState": "static",
+        "hasRestore": True,
+        "availableState": "live",
     }
 
 
-def test_lifecycle_limit_ignores_iframes_hidden_by_spa_chat_switching():
+def test_lifecycle_limit_counts_iframes_hidden_by_spa_chat_switching():
     result = _run_lifecycle_js(
         """
 function frame(order, visible) {
@@ -951,7 +996,7 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
   const hidden=frame(1,false);
   const first=frame(2,true);
   const second=frame(3,true);
-  const config={lifecycleVersion:3,maxActiveVisualizations:1};
+  const config={lifecycleVersion:4,maxActiveVisualizations:1};
   [hidden,first,second].forEach(function(item){manager.watch(item,config);manager.live(item,config);});
   await pause();
   console.log(JSON.stringify({
@@ -962,7 +1007,7 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
 })();
 """
     )
-    assert result == {"hidden": "live", "first": "static", "second": "live"}
+    assert result == {"hidden": "static", "first": "static", "second": "live"}
 
 
 def test_zero_active_limit_disables_lifecycle_suspension():
@@ -985,7 +1030,7 @@ function frame(order) {
 function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
 (async function(){
   const frames=[frame(1),frame(2),frame(3),frame(4)];
-  const config={lifecycleVersion:3,maxActiveVisualizations:0};
+  const config={lifecycleVersion:4,maxActiveVisualizations:0};
   frames.forEach(function(item){manager.watch(item,config);manager.live(item,config);});
   await pause();
   console.log(JSON.stringify(frames.map(function(item){return item.getAttribute('data-iv-state');})));
@@ -1044,6 +1089,10 @@ def test_external_libraries_preload_and_ready_waits_for_script_chain():
     assert source.index("enqueueExternalScripts(raw);") < source.index(
         "var cut = findSafeCut(raw);"
     )
+    assert "function _ivLoadExternalScript(src, attrs, attempt, optional)" in source
+    assert "if (attempt < 2 && !window.__ivDisposed)" in source
+    assert "failed to load a required chart library" in source
+    assert "_ivRecovery === 'failed' || _ivScriptFailures.length > 0" in source
     finalize_start = source.index("function finalize(fullText)")
     finalize_end = source.index("function isBlockClosed()", finalize_start)
     finalize_source = source[finalize_start:finalize_end]
@@ -1078,6 +1127,19 @@ def test_canvas_first_paint_is_nudged_before_ready():
     assert "elapsed >= 2000" in source
 
 
+def test_chart_scripts_wait_for_visible_layout_and_refresh_after_chat_switch():
+    source = iv.STREAMING_OBSERVER_SCRIPT
+    assert "function _ivWaitForUsableLayout()" in source
+    assert source.index("return _ivWaitForUsableLayout();") < source.index(
+        "function createInlineScript()"
+    )
+    assert "window.__ivRefreshLayout = function()" in source
+    assert "if (!finalized || !_ivHasUsableLayout()) return;" in source
+    lifecycle = iv.LIFECYCLE_BOOTSTRAP_SCRIPT
+    assert "record.layoutObserver = new ResizeObserver" in lifecycle
+    assert "frame.contentWindow.__ivRefreshLayout" in lifecycle
+
+
 def test_snapshot_rejects_blank_rasters_and_prefers_dominant_canvas():
     source = iv.BODY_SCRIPTS
     assert "function canvasLooksBlank(canvas)" in source
@@ -1090,15 +1152,375 @@ def test_all_iframe_scripts_keep_the_srcdoc_safety_invariant():
         iv._assert_srcdoc_safe(name, source)
 
 
+def _run_startup_loader_js(scenario, config=None):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for executable browser-helper tests")
+    source = iv.STREAMING_OBSERVER_SCRIPT
+    start = source.index("  var _ivScriptChain = Promise.resolve();")
+    end = source.index("  // Start fetching referenced libraries", start)
+    harness = r"""
+const assert = require('node:assert/strict');
+const appended = [];
+const timers = new Map();
+let nextTimer = 0;
+global.setTimeout = (callback, ms) => {
+  const id = ++nextTimer;
+  timers.set(id, {callback, ms});
+  return id;
+};
+global.clearTimeout = id => timers.delete(id);
+function fireTimer(ms) {
+  const entry = [...timers].find(([, timer]) => timer.ms === ms);
+  assert.ok(entry, 'expected timer: ' + ms);
+  timers.delete(entry[0]);
+  entry[1].callback();
+}
+const document = {
+  baseURI: 'https://webui.example/chat/123',
+  documentElement: {clientWidth: 800},
+  createElement() {
+    return {
+      attributes: [], textContent: '',
+      setAttribute(name, value) { this.attributes.push({name, value}); },
+      getAttribute(name) {
+        const attr = this.attributes.find(a => a.name === name);
+        return attr ? attr.value : null;
+      }
+    };
+  },
+  head: {
+    appendChild(el) { el.parentNode = this; appended.push(el); },
+    removeChild(el) { el.parentNode = null; }
+  }
+};
+function incoming(src, code = '') {
+  const el = document.createElement('script');
+  if (src) el.setAttribute('src', src);
+  el.textContent = code;
+  return el;
+}
+async function drain() { for (let i = 0; i < 20; i++) await Promise.resolve(); }
+"""
+    completed = subprocess.run(
+        [node],
+        input=(
+            harness
+            + "\nconst window = {__ivRuntimeConfig: "
+            + json.dumps(config or {})
+            + "};\n"
+            + source[start:end]
+            + "\n(async () => {\n"
+            + scenario
+            + "\n})().catch(error => { console.error(error); process.exitCode = 1; });"
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("first_loaded", [0, 1])
+@pytest.mark.parametrize("custom_urls", [False, True])
+def test_startup_loads_both_libraries_immediately_and_waits_without_duplicates(
+    first_loaded, custom_urls
+):
+    config = (
+        {"chartjsUrl": "/assets/chart.js", "plotlyUrl": "/assets/plotly.js"}
+        if custom_urls else {}
+    )
+    urls = [
+        config.get("chartjsUrl", "/static/iv-libs/chart.umd.min.js"),
+        config.get("plotlyUrl", "/static/iv-libs/plotly.min.js"),
+    ]
+    _run_startup_loader_js(
+        "const urls = " + json.dumps(urls) + ";\n"
+        + "const first = " + str(first_loaded) + ";\n"
+        + r"""
+// No generated markup has been enqueued: both requests already started.
+assert.deepEqual(appended.map(el => el.getAttribute('src')), urls);
+for (const url of urls) {
+  enqueueScript(incoming(url));
+  enqueueScript(incoming(new URL(url, document.baseURI).href));
+}
+enqueueScript(incoming(null, 'Chart.render(); Plotly.render();'));
+await drain();
+assert.equal(appended.length, 2);
+appended[first].onload();
+await drain();
+assert.equal(appended.length, 2, 'inline must wait for the slower library');
+appended[1 - first].onload();
+await _ivScriptChain;
+assert.equal(appended.length, 3);
+assert.equal(appended[2].textContent, 'Chart.render(); Plotly.render();');
+assert.deepEqual(_ivScriptFailures, []);
+assert.equal(timers.size, 0);
+""",
+        config,
+    )
+
+
+@pytest.mark.parametrize("failure", ["error", "timeout"])
+def test_startup_library_failure_retries_and_blocks_inline_code(failure):
+    _run_startup_loader_js(
+        "const failure = " + json.dumps(failure) + ";\n"
+        + r"""
+enqueueScript(incoming(null, 'Chart.render();'));
+appended[1].onload();
+function fail(script) {
+  if (failure === 'timeout') fireTimer(12000);
+  else script.onerror();
+}
+fail(appended[0]);
+fireTimer(300);
+assert.equal(appended.length, 3);
+fail(appended[2]);
+fireTimer(600);
+assert.equal(appended.length, 4);
+fail(appended[3]);
+await _ivScriptChain;
+assert.equal(_ivScriptFailures.length, 1);
+assert.ok(_ivScriptFailures[0].includes('chartjs'));
+assert.equal(appended.length, 4, 'inline code must not run after failure');
+assert.equal(timers.size, 0, 'retries must be bounded');
+"""
+    )
+
+
+def test_startup_retry_success_unblocks_additional_imports_then_inline_code():
+    _run_startup_loader_js(r"""
+enqueueScript(incoming('/assets/d3.js'));
+enqueueScript(incoming(null, 'Chart.render();'));
+appended[0].onerror();
+appended[1].onload();
+await drain();
+assert.equal(appended.length, 3);
+fireTimer(300);
+appended[3].onload();
+await drain();
+assert.equal(appended.length, 4);
+assert.equal(appended[2].getAttribute('src'), '/assets/d3.js');
+appended[2].onload();
+await _ivScriptChain;
+assert.equal(appended.length, 5);
+assert.equal(appended[4].textContent, 'Chart.render();');
+assert.deepEqual(_ivScriptFailures, []);
+assert.equal(timers.size, 0);
+""")
+
+
+def test_optional_plotly_failure_does_not_delay_or_break_chartjs_or_plain_code():
+    _run_startup_loader_js(r"""
+enqueueScript(incoming(null, 'plainCode();'));
+enqueueScript(incoming(null, 'Chart.render();'));
+await drain();
+assert.equal(appended[2].textContent, 'plainCode();');
+appended[0].onload();
+await _ivScriptChain;
+assert.equal(appended[3].textContent, 'Chart.render();');
+appended[1].onerror(); fireTimer(300);
+appended[4].onerror(); fireTimer(600);
+appended[5].onerror();
+await drain();
+assert.deepEqual(_ivScriptFailures, []);
+assert.equal(timers.size, 0);
+""")
+
+
+def test_explicit_dependencies_support_aliases_and_failure_is_per_consumer():
+    _run_startup_loader_js(r"""
+const first = incoming(null, 'alias.render();');
+first.setAttribute('data-iv-libraries', 'plotly');
+enqueueScript(first);
+enqueueScript(incoming(null, 'Chart.render();'));
+appended[0].onload();
+appended[1].onerror(); fireTimer(300);
+appended[2].onerror(); fireTimer(600);
+appended[3].onerror();
+await _ivScriptChain;
+assert.equal(appended.length, 5);
+assert.equal(appended[4].textContent, 'Chart.render();');
+assert.equal(_ivScriptFailures.length, 1);
+""")
+
+
+def test_layout_gate_rejects_hidden_frame_and_keeps_only_one_poll_timer():
+    _run_startup_loader_js(r"""
+appended[0].onload(); appended[1].onload();
+let visible = false, resized, disconnected = false;
+window.frameElement = {isConnected:true,
+  getBoundingClientRect:()=>({width:visible?600:0,height:visible?200:0})};
+global.ResizeObserver = class {
+  constructor(callback) { resized = callback; }
+  observe() {}
+  disconnect() { disconnected = true; }
+};
+assert.equal(_ivHasUsableLayout(), false);
+const ready = _ivWaitForUsableLayout();
+resized(); resized(); resized();
+assert.equal(timers.size, 1);
+visible = true;
+resized();
+await ready;
+assert.equal(timers.size, 0);
+assert.equal(disconnected, true);
+visible = false;
+resized();
+assert.equal(timers.size, 0, 'settled observer cannot restart polling');
+""")
+
+
+def test_heavy_runtime_is_inert_until_admitted():
+    html = iv._build_html(tool_data_bridge=iv._build_tool_data_bridge({"value": 42}))
+    start = html.index('<template id="iv-runtime">')
+    end = html.index('</template>', start)
+    assert start < html.index('window.getToolData=') < end
+    assert start < html.index('var _ivLibraryLoads') < end
+    assert start < html.index('var themeObserver') < end
+    assert html.index('function installLifecycleManager()') > end
+
+
+def test_admission_starts_only_two_of_thirty_and_cleans_up_on_page_exit():
+    result = _run_lifecycle_js(r"""
+(async()=>{
+  const frames=Array.from({length:30},(_,i)=>makeTestFrame(i));
+  const config={lifecycleVersion:4,maxActiveVisualizations:2};
+  const starts=[];
+  frames.forEach(f=>{
+    manager.watch(f,config);
+    manager.requestStart(f,config,()=>{starts.push(f.order);manager.live(f,config);});
+  });
+  await new Promise(r=>setTimeout(r,180));
+  const stats=manager.stats();
+  parentHandlers.pagehide({persisted:false});
+  console.log(JSON.stringify({starts,stats,after:manager.stats()}));
+})();
+""")
+    assert result["starts"] == [29, 28]
+    assert result["stats"]["states"] == {"static": 28, "live": 2}
+    assert result["stats"]["sourceBytes"] > 0  # bounded fallback without IndexedDB
+    assert result["after"] == {"states": {}, "sourceBytes": 0, "previewBytes": 0}
+
+
+def test_preview_cache_evicts_images_but_keeps_restore_sources():
+    result = _run_lifecycle_js(r"""
+(async()=>{
+  const config={lifecycleVersion:4,maxActiveVisualizations:1};
+  const frames=Array.from({length:5},(_,i)=>makeTestFrame(i,'source-'+i,
+    {url:'data:image/png;base64,eA==',width:2000,height:2000}));
+  frames.forEach(f=>{manager.watch(f,config);manager.live(f,config);});
+  await new Promise(r=>setTimeout(r,30));
+  const stats=manager.stats();
+  const previewCount=frames.filter(f=>f.getAttribute('srcdoc').includes('<img')).length;
+  manager.activate(frames[0]);
+  await new Promise(r=>setTimeout(r,60));
+  console.log(JSON.stringify({stats,previewCount,restored:frames[0].getAttribute('srcdoc')}));
+})();
+""")
+    assert result["stats"]["previewBytes"] <= 16 * 1024 * 1024
+    assert result["previewCount"] == 1
+    assert result["restored"] == "source-0"
+
+
+def test_admission_waits_for_old_iframe_document_to_unload():
+    result = _run_lifecycle_js(r"""
+(async()=>{
+  const config={lifecycleVersion:4,maxActiveVisualizations:1};
+  const first=makeTestFrame(0), second=makeTestFrame(1);
+  let starts=0, loaded;
+  first.addEventListener=(name,callback)=>{if(name==='load')loaded=callback;};
+  first.removeEventListener=()=>{};
+  manager.watch(first,config);
+  manager.requestStart(first,config,()=>{starts++;manager.live(first,config);});
+  await new Promise(r=>setTimeout(r,130));
+  manager.watch(second,config);
+  manager.requestStart(second,config,()=>{starts++;manager.live(second,config);});
+  await new Promise(r=>setTimeout(r,130));
+  const before={starts,states:manager.stats().states};
+  first.contentDocument.documentElement={getAttribute:()=> '4'};
+  loaded();
+  await new Promise(r=>setTimeout(r,30));
+  console.log(JSON.stringify({before,after:{starts,states:manager.stats().states}}));
+})();
+""")
+    assert result["before"] == {"starts": 1, "states": {"suspending": 1, "queued": 1}}
+    assert result["after"] == {"starts": 2, "states": {"static": 1, "live": 1}}
+
+
+def test_storage_failure_preserves_source_and_does_not_admit_over_budget():
+    result = _run_lifecycle_js(r"""
+(async()=>{
+  const config={lifecycleVersion:4,maxActiveVisualizations:1};
+  const first=makeTestFrame(0,'x'.repeat(5*1024*1024));
+  const second=makeTestFrame(1);
+  let starts=0;
+  manager.watch(first,config);
+  manager.requestStart(first,config,()=>{starts++;manager.live(first,config);});
+  await new Promise(r=>setTimeout(r,130));
+  manager.watch(second,config);
+  manager.requestStart(second,config,()=>{starts++;manager.live(second,config);});
+  await new Promise(r=>setTimeout(r,130));
+  console.log(JSON.stringify({starts,stats:manager.stats(),sourceLength:first.getAttribute('srcdoc').length}));
+})();
+""")
+    assert result["starts"] == 1
+    assert result["stats"]["states"] == {"live": 1, "queued": 1}
+    assert result["stats"]["sourceBytes"] == 0
+    assert result["sourceLength"] == 5 * 1024 * 1024
+
+
+def test_unmount_prunes_shared_text_nodes_and_disposes_child():
+    result = _run_lifecycle_js(r"""
+const f=makeTestFrame(1);
+let disposed=0;
+f.contentWindow.__ivDispose=()=>disposed++;
+manager.watch(f,{lifecycleVersion:4,maxActiveVisualizations:2});
+const stale={isConnected:false}, current={isConnected:true};
+parentWindow.__ivChatBlankedNodes=[stale,current];
+parentWindow.__ivChatOriginalText=new WeakMap([[stale,'large payload']]);
+parentWindow.__ivChatBlankedSet=new WeakSet([stale,current]);
+f.isConnected=false;
+observers[0].callback([]);
+console.log(JSON.stringify({disposed,remaining:parentWindow.__ivChatBlankedNodes.length,stats:manager.stats()}));
+""")
+    assert result == {"disposed": 1, "remaining": 1, "stats": {"states": {}, "sourceBytes": 0, "previewBytes": 0}}
+
+
+def test_theme_observer_disconnects_exactly_once_on_dispose():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required")
+    scripts = [re.fullmatch(r"\s*<script>\s*(.*?)\s*</script>\s*", s, re.DOTALL).group(1)
+               for s in [iv.CLEANUP_SCRIPT, iv.THEME_DETECTION_SCRIPT]]
+    completed = subprocess.run([node], input=r"""
+const assert=require('node:assert/strict');
+let disconnected=0;
+const root={classList:{contains:()=>false},getAttribute:()=> 'light'};
+const document={documentElement:root};
+const parent={document};
+const window={addEventListener(){}};
+const getComputedStyle=()=>({colorScheme:'light'});
+class MutationObserver { observe(){} disconnect(){disconnected++;} }
+""" + "\n".join(scripts) + r"""
+window.__ivDispose(); window.__ivDispose();
+assert.equal(disconnected,1);
+assert.equal(window.__ivDisposed,true);
+""", text=True, capture_output=True, timeout=10)
+    assert completed.returncode == 0, completed.stderr
+
+
 @pytest.mark.parametrize(
     "source",
     [
         iv.DOWNSAMPLING_SCRIPT,
+        iv.CLEANUP_SCRIPT,
         iv.LIFECYCLE_BOOTSTRAP_SCRIPT,
         iv.BODY_SCRIPTS,
         iv.STREAMING_OBSERVER_SCRIPT,
     ],
-    ids=["downsampling", "lifecycle", "body-scripts", "streaming-observer"],
+    ids=["downsampling", "cleanup", "lifecycle", "body-scripts", "streaming-observer"],
 )
 def test_new_browser_scripts_parse_after_python_string_decoding(source):
     node = shutil.which("node")

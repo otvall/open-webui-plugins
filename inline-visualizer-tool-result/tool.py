@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.12
+version: 1.2.0
 required_open_webui_version: 0.10.2
 description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
@@ -17,7 +17,10 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.12"
+_IV_BUILD = "tool-result-1.2.0"
+
+_CHARTJS_URL = "/static/iv-libs/chart.umd.min.js"
+_PLOTLY_URL = "/static/iv-libs/plotly.min.js"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -195,13 +198,17 @@ def _build_runtime_config(
     lifecycle_key: str = "",
     chat_id: str = "",
     message_id: str = "",
+    chartjs_url: str = _CHARTJS_URL,
+    plotly_url: str = _PLOTLY_URL,
 ) -> str:
     """Serialize bounded browser-runtime settings into inert JSON."""
     config = {
         "build": _IV_BUILD,
-        "lifecycleVersion": 3,
+        "lifecycleVersion": 4,
         "maxActiveVisualizations": max_active_visualizations,
         "pointDensity": point_density,
+        "chartjsUrl": chartjs_url,
+        "plotlyUrl": plotly_url,
     }
     if lifecycle_key:
         config["lifecycleKey"] = lifecycle_key
@@ -402,13 +409,42 @@ DOWNSAMPLING_SCRIPT = """
 """
 
 
+CLEANUP_SCRIPT = """
+<script>
+(function() {
+  var callbacks = [];
+  window.__ivDisposed = false;
+  window.__ivOnDispose = function(callback) { callbacks.push(callback); };
+  window.__ivDispose = function() {
+    if (window.__ivDisposed) return;
+    window.__ivDisposed = true;
+    callbacks.splice(0).forEach(function(callback) { try { callback(); } catch(e) {} });
+    try {
+      Object.values((window.Chart && window.Chart.instances) || {}).forEach(function(chart) {
+        try { chart.destroy(); } catch(e) {}
+      });
+    } catch(e) {}
+    try {
+      if (window.Plotly && typeof window.Plotly.purge === 'function') {
+        document.querySelectorAll('.js-plotly-plot').forEach(function(el) { window.Plotly.purge(el); });
+      }
+    } catch(e) {}
+  };
+  window.addEventListener('pagehide', function(event) {
+    if (!event.persisted) window.__ivDispose();
+  });
+})();
+</script>
+"""
+
+
 LIFECYCLE_BOOTSTRAP_SCRIPT = """
 <script>
 (function() {
   'use strict';
 
   function installLifecycleManager() {
-    if (window.__ivLifecycleV3) return;
+    if (window.__ivLifecycleV4) return;
     var records = new WeakMap();
     var frames = new Set();
     var sequence = 0;
@@ -417,6 +453,132 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
     var enforcePending = false;
     var observerRaf = 0;
     var pendingMutationRecords = [];
+    var drainTimer = null;
+    var draining = false;
+    var drainAgain = false;
+    var stopped = false;
+    var sourceBytes = 0;
+    var sourceBudget = 8 * 1024 * 1024;
+    var previewBudget = 16 * 1024 * 1024;
+    var dbPromise = null;
+    var sessionKey = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+    var createSourceHider = /*__SOURCE_HIDER_FACTORY__*/;
+
+    // Source HTML is session-scoped, not a permanent copy of chat history.
+    // IndexedDB keeps parked datasets out of the JS heap. A bounded RAM
+    // fallback supports browsers where storage is unavailable.
+    function database() {
+      if (dbPromise) return dbPromise;
+      dbPromise = new Promise(function(resolve) {
+        try {
+          if (!window.indexedDB) { resolve(null); return; }
+          var request = window.indexedDB.open('iv-runtime-sessions-v4', 1);
+          var settled = false;
+          var deadline = setTimeout(function() { settled = true; resolve(null); }, 2000);
+          function failed() { settled = true; clearTimeout(deadline); resolve(null); }
+          request.onupgradeneeded = function() {
+            request.result.createObjectStore('sources');
+          };
+          request.onerror = request.onblocked = failed;
+          request.onsuccess = function() {
+            var db = request.result;
+            if (settled) { db.close(); return; }
+            settled = true;
+            clearTimeout(deadline);
+            db.onversionchange = function() { db.close(); };
+            try {
+              var cursor = db.transaction('sources', 'readwrite').objectStore('sources').openCursor();
+              cursor.onsuccess = function() {
+                var row = cursor.result;
+                if (!row) return;
+                if (row.value.expires < Date.now()) row.delete();
+                row.continue();
+              };
+            } catch(e) {}
+            resolve(db);
+          };
+        } catch(e) { resolve(null); }
+      });
+      return dbPromise;
+    }
+
+    async function storedSource(record, source) {
+      var db = await database();
+      if (!db) return source === undefined ? null : false;
+      return new Promise(function(resolve) {
+        try {
+          var tx = db.transaction('sources', source === undefined ? 'readonly' : 'readwrite');
+          var deadline = setTimeout(function() {
+            try { tx.abort(); } catch(e) {}
+            resolve(source === undefined ? null : false);
+          }, 2000);
+          var objectStore = tx.objectStore('sources');
+          var request = source === undefined ? objectStore.get(record.storageKey) :
+            objectStore.put({html:source, expires:Date.now() + 86400000}, record.storageKey);
+          tx.oncomplete = function() {
+            clearTimeout(deadline);
+            resolve(source === undefined ? (request.result && request.result.html) || null : true);
+          };
+          tx.onerror = tx.onabort = function() { clearTimeout(deadline); resolve(source === undefined ? null : false); };
+        } catch(e) { resolve(source === undefined ? null : false); }
+      });
+    }
+
+    function releaseSource(record) {
+      sourceBytes -= record.sourceBytes || 0;
+      record.sourceBytes = 0;
+      record.originalSrcdoc = '';
+    }
+
+    function deleteStoredSource(record) {
+      database().then(function(db) {
+        try { if (db) db.transaction('sources', 'readwrite').objectStore('sources').delete(record.storageKey); } catch(e) {}
+      });
+    }
+
+    async function saveSource(frame, record) {
+      if (record.sourceSaved || record.originalSrcdoc) return true;
+      var source = sourceFor(frame);
+      if (!source || /^\\s*(?:<!doctype html>\\s*)?<html\\s+data-iv-static=/i.test(source)) return false;
+      var saved = await storedSource(record, source);
+      if (stopped || !frame.isConnected || records.get(frame) !== record) {
+        if (saved) deleteStoredSource(record);
+        return false;
+      }
+      if (saved) {
+        record.sourceSaved = true;
+        return true;
+      }
+      var bytes = source.length * 2;
+      if (sourceBytes + bytes > sourceBudget) return false;
+      record.originalSrcdoc = source;
+      record.sourceBytes = bytes;
+      sourceBytes += bytes;
+      return true;
+    }
+
+    function disposeChild(frame) {
+      try {
+        if (frame.contentWindow && typeof frame.contentWindow.__ivDispose === 'function') {
+          frame.contentWindow.__ivDispose();
+        }
+      } catch(e) {}
+    }
+
+    function forget(frame, record) {
+      if (record) {
+        try { if (record.layoutObserver) record.layoutObserver.disconnect(); } catch(e) {}
+        try { if (record.layoutRaf) cancelAnimationFrame(record.layoutRaf); } catch(e) {}
+        record.start = null;
+        record.hideSource = null;
+        if (record.cancelPark) record.cancelPark();
+        record.snapshot = null;
+        releaseSource(record);
+        if (record.sourceSaved) deleteStoredSource(record);
+      }
+      frames.delete(frame);
+      records.delete(frame);
+    }
 
     function boundedMax(value) {
       var parsed = Math.floor(Number(value));
@@ -427,7 +589,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
     function setState(frame, record, state) {
       record.state = state;
       try {
-        frame.setAttribute('data-iv-lifecycle-version', '3');
+        frame.setAttribute('data-iv-lifecycle-version', '4');
         frame.setAttribute('data-iv-state', state);
       } catch(e) {}
     }
@@ -441,20 +603,31 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       var configured = config && config.lifecycleKey;
       if (configured != null && String(configured)) return String(configured);
       var source = sourceFor(frame);
-      return source.indexOf('data-iv-static=') < 0 ? source : '';
+      if (/^\\s*(?:<!doctype html>\\s*)?<html\\s+data-iv-static=/i.test(source)) return '';
+      var hash = 2166136261;
+      for (var i = 0; i < source.length; i++) hash = Math.imul(hash ^ source.charCodeAt(i), 16777619) >>> 0;
+      return source.length + ':' + hash.toString(36);
     }
 
     function newRecord(frame, config, identity) {
       return {
         state: 'streaming',
         identity: identity || '',
-        originalSrcdoc: sourceFor(frame),
+        originalSrcdoc: '',
+        sourceBytes: 0,
+        sourceSaved: false,
+        storageKey: sessionKey + ':' + (++sequence),
+        start: null,
+        hideSource: createSourceHider(frame, config || {}),
+        requested: false,
         title: 'Visualization',
         height: 0,
         registrationOrder: ++sequence,
         activationOrder: 0,
-        protectedUntil: 0,
-        snapshotFailedAt: 0,
+        layoutObserver: null,
+        layoutRaf: 0,
+        lastLayoutWidth: 0,
+        wasVisible: false,
         config: config || {},
         snapshot: null
       };
@@ -467,6 +640,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       // A WeakMap entry therefore belongs to the visualization identity, not
       // unconditionally to the node for the rest of the page session.
       if (record && identity && record.identity !== identity) {
+        forget(frame, record);
         record = null;
       }
       if (!record) {
@@ -491,17 +665,17 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       var image = snapshot && snapshot.url ? htmlEscape(snapshot.url) : '';
       var imageMarkup = image
         ? '<img id="iv-static-image" src="' + image + '" alt="' + title + '">'
-        : '<div class="iv-static-fallback">Preview unavailable</div>';
+        : '<div class="iv-static-fallback">Visualization paused. Click Restore interactivity to render.</div>';
       var openScript = '<scr' + 'ipt>';
       var closeScript = '</scr' + 'ipt>';
       var behavior = "(function(){" +
         "function report(){try{parent.postMessage({type:'iframe:height',height:document.documentElement.scrollHeight},'*');}catch(e){}}" +
-        "function activate(){try{var m=parent.__ivLifecycleV3;if(m)m.activate(window.frameElement);}catch(e){}}" +
+        "function activate(){try{var m=parent.__ivLifecycleV4;if(m)m.activate(window.frameElement);}catch(e){}}" +
         "var button=document.getElementById('iv-static-activate');if(button)button.addEventListener('click',activate);" +
         "var image=document.getElementById('iv-static-image');if(image)image.addEventListener('click',activate);" +
         "window.addEventListener('load',report);setTimeout(report,0);" +
         "})();";
-      return '<!doctype html><html data-iv-static="3"><head><meta charset="utf-8">' +
+      return '<!doctype html><html data-iv-static="4"><head><meta charset="utf-8">' +
         '<meta name="viewport" content="width=device-width,initial-scale=1">' +
         '<meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; img-src data: blob:; style-src &#39;unsafe-inline&#39;; script-src &#39;unsafe-inline&#39;; form-action &#39;none&#39;; object-src &#39;none&#39;">' +
         '<title>' + title + '</title><style>' +
@@ -534,12 +708,49 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       return true;
     }
 
+    function signalLayout(frame, record, force) {
+      if (!frame || !record || !frame.isConnected) return;
+      var visible = isFrameVisible(frame);
+      var width = 0;
+      try { width = frame.getBoundingClientRect().width || 0; } catch(e) {}
+      var becameVisible = visible && !record.wasVisible;
+      var widthChanged = visible && Math.abs(width - record.lastLayoutWidth) > 1;
+      record.wasVisible = visible;
+      if (visible) record.lastLayoutWidth = width;
+      if (!visible || (!force && !becameVisible && !widthChanged)) return;
+      if (record.layoutRaf) return;
+      record.layoutRaf = requestAnimationFrame(function() {
+        record.layoutRaf = 0;
+        try {
+          var refresh = frame.contentWindow && frame.contentWindow.__ivRefreshLayout;
+          if (typeof refresh === 'function') refresh();
+        } catch(e) {}
+      });
+    }
+
+    function observeFrameLayout(frame, record) {
+      if (!frame || !record || record.layoutObserver) return;
+      try {
+        if (typeof ResizeObserver === 'function') {
+          record.layoutObserver = new ResizeObserver(function() {
+            signalLayout(frame, record, false);
+          });
+          record.layoutObserver.observe(frame);
+        }
+      } catch(e) { record.layoutObserver = null; }
+      requestAnimationFrame(function() { signalLayout(frame, record, false); });
+    }
+
     function connectedLiveFrames(exclude) {
       var result = [];
       frames.forEach(function(frame) {
-        if (!frame || !frame.isConnected) { frames.delete(frame); return; }
+        if (!frame || !frame.isConnected) {
+          disposeChild(frame);
+          forget(frame, frame && records.get(frame));
+          return;
+        }
         var record = records.get(frame);
-        if (frame !== exclude && record && record.state === 'live' && isFrameVisible(frame)) result.push(frame);
+        if (frame !== exclude && record && (record.state === 'live' || record.state === 'loading' || record.state === 'suspending')) result.push(frame);
       });
       result.sort(function(a, b) {
         var aRecord = records.get(a);
@@ -547,6 +758,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         // A restored preview is an explicit user choice and therefore wins
         // over passively rehydrated frames. Among untouched frames, chat DOM
         // order is the stable chronology; iframe load/finalize order is not.
+        if (isFrameVisible(a) !== isFrameVisible(b)) return isFrameVisible(a) ? 1 : -1;
         if (aRecord.activationOrder || bRecord.activationOrder) {
           if (aRecord.activationOrder !== bRecord.activationOrder) {
             return aRecord.activationOrder - bRecord.activationOrder;
@@ -570,7 +782,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
           settled = true;
           resolve(value || null);
         }
-        var timer = setTimeout(function() { finish(null); }, 15000);
+        var timer = setTimeout(function() { finish(null); }, 1500);
         try {
           var childWindow = frame.contentWindow;
           var creator = childWindow && childWindow._ivCreateSnapshot;
@@ -580,6 +792,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
             ? Promise.resolve().then(function() { return ready(); })
             : Promise.resolve();
           readiness.catch(function() {}).then(function() {
+            if (settled) return null;
             return creator();
           }).then(function(value) {
               clearTimeout(timer);
@@ -595,9 +808,12 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       });
     }
 
-    async function suspend(frame) {
+    async function suspend(frame, interruptLoading) {
       var record = records.get(frame);
-      if (!record || record.state !== 'live' || !frame.isConnected) return false;
+      if (!record || (record.state !== 'live' && !(interruptLoading && record.state === 'loading')) || !frame.isConnected) return false;
+      var initialState = record.state;
+      if (!await saveSource(frame, record)) return false;
+      if (!frame.isConnected || records.get(frame) !== record || record.state !== initialState) return false;
       setState(frame, record, 'suspending');
       try {
         var rect = frame.getBoundingClientRect();
@@ -607,24 +823,159 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         var doc = frame.contentDocument;
         if (doc && doc.title) record.title = doc.title;
       } catch(e) {}
-      var snapshot = await snapshotWithTimeout(frame);
+      var snapshot = initialState === 'live' && isFrameVisible(frame) ? await snapshotWithTimeout(frame) : null;
       if (!frame.isConnected || records.get(frame) !== record) return false;
-      if (!snapshot || !snapshot.url) {
-        record.snapshotFailedAt = Date.now();
-        setState(frame, record, 'live');
-        return false;
-      }
-      record.snapshot = snapshot;
-      record.snapshotFailedAt = 0;
+      return await park(frame, record, snapshot);
+    }
+
+    function previewBytes(snapshot) {
+      if (!snapshot || !snapshot.url) return 0;
+      return snapshot.url.length * 2 + Math.max(0, (snapshot.width || 0) * (snapshot.height || 0) * 4);
+    }
+
+    function trimPreviews() {
+      var total = 0;
+      var cached = [];
+      frames.forEach(function(frame) {
+        var record = records.get(frame);
+        if (!record || !record.snapshot) return;
+        total += previewBytes(record.snapshot);
+        cached.push({frame:frame, record:record});
+      });
+      cached.sort(function(a,b) { return a.record.previewOrder - b.record.previewOrder; });
+      cached.forEach(function(entry) {
+        if (total <= previewBudget) return;
+        total -= previewBytes(entry.record.snapshot);
+        entry.record.snapshot = null;
+        if (entry.record.state === 'static') {
+          try { entry.frame.setAttribute('srcdoc', staticDocument(entry.record, null)); } catch(e) {}
+        }
+      });
+    }
+
+    async function park(frame, record, snapshot) {
+      record.start = null;
+      record.requested = false;
+      record.snapshot = previewBytes(snapshot) <= previewBudget ? snapshot : null;
+      record.previewOrder = ++sequence;
+      try { if (record.hideSource) record.hideSource(); } catch(e) {}
+      disposeChild(frame);
+      var resident = record.state === 'live' || record.state === 'loading' || record.state === 'suspending';
+      setState(frame, record, resident ? 'suspending' : 'parking');
+      var navigated = await new Promise(function(resolve) {
+        var settled = false, timer = null;
+        function finish(ok) {
+          if (settled) return;
+          settled = true;
+          if (timer !== null) clearTimeout(timer);
+          try { frame.removeEventListener('load', loaded); } catch(e) {}
+          record.cancelPark = null;
+          resolve(ok);
+        }
+        function loaded() {
+          try {
+            finish(records.get(frame) === record && frame.contentDocument.documentElement.getAttribute('data-iv-static') === '4');
+          } catch(e) { finish(false); }
+        }
+        record.cancelPark = function() { finish(false); };
+        try {
+          if (frame.addEventListener) {
+            frame.addEventListener('load', loaded);
+            timer = setTimeout(function() { finish(false); }, 2000);
+          }
+          frame.setAttribute('srcdoc', staticDocument(record, record.snapshot));
+          if (record.height > 0) frame.style.height = record.height + 'px';
+          if (!frame.addEventListener) finish(true); // non-browser test doubles
+        } catch(e) { finish(false); }
+      });
+      if (!frame.isConnected || records.get(frame) !== record) return false;
+      // Do not release a slot until the old document has actually unloaded.
+      // On navigation failure keep the slot reserved rather than over-admit.
+      if (!navigated) return false;
       setState(frame, record, 'static');
-      try {
-        frame.setAttribute('srcdoc', staticDocument(record, snapshot));
-        if (record.height > 0) frame.style.height = record.height + 'px';
-      } catch(e) {
-        setState(frame, record, 'live');
-        return false;
-      }
+      trimPreviews();
       return true;
+    }
+
+    function newer(a, b) {
+      var ar = records.get(a), br = records.get(b);
+      if (ar.activationOrder !== br.activationOrder) return ar.activationOrder > br.activationOrder;
+      try {
+        var position = a.compareDocumentPosition(b);
+        if (position & 2) return true;
+        if (position & 4) return false;
+      } catch(e) {}
+      return ar.registrationOrder > br.registrationOrder;
+    }
+
+    function scheduleDrain(delay) {
+      if (stopped || drainTimer !== null) return;
+      drainTimer = setTimeout(function() { drainTimer = null; drain(); }, delay || 20);
+    }
+
+    async function drain() {
+      if (stopped) return;
+      if (draining) { drainAgain = true; return; }
+      draining = true;
+      try {
+        connectedLiveFrames(null); // collect detached frames even with limit disabled
+        var queued = Array.from(frames).filter(function(frame) {
+          var r = records.get(frame);
+          return r && r.state === 'queued';
+        }).sort(function(a,b) { return newer(a,b) ? -1 : 1; });
+        for (var i = 0; i < queued.length; i++) {
+          var frame = queued[i], record = records.get(frame);
+          if (!record || !frame.isConnected || record.state !== 'queued') continue;
+          var active = connectedLiveFrames(null);
+          var canStart = maxActive === 0 || active.length < maxActive;
+          if (!canStart) {
+            var victim = active.find(function(item) { return records.get(item).state === 'live'; });
+            if (!victim && record.requested) victim = active.find(function(item) { return records.get(item).state === 'loading'; });
+            if (victim && (record.requested || newer(frame, victim))) {
+              canStart = await suspend(victim, record.requested);
+            }
+          }
+          if (!frame.isConnected || records.get(frame) !== record) continue;
+          if (!canStart) {
+            try {
+              var label = frame.contentDocument.querySelector('.iv-loading-label');
+              if (label) label.textContent = 'Waiting for an available visualization slot…';
+            } catch(e) {}
+            // Do not interrupt a still-streaming visualization. A newer
+            // request stays inert until live() releases an admission slot.
+            if (record.requested || active.some(function(item) { return newer(frame, item); })) continue;
+            if (await saveSource(frame, record) && frame.isConnected && records.get(frame) === record) await park(frame, record, null);
+            continue;
+          }
+          if (!isFrameVisible(frame) && !record.requested) {
+            if (await saveSource(frame, record) && frame.isConnected && records.get(frame) === record) await park(frame, record, null);
+            continue;
+          }
+          // At most two simultaneous initializations, even with no live cap.
+          if (active.filter(function(item) { return records.get(item).state === 'loading'; }).length >= 2) continue;
+          if (record.start) {
+            var start = record.start;
+            record.start = null;
+            setState(frame, record, 'loading');
+            start();
+          } else {
+            var source = record.originalSrcdoc || await storedSource(record);
+            if (!frame.isConnected || records.get(frame) !== record) continue;
+            if (!source) {
+              setState(frame, record, 'static');
+              try { frame.contentDocument.querySelector('.iv-static-fallback').textContent = 'Restore failed: session source unavailable. Reopen the saved chat.'; } catch(e) {}
+              try { frame.contentDocument.getElementById('iv-static-activate').textContent = 'Source unavailable — reopen the saved chat'; } catch(e) {}
+              continue;
+            }
+            record.reserved = true;
+            setState(frame, record, 'loading');
+            frame.setAttribute('srcdoc', source);
+          }
+        }
+      } finally {
+        draining = false;
+        if (drainAgain) { drainAgain = false; scheduleDrain(); }
+      }
     }
 
     async function enforceLimit(exclude) {
@@ -641,18 +992,16 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
           enforcePending = false;
           var active = connectedLiveFrames(exclude);
           while (active.length > maxActive) {
-            var now = Date.now();
             var candidate = null;
             for (var i = 0; i < active.length; i++) {
               var candidateRecord = records.get(active[i]);
               if (!candidateRecord) continue;
-              if (candidateRecord.protectedUntil > now) continue;
-              if (candidateRecord.snapshotFailedAt && now - candidateRecord.snapshotFailedAt < 5000) continue;
+              if (candidateRecord.state !== 'live') continue;
               candidate = active[i];
               break;
             }
             if (!candidate) break;
-            await suspend(candidate);
+            if (!await suspend(candidate)) break;
             active = connectedLiveFrames(exclude);
           }
         } while (enforcePending);
@@ -668,10 +1017,19 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
     }
 
     function notifyTouched(recordsList) {
+      // The shared list (unlike its companion WeakMap) owns text nodes.
+      // Prune it even when every iframe in the previous chat was removed.
+      var blanked = window.__ivChatBlankedNodes;
+      if (blanked) for (var b = blanked.length - 1; b >= 0; b--) {
+        if (!blanked[b].isConnected) {
+          try { window.__ivChatOriginalText.delete(blanked[b]); window.__ivChatBlankedSet.delete(blanked[b]); } catch(e) {}
+          blanked.splice(b, 1);
+        }
+      }
       frames.forEach(function(frame) {
-        if (!frame || !frame.isConnected) { frames.delete(frame); return; }
+        if (!frame || !frame.isConnected) { disposeChild(frame); forget(frame, frame && records.get(frame)); return; }
         var record = records.get(frame);
-        if (!record || record.state === 'static' || record.state === 'suspending') return;
+        if (!record) return;
         var message = messageFor(frame);
         if (!message) return;
         var touched = false;
@@ -683,10 +1041,15 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
           } catch(e) { touched = true; break; }
         }
         if (!touched) return;
+        if (record.state === 'static' || record.state === 'queued') {
+          try { if (record.hideSource) record.hideSource(); } catch(e) {}
+          return;
+        }
         try {
           var callback = frame.contentWindow && frame.contentWindow.__ivHandleParentMutation;
           if (typeof callback === 'function') callback();
         } catch(e) {}
+        signalLayout(frame, record, true);
       });
     }
 
@@ -705,6 +1068,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         // streaming renderer changes styles while hiding VIZ source, and an
         // attribute observer would feed those writes back into tick().
         enforceLimit(null);
+        scheduleDrain();
       });
     });
     try {
@@ -715,15 +1079,31 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       });
     } catch(e) {}
 
-    window.__ivLifecycleV3 = {
+    window.__ivLifecycleV4 = {
       watch: function(frame, config) {
-        if (!frame || !config || Number(config.lifecycleVersion) !== 3) return;
+        if (!frame || !config || Number(config.lifecycleVersion) !== 4) return;
         maxActive = boundedMax(config.maxActiveVisualizations);
         var record = recordFor(frame, config);
-        if (record.state !== 'activating') setState(frame, record, 'streaming');
+        observeFrameLayout(frame, record);
+        if (!record.reserved) setState(frame, record, 'streaming');
+      },
+      requestStart: function(frame, config, start) {
+        var record = recordFor(frame, config);
+        if (record.reserved) {
+          record.reserved = false;
+          start();
+          return;
+        }
+        record.start = start;
+        setState(frame, record, 'queued');
+        // Coalesce a chat-history mount burst before selecting the newest
+        // frames. DOM mutations do not reset this deadline.
+        if (drainTimer !== null) clearTimeout(drainTimer);
+        drainTimer = null;
+        scheduleDrain(100);
       },
       live: function(frame, config) {
-        if (!frame || !config || Number(config.lifecycleVersion) !== 3) return;
+        if (!frame || !config || Number(config.lifecycleVersion) !== 4) return;
         maxActive = boundedMax(config.maxActiveVisualizations);
         var record = recordFor(frame, config);
         try {
@@ -731,36 +1111,51 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
           if (doc && doc.title) record.title = doc.title;
         } catch(e) {}
         setState(frame, record, 'live');
+        observeFrameLayout(frame, record);
+        signalLayout(frame, record, true);
         enforceLimit(null);
+        scheduleDrain();
       },
       activate: function(frame) {
         var record = records.get(frame);
-        if (!record || record.state !== 'static' || !record.originalSrcdoc) return;
-        setState(frame, record, 'activating');
+        if (!record || (record.state !== 'static' && !(record.state === 'queued' && record.start))) return;
+        setState(frame, record, 'queued');
         record.activationOrder = ++sequence;
-        record.protectedUntil = Date.now() + 5000;
-        // Restore immediately. Once this iframe finishes rendering, live()
-        // enforces the limit and suspends the oldest eligible frame. Waiting
-        // for that victim's snapshot here made the Restore button feel stuck.
-        if (!frame.isConnected) return;
-        try { frame.setAttribute('srcdoc', record.originalSrcdoc); }
-        catch(e) { setState(frame, record, 'static'); }
+        record.requested = true;
+        scheduleDrain();
       },
       state: function(frame) {
         var record = records.get(frame);
         return record ? record.state : null;
+      },
+      stats: function() {
+        var states = {}, previews = 0;
+        frames.forEach(function(frame) {
+          var r = records.get(frame);
+          if (!r) return;
+          states[r.state] = (states[r.state] || 0) + 1;
+          previews += previewBytes(r.snapshot);
+        });
+        return {states:states, sourceBytes:sourceBytes, previewBytes:previews};
       }
     };
+    window.addEventListener('pagehide', function(event) {
+      if (event.persisted) return;
+      stopped = true;
+      if (drainTimer !== null) clearTimeout(drainTimer);
+      observer.disconnect();
+      frames.forEach(function(frame) { disposeChild(frame); forget(frame, records.get(frame)); });
+    });
   }
 
   try {
-    if (!parent.__ivLifecycleV3) {
+    if (!parent.__ivLifecycleV4) {
       var installer = parent.document.createElement('script');
       installer.textContent = '(' + installLifecycleManager.toString() + ')();';
       (parent.document.head || parent.document.body).appendChild(installer);
       installer.remove();
     }
-    window.__ivLifecycleManager = parent.__ivLifecycleV3 || null;
+    window.__ivLifecycleManager = parent.__ivLifecycleV4 || null;
     if (window.__ivLifecycleManager) {
       window.__ivLifecycleManager.watch(window.frameElement, window.__ivRuntimeConfig || {});
     }
@@ -775,6 +1170,23 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       }
     } catch(e) {}
   };
+  function startRuntime() {
+    var template = document.getElementById('iv-runtime');
+    if (!template) return;
+    var startButton = document.getElementById('iv-start');
+    if (startButton) startButton.remove();
+    var scripts = Array.from(template.content.querySelectorAll('script'));
+    template.remove();
+    scripts.forEach(function(source) {
+      var script = document.createElement('script');
+      Array.from(source.attributes).forEach(function(attr) { script.setAttribute(attr.name, attr.value); });
+      script.textContent = source.textContent;
+      document.body.appendChild(script);
+    });
+  }
+  if (window.__ivLifecycleManager && window.frameElement) {
+    window.__ivLifecycleManager.requestStart(window.frameElement, window.__ivRuntimeConfig || {}, startRuntime);
+  } else { startRuntime(); }
 })();
 </script>
 """
@@ -1379,8 +1791,7 @@ dl[data-layout="inline"] > div > dd {
 # ---------------------------------------------------------------------------
 # Injected JavaScript — theme detection (head), height reporting & bridges (body)
 # ---------------------------------------------------------------------------
-# Theme script runs in <head> before user content so CSS vars are resolved
-# when model scripts read them at parse time.
+# Theme detection runs in the admitted runtime before model scripts.
 #
 # !! SRCDOC SAFETY !!  Do NOT write the literal tokens <!-- , --> ,
 # <![CDATA[ , ]]> , <script> or </script> ANYWHERE in this body —
@@ -1422,15 +1833,19 @@ THEME_DETECTION_SCRIPT = """
   try {
     var parentRoot = parent.document.documentElement;
     applyTheme(detectTheme(parentRoot));
-    new MutationObserver(function() {
+    var themeObserver = new MutationObserver(function() {
       applyTheme(detectTheme(parentRoot));
-    }).observe(parentRoot, { attributes: true, attributeFilter: ['class', 'data-theme', 'style'] });
+    });
+    themeObserver.observe(parentRoot, { attributes: true, attributeFilter: ['class', 'data-theme', 'style'] });
+    if (window.__ivOnDispose) window.__ivOnDispose(function() { themeObserver.disconnect(); });
   } catch(e) {
     // No same-origin access — fall back to OS preference.
     var mediaQuery = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
     if (mediaQuery) {
       applyTheme(mediaQuery.matches);
-      mediaQuery.addEventListener('change', function(e) { applyTheme(e.matches); });
+      var themeChanged = function(e) { applyTheme(e.matches); };
+      mediaQuery.addEventListener('change', themeChanged);
+      if (window.__ivOnDispose) window.__ivOnDispose(function() { mediaQuery.removeEventListener('change', themeChanged); });
     }
   }
 })();
@@ -1545,7 +1960,7 @@ document.addEventListener('click', function() {
 }, true);
 
 // --- Post-render fixes (theme defaults, overlap prevention) ---
-window.addEventListener('load', function() {
+window.__ivPostRenderFixes = function() {
   // Chart.js theme defaults + legend overflow prevention
   if (window.Chart) {
     var styles = getComputedStyle(document.documentElement);
@@ -1629,7 +2044,7 @@ window.addEventListener('load', function() {
   });
 
   setTimeout(reportHeight, 100);
-});
+};
 
 // --- sendPrompt bridge (requires iframe Sandbox Allow Same Origin) ---
 function sendPrompt(text) {
@@ -3924,7 +4339,38 @@ STREAMING_OBSERVER_SCRIPT = """
   // so we chain the insertions to enforce source order.
   var _ivScriptChain = Promise.resolve();
   var _ivEnqueuedScripts = Object.create(null);
+  var _ivScriptFailures = [];
   var _ivSnapshotReadyPromise = null;
+
+  // Start both downloads at admitted runtime startup, before any VIZ text.
+  // Failures stay local to consumers of that library, not every visualization.
+  var _ivBootstrapConfig = window.__ivRuntimeConfig || {};
+  var _ivLibraryLoads = Object.create(null);
+  var _ivLibraryUrlLoads = Object.create(null);
+  var _ivLibraryUrls = {
+    chartjs: _ivBootstrapConfig.chartjsUrl || '/static/iv-libs/chart.umd.min.js',
+    plotly: _ivBootstrapConfig.plotlyUrl || '/static/iv-libs/plotly.min.js'
+  };
+  Object.keys(_ivLibraryUrls).forEach(function(name) {
+    var src = _ivLibraryUrls[name];
+    var key = 'src:' + _ivScriptUrlKey(src);
+    _ivEnqueuedScripts[key] = true;
+    if (!_ivLibraryUrlLoads[key]) _ivLibraryUrlLoads[key] = _ivLoadExternalScript(src, [['src', src]], 0, true);
+    _ivLibraryLoads[name] = _ivLibraryUrlLoads[key];
+  });
+  window.ivRequireLibraries = function(names) {
+    return Promise.all(names.map(function(name) {
+      if (!_ivLibraryLoads[name]) return Promise.reject(new Error('Unknown chart library: ' + name));
+      return _ivLibraryLoads[name].then(function(ok) {
+        if (!ok) throw new Error('Failed to load ' + name + ': ' + _ivLibraryUrls[name]);
+      });
+    }));
+  };
+
+  function _ivScriptUrlKey(src) {
+    try { return new URL(src, document.baseURI).href; }
+    catch(e) { return src; }
+  }
 
   // The lifecycle manager can ask for a preview immediately after finalize.
   // Wait for imported libraries + the model's inline script, then let the
@@ -3957,6 +4403,108 @@ STREAMING_OBSERVER_SCRIPT = """
     return hash.toString(36);
   }
 
+  function _ivHasUsableLayout() {
+    try {
+      var frame = window.frameElement;
+      var rect = frame && frame.getBoundingClientRect ? frame.getBoundingClientRect() : null;
+      if (frame) {
+        if (frame.isConnected === false) return false;
+        if (frame.getClientRects && frame.getClientRects().length === 0) return false;
+        if (rect && !(rect.width > 16 && rect.height > 0)) return false;
+        try {
+          var style = parent.getComputedStyle(frame);
+          if (style.display === 'none' || style.visibility === 'hidden') return false;
+        } catch(e) {}
+        if (rect) return true;
+      }
+    } catch(e) {}
+    try { return document.documentElement.clientWidth > 16; } catch(e) { return false; }
+  }
+
+  // A restored chat can mount its iframe under display:none and show it only
+  // after the route transition completes. Layout-sensitive chart code must not
+  // run during that zero-width phase or it can bake empty dimensions forever.
+  function _ivWaitForUsableLayout() {
+    if (_ivHasUsableLayout()) return Promise.resolve();
+    return new Promise(function(resolve) {
+      var settled = false;
+      var observer = null;
+      var timer = null;
+      function finish() {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        try { if (observer) observer.disconnect(); } catch(e) {}
+        resolve();
+      }
+      function check() {
+        if (settled) return;
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+        if (window.__ivDisposed) { finish(); return; }
+        if (_ivHasUsableLayout()) { finish(); return; }
+        timer = setTimeout(check, 250);
+      }
+      try {
+        var frame = window.frameElement;
+        if (frame && typeof ResizeObserver === 'function') {
+          observer = new ResizeObserver(check);
+          observer.observe(frame);
+        }
+      } catch(e) {}
+      if (window.__ivOnDispose) window.__ivOnDispose(finish);
+      check();
+    });
+  }
+
+  function _ivLoadExternalScript(src, attrs, attempt, optional) {
+    return new Promise(function(resolve) {
+      var settled = false;
+      var scriptEl = null;
+      var timer = null;
+      function finish(ok) {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        if (ok) { resolve(true); return; }
+        try { if (scriptEl && scriptEl.parentNode) scriptEl.parentNode.removeChild(scriptEl); } catch(e) {}
+        if (attempt < 2 && !window.__ivDisposed) {
+          setTimeout(function() {
+            if (window.__ivDisposed) { resolve(false); return; }
+            _ivLoadExternalScript(src, attrs, attempt + 1, optional).then(resolve);
+          }, 300 * (attempt + 1));
+          return;
+        }
+        if (!optional) _ivScriptFailures.push(src || 'external-library');
+        resolve(false);
+      }
+      try {
+        scriptEl = document.createElement('script');
+        attrs.forEach(function(pair) {
+          try { scriptEl.setAttribute(pair[0], pair[1]); } catch(_){}
+        });
+        scriptEl.setAttribute('data-iv-imported', '1');
+        scriptEl.onload = function() { finish(true); };
+        scriptEl.onerror = function() { finish(false); };
+        timer = setTimeout(function() { finish(false); }, 12000);
+        document.head.appendChild(scriptEl);
+      } catch(e) { finish(false); }
+    });
+  }
+
+  function _ivShowScriptFailure() {
+    if (!_ivScriptFailures.length || document.getElementById('iv-script-load-error')) return;
+    var box = document.createElement('div');
+    box.id = 'iv-script-load-error';
+    box.setAttribute('role', 'alert');
+    box.style.cssText = 'margin:12px 0;padding:14px 16px;border:1px solid var(--color-border-tertiary);' +
+      'border-radius:var(--radius-md);background:var(--color-bg-secondary);color:var(--color-text-danger);' +
+      'font:13px/1.45 var(--font-sans);';
+    var label = (typeof _ivScriptErrStr !== 'undefined' &&
+      (_ivScriptErrStr[_ivLang] || _ivScriptErrStr.en)) || 'Visualization script error';
+    box.textContent = label + ': failed to load a required chart library. ' + _ivScriptFailures.join('; ');
+    renderArea.appendChild(box);
+  }
+
   function enqueueScript(incoming) {
     var src = incoming.getAttribute && incoming.getAttribute('src');
     var code = incoming.textContent || '';
@@ -3964,7 +4512,7 @@ STREAMING_OBSERVER_SCRIPT = """
     // Dedupe by src or content hash — reconciler may hit the same
     // script twice across streaming/finalize branches. Re-execution
     // would redeclare consts and double-wire listeners.
-    var key = src ? ('src:' + src) : ('code:' + code.length + ':' + _ivHashScript(code));
+    var key = src ? ('src:' + _ivScriptUrlKey(src)) : ('code:' + code.length + ':' + _ivHashScript(code));
     if (_ivEnqueuedScripts[key]) return;
     _ivEnqueuedScripts[key] = true;
 
@@ -3978,19 +4526,9 @@ STREAMING_OBSERVER_SCRIPT = """
     // chain and stall every script that follows.
     if (src) {
       _ivScriptChain = _ivScriptChain.then(function() {
-        return new Promise(function(resolve) {
-          try {
-            var scriptEl = document.createElement('script');
-            attrs.forEach(function(pair) {
-              try { scriptEl.setAttribute(pair[0], pair[1]); } catch(_){}
-            });
-            // Tag for HTML export: _ivDownload moves these to end of body
-            // so they execute after the model's canvases / DOM nodes exist.
-            scriptEl.setAttribute('data-iv-imported', '1');
-            scriptEl.onload = scriptEl.onerror = function() { resolve(); };
-            document.head.appendChild(scriptEl);
-          } catch(e) { resolve(); }
-        });
+        // A transient CDN/static-asset failure gets two bounded retries; a
+        // terminal failure remains visible instead of becoming an empty card.
+        return _ivLoadExternalScript(src, attrs, 0);
       }).catch(function() {});
     } else {
       var isModule = false;
@@ -4002,6 +4540,20 @@ STREAMING_OBSERVER_SCRIPT = """
         }
       }
       _ivScriptChain = _ivScriptChain.then(function() {
+        return _ivWaitForUsableLayout();
+      }).then(function() {
+        if (window.__ivDisposed) return;
+        var explicit = incoming.getAttribute && incoming.getAttribute('data-iv-libraries');
+        var required = explicit !== null && explicit !== undefined ? explicit.split(/[ ,]+/).filter(Boolean) :
+          Object.keys(_ivLibraryLoads).filter(function(name) {
+            return (name === 'chartjs' ? /\\bChart\\b/ : /\\bPlotly\\b/).test(code);
+          });
+        return window.ivRequireLibraries(required).then(function() { return true; }, function(error) {
+          _ivScriptFailures.push(error.message);
+          return false;
+        });
+      }).then(function(ready) {
+        if (!ready || window.__ivDisposed) return;
         function createInlineScript() {
           var scriptEl = document.createElement('script');
           attrs.forEach(function(pair) {
@@ -4085,6 +4637,28 @@ STREAMING_OBSERVER_SCRIPT = """
       }
     } catch(e) {}
   }
+
+  var _ivRefreshRaf = 0;
+  window.__ivRefreshLayout = function() {
+    if (!finalized || !_ivHasUsableLayout()) return;
+    if (_ivRefreshRaf) cancelAnimationFrame(_ivRefreshRaf);
+    _ivRefreshRaf = requestAnimationFrame(function() {
+      _ivRefreshRaf = 0;
+      _ivDispatchResize();
+      scheduleHeight();
+      setTimeout(_ivDispatchResize, 120);
+      setTimeout(scheduleHeight, 160);
+    });
+  };
+  function _ivRefreshOnWake() {
+    if (!window.__ivDisposed && typeof window.__ivRefreshLayout === 'function') window.__ivRefreshLayout();
+  }
+  window.addEventListener('pageshow', _ivRefreshOnWake);
+  window.addEventListener('focus', _ivRefreshOnWake);
+  if (window.__ivOnDispose) window.__ivOnDispose(function() {
+    window.removeEventListener('pageshow', _ivRefreshOnWake);
+    window.removeEventListener('focus', _ivRefreshOnWake);
+  });
 
   function _ivHasPaintedCanvas() {
     var canvases;
@@ -4527,6 +5101,8 @@ STREAMING_OBSERVER_SCRIPT = """
     // after the exact script chain enqueued above has executed. For cached or
     // script-free visualizations this resolves in the next microtask.
     Promise.resolve(_ivScriptChain).catch(function() {}).then(function() {
+      _ivShowScriptFailure();
+      try { if (typeof window.__ivPostRenderFixes === 'function') window.__ivPostRenderFixes(); } catch(e) {}
       return _ivWaitForFirstPaint();
     }).then(function() {
       hideLoader();
@@ -4538,7 +5114,7 @@ STREAMING_OBSERVER_SCRIPT = """
       } catch(e) {}
       // Done/failed announcement — only on live streams, not on rehydration.
       if (wasStreaming) {
-        var failed = _ivRecovery === 'failed';
+        var failed = _ivRecovery === 'failed' || _ivScriptFailures.length > 0;
         try {
           var table = failed ? _ivScriptErrStr : _ivDoneStr;
           if (typeof toast === 'function') toast(table[_ivLang] || table.en, failed ? 'error' : 'success');
@@ -4668,6 +5244,7 @@ STREAMING_OBSERVER_SCRIPT = """
         try { hideMarkerRange(); } catch(e) {}
         try { stripFinalizeArtifacts(); } catch(e) {}
         try { refinalizeIfSettledDiffers(); } catch(e) {}
+        try { window.__ivRefreshLayout(); } catch(e) {}
         _ivHealDirty = false;
       }
       return;
@@ -4904,13 +5481,37 @@ STREAMING_OBSERVER_SCRIPT = """
   // Each bootstrap step is independently guarded. Poll for the duration of
   // streaming even after the observer attaches: the first observed node is
   // not guaranteed to remain Open WebUI's live response node.
+  if (window.__ivOnDispose) window.__ivOnDispose(function() {
+    stopLocalWatchers();
+    if (finalizeTimer !== null) clearTimeout(finalizeTimer);
+    window.__ivHandleParentMutation = null;
+    window.__ivRefreshLayout = null;
+  });
   try { tick(false); } catch(e) {}
-  try { attachInnerObserver(); } catch(e) {}
+  if (!finalized) { try { attachInnerObserver(); } catch(e) {} }
   if (!finalized) pollInterval = setInterval(pollTick, 400);
 })();
 </script>
 """
 
+
+# Reuse the proven Svelte-safe marker hider for parked frames, without loading
+# their data, chart libraries, renderer, or child-window closures. It runs in
+# the parent realm and is released with the lifecycle record.
+_source_hider_body = STREAMING_OBSERVER_SCRIPT.split("  'use strict';", 1)[1].split(
+    "  // Returns the last index where the parser is in TEXT state", 1
+)[0]
+_source_hider_body = (
+    _source_hider_body.replace("window.frameElement", "frame")
+    .replace("window.__ivRuntimeConfig", "config")
+    .replace("var renderArea = document.getElementById('iv-render');", "var renderArea = {};")
+)
+LIFECYCLE_BOOTSTRAP_SCRIPT = LIFECYCLE_BOOTSTRAP_SCRIPT.replace(
+    "/*__SOURCE_HIDER_FACTORY__*/",
+    "function(frame, config) { var parent = window;\n"
+    + _source_hider_body
+    + "\nfinalized = true; return hideMarkerRange; }",
+)
 
 # Kept for backwards compatibility in case anything references the old name
 INJECTED_SCRIPTS = BODY_SCRIPTS
@@ -4981,6 +5582,7 @@ def _assert_srcdoc_safe(name: str, body: str) -> None:
 
 
 _IFRAME_EMBEDDED_SCRIPTS = {
+    "CLEANUP_SCRIPT": CLEANUP_SCRIPT,
     "THEME_DETECTION_SCRIPT": THEME_DETECTION_SCRIPT,
     "BODY_SCRIPTS": BODY_SCRIPTS,
     "CHIME_SCRIPT": CHIME_SCRIPT,
@@ -5105,6 +5707,8 @@ def _build_html(
     lifecycle_key: str = "",
     chat_id: str = "",
     message_id: str = "",
+    chartjs_url: str = _CHARTJS_URL,
+    plotly_url: str = _PLOTLY_URL,
 ) -> str:
     """Wrap the streaming visualization shell: empty render area + observer.
 
@@ -5138,6 +5742,8 @@ def _build_html(
         lifecycle_key=lifecycle_key,
         chat_id=chat_id,
         message_id=message_id,
+        chartjs_url=chartjs_url,
+        plotly_url=plotly_url,
     )
 
     # Loader sits *below* the render area so content appears to flow
@@ -5148,15 +5754,20 @@ def _build_html(
         '<div id="iv-loader" class="iv-loading" aria-live="polite">'
         '<div class="iv-loading-dots"><span></span><span></span><span></span></div>'
         '<div class="iv-loading-label">Rendering visualization\u2026</div>'
+        '<button id="iv-start" type="button" onclick="try{parent.__ivLifecycleV4.activate(window.frameElement);}catch(e){}">Load visualization</button>'
         "</div>\n"
         f"{DOWNLOAD_BUTTON}\n"
         f"{runtime_config}"
+        '<template id="iv-runtime">'
+        f"{CLEANUP_SCRIPT}"
+        f"{THEME_DETECTION_SCRIPT}"
         f"{body_scripts}"
         f"{tool_data_bridge}"
         f"{DOWNSAMPLING_SCRIPT}"
-        f"{LIFECYCLE_BOOTSTRAP_SCRIPT}"
         f"{STREAMING_OBSERVER_SCRIPT}"
         f"{strict_script}"
+        '</template>'
+        f"{LIFECYCLE_BOOTSTRAP_SCRIPT}"
     )
 
     return (
@@ -5165,7 +5776,6 @@ def _build_html(
         f"{csp_tag}"
         f"<style>{THEME_CSS}\n{SVG_CLASSES}\n{BASE_STYLES}</style>"
         f'<script>try{{console.info("iv[build]","{_IV_BUILD}");}}catch(e){{}}</script>'
-        f"{THEME_DETECTION_SCRIPT}"
         f"</head><body>\n{body_inner}\n</body></html>"
     )
 
@@ -5226,6 +5836,16 @@ class Tools:
     """
 
     class Valves(BaseModel):
+        chartjs_url: str = Field(
+            default=_CHARTJS_URL,
+            min_length=1,
+            description="Chart.js UMD script loaded when an iframe runtime is admitted. Serve this file on the Open WebUI origin for strict/balanced/offline modes.",
+        )
+        plotly_url: str = Field(
+            default=_PLOTLY_URL,
+            min_length=1,
+            description="Plotly browser bundle loaded at admitted runtime startup, in parallel with Chart.js. Serve this file on the Open WebUI origin for strict/balanced/offline modes.",
+        )
         security_level: Literal["strict", "balanced", "none", "offline"] = Field(
             default="strict",
             description="Strict (default): blocks outbound fetch/XHR, images, and forms; scripts load only from the Open WebUI origin, including /static. Offline: like Strict with zero external connections. Balanced: like Strict but also allows external images. None: no restrictions.",
@@ -5238,7 +5858,7 @@ class Tools:
             default=2,
             ge=0,
             le=10,
-            description="Maximum interactive Tool Result visualizations kept alive on the page. Older completed visualizations become restorable static previews. Set to 0 to disable suspension.",
+            description="Maximum resident Tool Result runtimes, including loading and hidden iframes. Older visualizations become restorable previews/placeholders before a new runtime starts. Set to 0 to disable this cap; initialization concurrency remains limited to two.",
         )
         point_density: float = Field(
             default=1.0,
@@ -5411,6 +6031,8 @@ return (() => {
             lifecycle_key=uuid.uuid4().hex,
             chat_id=chat_id,
             message_id=message_id,
+            chartjs_url=self.valves.chartjs_url,
+            plotly_url=self.valves.plotly_url,
         )
         response = HTMLResponse(
             content=html,
@@ -5420,6 +6042,10 @@ return (() => {
             f'Visualization wrapper "{title}" is mounted and waiting for content. '
             f"The selected tool result is available inside the iframe only via "
             f"getToolData(). Do not reproduce it in the generated HTML or JavaScript. "
+            f"Chart.js (window.Chart) and Plotly (window.Plotly) are loaded automatically "
+            f"at admitted iframe startup. Mark chart scripts with data-iv-libraries=\"chartjs\" "
+            f"or data-iv-libraries=\"plotly\" (space-separated for both); only required libraries are awaited. Do not add script "
+            f"tags or other loaders for Chart.js or Plotly. "
             f"Now emit the HTML/SVG in your NEXT text response wrapped in the "
             f"TEXT delimiters @@@VIZ-START and @@@VIZ-END, each on their own line. "
             f"The wrapper will tail your stream and render live. These are PLAIN "
