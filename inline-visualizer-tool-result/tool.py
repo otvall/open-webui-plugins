@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.4.2
+version: 1.4.3
 required_open_webui_version: 0.10.2
 description: Shows a loading embed, generates HTML in a separate model request, then saves a self-contained visualization of one completed tool result. Pass the exact source call ID and a short instruction, not HTML. Requires native tool calling and a saved chat.
 """
@@ -18,6 +18,7 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from html.parser import HTMLParser
 from typing import Any, Literal
 
@@ -25,7 +26,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.4.2"
+_IV_BUILD = "tool-result-1.4.3"
 _ARTIFACT_VERSION = 1
 
 _CHARTJS_URL = "/static/chart.umd.min.js"
@@ -35,6 +36,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
+_IV_GENERATION_ACTIVE = ContextVar("iv_generation_active", default=False)
 
 # This prompt must be embedded: OWUI installs tool.py without adjacent files.
 _GENERATION_RULES = """You are the HTML renderer inside a visualization tool.
@@ -165,7 +167,7 @@ async def _resolve_generation_model(request, user, model_id):
             if not isinstance(base_id, str):
                 raise _GenerationModelError("Некорректный base_model_id в настройках workspace-модели.")
             # Unwrapping a preset must not grant access to an inaccessible agent.
-            # The final physical model is checked again by generate_chat_completion.
+            # The final base model/Pipe is checked again by generate_chat_completion.
             if user.role == "user":
                 try:
                     await check_model_access(user, model)
@@ -173,10 +175,12 @@ async def _resolve_generation_model(request, user, model_id):
                     raise _GenerationModelError("Нет доступа к выбранной workspace-модели или её базовой модели.") from exc
             model_id = base_id
             continue
-        if model.get("pipe") or model.get("owned_by") == "arena" or model.get("arena"):
-            raise _GenerationModelError("Базовая модель является Pipe или Arena. Укажите ID физической модели в generation_model_id.")
+        if model.get("owned_by") == "arena" or model.get("arena"):
+            raise _GenerationModelError("Базовая модель является Arena. Укажите конкретную серверную модель или логирующий Pipe в generation_model_id.")
         if model.get("connection_type") == "direct":
             raise _GenerationModelError("Базовая модель подключена напрямую из браузера. Нужна серверная модель в generation_model_id.")
+        # A base Pipe may be the required provider/logging transport. Let OWUI
+        # invoke it with its server-side valves; never bypass it or strip its ID.
         return model_id
     raise _GenerationModelError("Слишком длинная цепочка base_model_id (более 8 моделей).")
 
@@ -187,19 +191,25 @@ async def _generate_fragment(request, user_info, model_id, messages, max_tokens)
     from open_webui.models.users import Users
     from open_webui.utils.chat import generate_chat_completion
 
+    if _IV_GENERATION_ACTIVE.get():
+        raise _GenerationModelError("Повторный вход в генератор визуализации из Pipe запрещён.")
     user = await Users.get_user_by_id(user_info["id"])
     if user is None:
         raise ValueError("User not found")
     scope = dict(request.scope)
     scope["state"] = {"metadata": {"iv_generation": True}, "user": user}
     child = Request(scope)
-    physical_model_id = await _resolve_generation_model(child, user, model_id)
-    log.info("Visualization generation model resolved: %s -> %s", model_id, physical_model_id)
-    response = await generate_chat_completion(
-        child,
-        {"model": physical_model_id, "messages": messages, "stream": False, "max_tokens": max_tokens},
-        user=user, bypass_filter=False, bypass_system_prompt=True,
-    )
+    base_model_id = await _resolve_generation_model(child, user, model_id)
+    log.info("Visualization generation model resolved: %s -> %s", model_id, base_model_id)
+    token = _IV_GENERATION_ACTIVE.set(True)
+    try:
+        response = await generate_chat_completion(
+            child,
+            {"model": base_model_id, "messages": messages, "stream": False, "max_tokens": max_tokens},
+            user=user, bypass_filter=False, bypass_system_prompt=True,
+        )
+    finally:
+        _IV_GENERATION_ACTIVE.reset(token)
     if not isinstance(response, dict) or not response.get("choices"):
         raise ValueError("Model returned no completed chat response")
     choice = response["choices"][0]
@@ -6462,7 +6472,7 @@ class Tools:
     """
 
     class Valves(BaseModel):
-        generation_model_id: str = Field(default="", description="Internal HTML model override. Empty resolves the current workspace model to its physical base_model_id, without preset tools/skills. Explicit preset IDs are also resolved. Final target must be server-connected, not Pipe/Arena/browser-direct.")
+        generation_model_id: str = Field(default="", description="Internal HTML model override. Empty resolves the current workspace model to its base_model_id without preset tools/skills. Server-side provider/logging Pipes are supported and retain their routing. Arena and browser-direct targets are unsupported.")
         generation_timeout_seconds: int = Field(default=120, ge=10, le=600, description="Internal generation timeout. No automatic paid retry.")
         generation_max_tokens: int = Field(default=8000, ge=256, le=64000, description="Internal request output token limit.")
         generation_context_max_chars: int = Field(default=400000, ge=1000, le=4000000, description="Serialized context safety ceiling. Oversized history fails visibly, never silently truncates.")
@@ -6540,7 +6550,7 @@ class Tools:
         if not isinstance(title, str) or len(title) > 300 or retry_attempt not in (0, 1):
             return failure("Invalid title or retry_attempt")
         request_metadata = getattr(getattr(__request__, "state", None), "metadata", None) or {}
-        if metadata.get("iv_generation") or request_metadata.get("iv_generation"):
+        if _IV_GENERATION_ACTIVE.get() or metadata.get("iv_generation") or request_metadata.get("iv_generation"):
             return failure("Recursive visualization generation is disabled")
         if not (__request__ and __user__ and __user__.get("id") and __event_emitter__ and
                 metadata.get("chat_id") and (metadata.get("message_id") or metadata.get("assistant_message_id"))):

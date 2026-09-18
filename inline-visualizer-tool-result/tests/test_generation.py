@@ -36,7 +36,8 @@ def host(monkeypatch):
     events, calls = [], []
     h = SimpleNamespace(request=request, saved=saved, events=events, calls=calls,
                         access=True, model_error=None, result=None, started=None, release=None,
-                        model_records={}, model_checks=[], denied_models=set(), refreshed_models=None, refresh_count=0)
+                        model_records={}, model_checks=[], denied_models=set(), refreshed_models=None, refresh_count=0,
+                        pipe_handler=None)
 
     class Models:
         @staticmethod
@@ -86,6 +87,8 @@ def host(monkeypatch):
             await h.release.wait()
         if h.model_error:
             raise h.model_error
+        if h.pipe_handler is not None and child.app.state.MODELS[body["model"]].get("pipe"):
+            return await h.pipe_handler(child, body)
         return h.result or {"choices": [{"finish_reason": "stop", "message": {"content": FRAGMENT}}]}
 
     async def emit(event):
@@ -251,6 +254,62 @@ def test_nested_workspace_alias_and_explicit_override(host):
     assert host.model_checks == ["override", "middle", "fast"]
 
 
+@pytest.mark.parametrize("workspace", [True, False])
+def test_logging_pipe_is_called_instead_of_bypassed(host, workspace):
+    pipe_id = "logging.Kimi_K2.6"
+    host.request.app.state.MODELS[pipe_id] = {"id": pipe_id, "pipe": {"type": "pipe"}}
+    # Also make a direct model available: it must NOT be selected by guessing.
+    host.request.app.state.MODELS["Kimi_K2.6"] = {"id": "Kimi_K2.6"}
+    if workspace:
+        host.request.app.state.MODELS["main"] = {"id": "main", "preset": True, "info": {"base_model_id": pipe_id}}
+    else:
+        host.kwargs["__model__"] = {"id": pipe_id}
+    logged = []
+    async def logging_pipe(child, body):
+        logged.append(body["model"])
+        assert body["model"] == pipe_id and body["stream"] is False
+        assert "tools" not in body and "tool_ids" not in body and "skill_ids" not in body
+        assert child.state.metadata == {"iv_generation": True}
+        assert not any(key in child.state.metadata for key in ("chat_id", "session_id", "message_id", "tools"))
+        return {"choices": [{"finish_reason": "stop", "message": {"content": FRAGMENT}}]}
+    host.pipe_handler = logging_pipe
+    response, _ = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    assert logged == [pipe_id]
+    assert artifact(response.body.decode())["data"] == {"value": 42}
+    assert host.model_checks == (["main", pipe_id] if workspace else [pipe_id])
+    assert not iv._IV_GENERATION_ACTIVE.get()
+
+
+def test_pipe_cannot_reenter_visualizer_even_if_it_drops_metadata(host):
+    host.request.app.state.MODELS["main"]["pipe"] = True
+    async def recursive_pipe(child, body):
+        # Simulate an adapter losing the metadata guard but staying in the same
+        # async request context. It must not start a second generation/embed.
+        nested = await iv.Tools().visualize_tool_result(**host.kwargs)
+        assert nested["status"] == "error" and "Recursive" in nested["message"]
+        with pytest.raises(iv._GenerationModelError, match="Повторный вход"):
+            await iv._generate_fragment(child, {"id": "u"}, "main", [], 1000)
+        return {"choices": [{"finish_reason": "stop", "message": {"content": FRAGMENT}}]}
+    host.pipe_handler = recursive_pipe
+    asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    assert len(host.calls) == 1 and len(host.events) == 2
+
+
+def test_pipe_failure_releases_recursion_guard_for_next_request(host):
+    host.request.app.state.MODELS["main"]["pipe"] = True
+    async def scenario():
+        async def broken_pipe(child, body):
+            raise RuntimeError("logging adapter unavailable")
+        host.pipe_handler = broken_pipe
+        _, context = await iv.Tools().visualize_tool_result(**host.kwargs)
+        assert "failed" in context and not iv._IV_GENERATION_ACTIVE.get()
+        host.pipe_handler = None
+        response, _ = await iv.Tools().visualize_tool_result(**host.kwargs)
+        assert artifact(response.body.decode())["data"] == {"value": 42}
+        assert not iv._IV_GENERATION_ACTIVE.get()
+    asyncio.run(scenario())
+
+
 def test_missing_base_cache_refreshes_once(host):
     host.request.app.state.MODELS["main"] = {"id": "main", "info": {"base_model_id": "Kimi_K2.6"}}
     host.refreshed_models = {"Kimi_K2.6": {"id": "Kimi_K2.6"}}
@@ -269,7 +328,7 @@ def test_unwrapping_does_not_bypass_preset_or_base_permissions(host, denied):
 
 @pytest.mark.parametrize("kind, expected", [
     ("cycle", "циклическая"), ("missing", "не найдена"), ("disabled", "отключена"),
-    ("pipe", "Pipe или Arena"), ("direct", "напрямую из браузера"),
+    ("arena", "является Arena"), ("direct", "напрямую из браузера"),
 ])
 def test_bad_workspace_routes_have_specific_visible_errors(host, kind, expected):
     host.request.app.state.MODELS["main"] = {"id": "main", "info": {"base_model_id": "fast"}}
@@ -279,8 +338,8 @@ def test_bad_workspace_routes_have_specific_visible_errors(host, kind, expected)
         del host.request.app.state.MODELS["fast"]
     elif kind == "disabled":
         host.request.app.state.MODELS["main"]["info"]["is_active"] = False
-    elif kind == "pipe":
-        host.request.app.state.MODELS["fast"]["pipe"] = True
+    elif kind == "arena":
+        host.request.app.state.MODELS["fast"]["owned_by"] = "arena"
     else:
         host.request.app.state.MODELS["fast"]["connection_type"] = "direct"
     response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
@@ -382,12 +441,12 @@ def test_access_failure_never_calls_model_or_overwrites(host):
     assert host.saved["embeds"] == ["https://example.org/existing"]
 
 
-@pytest.mark.parametrize("kind", ["pipe", "arena", "missing"])
+@pytest.mark.parametrize("kind", ["arena", "missing"])
 def test_unsupported_model_fails_visibly_without_provider_call(host, kind):
     if kind == "missing":
         host.request.app.state.MODELS.clear()
     else:
-        host.request.app.state.MODELS["main"] = {"pipe": True} if kind == "pipe" else {"owned_by": "arena"}
+        host.request.app.state.MODELS["main"] = {"owned_by": "arena"}
     response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
     assert "failed" in context and 'role="alert"' in response.body.decode() and not host.calls
 

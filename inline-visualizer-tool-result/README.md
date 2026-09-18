@@ -11,12 +11,14 @@ VIZ markers, assistant-message DOM, a new producer call, or an old browser cache
 - Install both `tool.py` and the `visualize-tool-result` skill.
 - Use native function calling in a saved chat. The tool requires authenticated
   user/request context and the server's event emitter; temporary chats are rejected.
-- Internal generation uses `generation_model_id` (empty: current model's physical
+- Internal generation uses `generation_model_id` (empty: current model's configured
   base). Since 1.4.2, workspace presets are unwrapped through `info.base_model_id`
   in the server registry, with a database fallback for uncached presets. For example,
-  a workspace agent backed by `Kimi_K2.6` generates HTML through `Kimi_K2.6` directly.
-  Explicit override IDs are unwrapped too. The final target must be server-connected,
-  not a Pipe, Arena or browser-direct connection.
+  a workspace agent backed by `Kimi_K2.6` generates HTML through that base model.
+  Since 1.4.3 a server-side provider/logging Pipe is also a valid base: a chain
+  `workspace agent → logging Pipe → Kimi` retains the Pipe and its logging.
+  Explicit override IDs are unwrapped too. Arena and browser-direct targets remain
+  unsupported. Leave the override empty to use the workspace agent's configured base.
 - Serve Chart.js at `/static/chart.umd.min.js` and Plotly at
   `/static/plotly.umd.min.js`. These are the only supported libraries.
   The tool does not install them. Override `chartjs_url` / `plotly_url` in
@@ -72,12 +74,24 @@ claim to reproduce the provider's exact original prompt or hidden model state.
 Original request state is untouched. Model access checks remain enabled.
 
 Preset tools, skills, parameters and system prompts are not applied again to the
-child request. Already available conversation instructions and historical skill/tool
+child request. A base Pipe still executes its own code and configured valves through
+OWUI; it is not bypassed by stripping its ID or calling its provider directly.
+Already available conversation instructions and historical skill/tool
 results remain part of its context. Each workspace hop is access-checked for regular
-users; the physical target still uses OWUI's normal access checks (no bypass flag).
+users; the base target/Pipe still uses OWUI's normal access checks (no bypass flag).
 Missing server models trigger at most one registry refresh. Cycles, disabled presets,
 missing targets and unsupported routes produce specific visible routing errors.
 No model ID is guessed from a display name, and no provider keys are copied into HTML.
+
+Logging/provider Pipes must accept `stream=False` and work without chat/session IDs
+or event emitters. The isolated child metadata carries `iv_generation=True`, but no
+tools or live chat routing. OWUI passes an empty tool map to the Pipe. A task-local
+guard also blocks re-entry into this visualizer in the same async call context even
+if metadata is dropped; it is reset on completion, failure and cancellation.
+This is not a sandbox for arbitrary Python: a Pipe that independently adds tools or
+starts an agent loop must be adapted rather than treated as a simple logging proxy.
+Its own logging requirements (e.g. mandatory chat IDs) need testing with that Pipe;
+this repository does not contain the user's adapter implementation.
 
 Valves: `generation_timeout_seconds=120`, `generation_max_tokens=8000`,
 `generation_context_max_chars=400000`. The context ceiling rejects oversized input
