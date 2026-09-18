@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.4.0
+version: 1.4.1
 required_open_webui_version: 0.10.2
 description: Shows a loading embed, generates HTML in a separate model request, then saves a self-contained visualization of one completed tool result. Pass the exact source call ID and a short instruction, not HTML. Requires native tool calling and a saved chat.
 """
@@ -25,7 +25,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.4.0"
+_IV_BUILD = "tool-result-1.4.1"
 _ARTIFACT_VERSION = 1
 
 _CHARTJS_URL = "/static/chart.umd.min.js"
@@ -424,13 +424,57 @@ async def _load_current_message_outputs(
 async def _resolve_tool_result(
     tool_call_id: str, __request__, __metadata__, __messages__
 ) -> tuple[bool, Any]:
-    for output in await _load_current_message_outputs(__request__, __metadata__):
-        found, result = _find_output_tool_result(output, tool_call_id)
-        if found:
-            return True, result
+    found, result, _ = await _resolve_tool_result_with_id(
+        tool_call_id, __request__, __metadata__, __messages__
+    )
+    return found, result
 
+
+def _contains_call_id(items, tool_call_id):
+    """An existing exact call, even pending, must never alias another call."""
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in ("function_call", "function_call_output") and item.get("call_id") == tool_call_id:
+            return True
+        if item.get("role") == "tool" and item.get("tool_call_id") == tool_call_id:
+            return True
+        calls = item.get("tool_calls")
+        if isinstance(calls, list) and any(isinstance(call, dict) and call.get("id") == tool_call_id for call in calls):
+            return True
+        output = item.get("output")
+        if isinstance(output, list) and _contains_call_id(output, tool_call_id):
+            return True
+    return False
+
+
+async def _resolve_tool_result_with_id(
+    tool_call_id: str, __request__, __metadata__, __messages__
+) -> tuple[bool, Any, str]:
+    outputs = await _load_current_message_outputs(__request__, __metadata__)
     messages = __messages__ if isinstance(__messages__, list) else []
-    return _find_message_tool_result(messages, tool_call_id)
+
+    def find(candidate):
+        for output in outputs:
+            found, result = _find_output_tool_result(output, candidate)
+            if found:
+                return True, result, candidate
+        found, result = _find_message_tool_result(messages, candidate)
+        return found, result, candidate
+
+    # Search ALL sources exactly before trying the sole supported correction.
+    resolved = find(tool_call_id)
+    if resolved[0]:
+        return resolved
+    if not tool_call_id.startswith("functions.") and not any(
+        _contains_call_id(items, tool_call_id) for items in [*outputs, messages]
+    ):
+        candidate = "functions." + tool_call_id
+        resolved = find(candidate)
+        if resolved[0]:
+            return resolved
+    # No fuzzy/suffix/tool-name matching, no stripping other namespaces.
+    return False, None, tool_call_id
 
 
 def _safe_json_for_html(value: Any) -> str:
@@ -6459,7 +6503,9 @@ class Tools:
         model_id = self.valves.generation_model_id.strip() or (model.get("id") if isinstance(model, dict) else model)
         if not model_id:
             return failure("Set generation_model_id in the tool valves")
-        found, data = await _resolve_tool_result(source_tool_call_id, __request__, metadata, __messages__)
+        found, data, resolved_source_id = await _resolve_tool_result_with_id(
+            source_tool_call_id, __request__, metadata, __messages__
+        )
         if not found:
             if retry_attempt == 0:
                 return {"status": "retry_required", "code": "source_result_not_visible_yet", "retry": {
@@ -6484,7 +6530,7 @@ class Tools:
             if len(json.dumps(messages, ensure_ascii=False)) > self.valves.generation_context_max_chars:
                 raise ValueError("Context exceeds generation_context_max_chars; history was not truncated")
             fragment = await _generate_fragment(__request__, __user__, model_id, messages, self.valves.generation_max_tokens)
-            artifact = _build_saved_artifact(fragment, data, source_tool_call_id, title)
+            artifact = _build_saved_artifact(fragment, data, resolved_source_id, title)
             artifact["visualizationId"] = visualization_id
             return _tag_slot(_build_html(
                 self.valves.security_level, title, "ru", chime=self.valves.chime, artifact=artifact,

@@ -148,6 +148,13 @@ The tool searches for an exact source call ID in this order:
 2. Saved `message.output` for that message.
 3. Completed results in the supplied dialogue.
 
+Since 1.4.1, if the exact ID is absent, the public tool also checks the single
+candidate `functions.` + supplied ID. It accepts only an existing completed result
+and saves its full canonical ID in the artifact. An existing exact call (including
+a pending call) prevents this fallback. There is no fuzzy, tool-name or arbitrary
+suffix matching; numeric suffixes and other namespaces are never repaired.
+The model should still copy the complete ID, rather than deliberately omit a prefix.
+
 Only the selected textual result is included; neighboring results, tool
 arguments, private metadata, images and attachments are excluded. JSON strings
 are normalized to their values; ordinary text remains a string. Later changes to

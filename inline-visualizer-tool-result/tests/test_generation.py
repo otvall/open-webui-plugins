@@ -98,6 +98,66 @@ def test_short_public_contract():
     assert params["source_tool_call_id"].default is inspect.Parameter.empty
 
 
+def test_public_tool_repairs_missing_functions_prefix_and_saves_canonical_id(host):
+    host.kwargs["source_tool_call_id"] = "get_sales:1"
+    host.kwargs["__messages__"][-1]["tool_call_id"] = "functions.get_sales:1"
+    response, _ = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    saved = artifact(response.body.decode())
+    assert saved["sourceToolCallId"] == "functions.get_sales:1"
+    assert saved["data"] == {"value": 42}
+    assert len(host.calls) == 1
+
+
+@pytest.mark.parametrize("location", ["live", "saved", "message", "nested", "direct"])
+def test_missing_prefix_resolves_across_output_formats(monkeypatch, location):
+    output = {"type": "function_call_output", "call_id": "functions.sales:1", "output": '{"value":42}', "status": "completed"}
+    outputs, messages = [], []
+    if location == "live":
+        outputs = [[output]]
+    elif location == "saved":
+        outputs = [[], [output]]
+    elif location == "message":
+        messages = [{"role": "tool", "tool_call_id": output["call_id"], "content": output["output"]}]
+    elif location == "nested":
+        messages = [{"role": "assistant", "output": [output]}]
+    else:
+        messages = [output]
+    async def load(*args):
+        return outputs
+    monkeypatch.setattr(iv, "_load_current_message_outputs", load)
+    assert asyncio.run(iv._resolve_tool_result_with_id("sales:1", None, None, messages)) == (
+        True, {"value": 42}, "functions.sales:1")
+
+
+def test_exact_history_id_wins_over_prefixed_live_id(monkeypatch):
+    async def load(*args):
+        return [[{"type": "function_call_output", "call_id": "functions.sales:1", "output": "wrong"}]]
+    monkeypatch.setattr(iv, "_load_current_message_outputs", load)
+    messages = [{"role": "tool", "tool_call_id": "sales:1", "content": "exact"}]
+    assert asyncio.run(iv._resolve_tool_result_with_id("sales:1", None, None, messages)) == (True, "exact", "sales:1")
+
+
+@pytest.mark.parametrize("pending", [
+    {"type": "function_call", "call_id": "sales:1", "status": "in_progress"},
+    {"type": "function_call_output", "call_id": "sales:1", "status": "pending", "output": "not ready"},
+    {"role": "assistant", "tool_calls": [{"id": "sales:1"}]},
+])
+def test_existing_unfinished_exact_call_blocks_prefix_fallback(pending):
+    messages = [pending, {"role": "tool", "tool_call_id": "functions.sales:1", "content": "wrong call"}]
+    assert asyncio.run(iv._resolve_tool_result_with_id("sales:1", None, None, messages)) == (False, None, "sales:1")
+
+
+@pytest.mark.parametrize("submitted", ["sales", "sales:2", "function.sales:1", "other.sales:1", "functions.functions.sales:1", "Sales:1"])
+def test_only_missing_literal_prefix_is_repaired(submitted):
+    messages = [{"role": "tool", "tool_call_id": "functions.sales:1", "content": "data"}]
+    assert asyncio.run(iv._resolve_tool_result_with_id(submitted, None, None, messages)) == (False, None, submitted)
+
+
+def test_prefixed_pending_result_is_not_accepted():
+    messages = [{"type": "function_call_output", "call_id": "functions.sales:1", "status": "pending", "output": "partial"}]
+    assert asyncio.run(iv._resolve_tool_result_with_id("sales:1", None, None, messages)) == (False, None, "sales:1")
+
+
 def test_placeholder_precedes_generation_and_final_is_durable(host):
     response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
     assert len(host.events) == 2 and len(host.calls) == 1
