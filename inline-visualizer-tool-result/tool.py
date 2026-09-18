@@ -3,9 +3,9 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.2.0
+version: 1.3.0
 required_open_webui_version: 0.10.2
-description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
+description: Renders completed HTML with a snapshot of one completed tool result as a self-contained, restorable visualization. Requires the source call's exact ID, the finished html argument, and sequential execution. The model must call view_skill("visualize-tool-result") before use.
 """
 
 import json
@@ -17,7 +17,8 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.2.0"
+_IV_BUILD = "tool-result-1.3.0"
+_ARTIFACT_VERSION = 1
 
 _CHARTJS_URL = "/static/chart.umd.min.js"
 _PLOTLY_URL = "/static/plotly.umd.min.js"
@@ -192,6 +193,29 @@ def _build_tool_data_bridge(result: Any) -> str:
     )
 
 
+def _build_saved_artifact(html: str, data: Any, source_tool_call_id: str, title: str) -> dict:
+    """A complete immutable snapshot; browser caches are never its source of truth."""
+    if not isinstance(html, str) or not html.strip() or not re.search(r"<[a-zA-Z]", html):
+        raise ValueError("html must contain a completed HTML/SVG fragment")
+    if html.lstrip().startswith(("```", "~~~")) or re.search(
+        r"(?m)^\s*@@@VIZ-(?:START|END)\s*$", html
+    ):
+        raise ValueError("Pass the fragment in html without Markdown fences or VIZ markers")
+    html.encode("utf-8")
+    artifact = {
+        "schemaVersion": _ARTIFACT_VERSION,
+        "visualizationId": uuid.uuid4().hex,
+        "runtimeVersion": _IV_BUILD,
+        "sourceToolCallId": source_tool_call_id,
+        "title": title,
+        "html": html,
+        "data": data,
+    }
+    # Validate serialization before emitting either copy of the embed.
+    _safe_json_for_html(artifact).encode("utf-8")
+    return artifact
+
+
 def _build_runtime_config(
     max_active_visualizations: int = 2,
     point_density: float = 1.0,
@@ -200,11 +224,12 @@ def _build_runtime_config(
     message_id: str = "",
     chartjs_url: str = _CHARTJS_URL,
     plotly_url: str = _PLOTLY_URL,
+    source_mode: str = "streaming",
 ) -> str:
     """Serialize bounded browser-runtime settings into inert JSON."""
     config = {
         "build": _IV_BUILD,
-        "lifecycleVersion": 4,
+        "lifecycleVersion": 5,
         "maxActiveVisualizations": max_active_visualizations,
         "pointDensity": point_density,
         "chartjsUrl": chartjs_url,
@@ -212,6 +237,8 @@ def _build_runtime_config(
     }
     if lifecycle_key:
         config["lifecycleKey"] = lifecycle_key
+    if source_mode != "streaming":
+        config["sourceMode"] = source_mode
     if chat_id:
         config["chatId"] = chat_id
     if message_id:
@@ -444,7 +471,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
   'use strict';
 
   function installLifecycleManager() {
-    if (window.__ivLifecycleV4) return;
+    if (window.__ivLifecycleV5) return;
     var records = new WeakMap();
     var frames = new Set();
     var sequence = 0;
@@ -472,7 +499,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       dbPromise = new Promise(function(resolve) {
         try {
           if (!window.indexedDB) { resolve(null); return; }
-          var request = window.indexedDB.open('iv-runtime-sessions-v4', 1);
+          var request = window.indexedDB.open('iv-runtime-sessions-v5', 1);
           var settled = false;
           var deadline = setTimeout(function() { settled = true; resolve(null); }, 2000);
           function failed() { settled = true; clearTimeout(deadline); resolve(null); }
@@ -618,7 +645,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         sourceSaved: false,
         storageKey: sessionKey + ':' + (++sequence),
         start: null,
-        hideSource: createSourceHider(frame, config || {}),
+        hideSource: config && config.sourceMode === 'saved' ? null : createSourceHider(frame, config || {}),
         requested: false,
         title: 'Visualization',
         height: 0,
@@ -670,12 +697,12 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       var closeScript = '</scr' + 'ipt>';
       var behavior = "(function(){" +
         "function report(){try{parent.postMessage({type:'iframe:height',height:document.documentElement.scrollHeight},'*');}catch(e){}}" +
-        "function activate(){try{var m=parent.__ivLifecycleV4;if(m)m.activate(window.frameElement);}catch(e){}}" +
+        "function activate(){try{var m=parent.__ivLifecycleV5;if(m)m.activate(window.frameElement);}catch(e){}}" +
         "var button=document.getElementById('iv-static-activate');if(button)button.addEventListener('click',activate);" +
         "var image=document.getElementById('iv-static-image');if(image)image.addEventListener('click',activate);" +
         "window.addEventListener('load',report);setTimeout(report,0);" +
         "})();";
-      return '<!doctype html><html data-iv-static="4"><head><meta charset="utf-8">' +
+      return '<!doctype html><html data-iv-static="5"><head><meta charset="utf-8">' +
         '<meta name="viewport" content="width=device-width,initial-scale=1">' +
         '<meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; img-src data: blob:; style-src &#39;unsafe-inline&#39;; script-src &#39;unsafe-inline&#39;; form-action &#39;none&#39;; object-src &#39;none&#39;">' +
         '<title>' + title + '</title><style>' +
@@ -874,7 +901,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         }
         function loaded() {
           try {
-            finish(records.get(frame) === record && frame.contentDocument.documentElement.getAttribute('data-iv-static') === '4');
+            finish(records.get(frame) === record && frame.contentDocument.documentElement.getAttribute('data-iv-static') === '5');
           } catch(e) { finish(false); }
         }
         record.cancelPark = function() { finish(false); };
@@ -1079,9 +1106,9 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
       });
     } catch(e) {}
 
-    window.__ivLifecycleV4 = {
+    window.__ivLifecycleV5 = {
       watch: function(frame, config) {
-        if (!frame || !config || Number(config.lifecycleVersion) !== 4) return;
+        if (!frame || !config || Number(config.lifecycleVersion) !== 5) return;
         maxActive = boundedMax(config.maxActiveVisualizations);
         var record = recordFor(frame, config);
         observeFrameLayout(frame, record);
@@ -1103,7 +1130,7 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
         scheduleDrain(100);
       },
       live: function(frame, config) {
-        if (!frame || !config || Number(config.lifecycleVersion) !== 4) return;
+        if (!frame || !config || Number(config.lifecycleVersion) !== 5) return;
         maxActive = boundedMax(config.maxActiveVisualizations);
         var record = recordFor(frame, config);
         try {
@@ -1149,13 +1176,13 @@ LIFECYCLE_BOOTSTRAP_SCRIPT = """
   }
 
   try {
-    if (!parent.__ivLifecycleV4) {
+    if (!parent.__ivLifecycleV5) {
       var installer = parent.document.createElement('script');
       installer.textContent = '(' + installLifecycleManager.toString() + ')();';
       (parent.document.head || parent.document.body).appendChild(installer);
       installer.remove();
     }
-    window.__ivLifecycleManager = parent.__ivLifecycleV4 || null;
+    window.__ivLifecycleManager = parent.__ivLifecycleV5 || null;
     if (window.__ivLifecycleManager) {
       window.__ivLifecycleManager.watch(window.frameElement, window.__ivRuntimeConfig || {});
     }
@@ -2154,6 +2181,10 @@ function copyText(text, silent) {
 // persists across reloads but never leaks between chats / messages.
 // Silent no-op if localStorage / parent is unreachable.
 function _ivStatePrefix() {
+  var cfg = window.__ivRuntimeConfig || {};
+  if (cfg.sourceMode === 'saved' && cfg.lifecycleKey) {
+    return 'iv-state:artifact:' + cfg.lifecycleKey + ':';
+  }
   try {
     var frame = window.frameElement;
     var msgEl = frame && frame.closest && frame.closest('[id^="message-"]');
@@ -3169,6 +3200,11 @@ function _ivDownload() {
   var docClone = document.documentElement.cloneNode(true);
   var headClone = docClone.querySelector('head');
   var bodyClone = docClone.querySelector('body');
+  if ((window.__ivRuntimeConfig || {}).sourceMode === 'saved') {
+    // The saved renderer replays the canonical artifact itself. Do not also
+    // execute scripts copied from the already rendered DOM on HTML export.
+    docClone.querySelectorAll('script[data-iv-imported="1"]').forEach(function(el) { el.remove(); });
+  }
   if (headClone && bodyClone) {
     var imported = headClone.querySelectorAll('script[data-iv-imported="1"]');
     for (var i = 0; i < imported.length; i++) {
@@ -5495,6 +5531,223 @@ STREAMING_OBSERVER_SCRIPT = """
 """
 
 
+SAVED_VISUALIZATION_SCRIPT = r"""
+<script>
+(function() {
+  'use strict';
+  var cfg = window.__ivRuntimeConfig || {};
+  var root = document.getElementById('iv-render');
+  var artifact = null;
+  var failure = null;
+  var pending = new Set();
+  var loads = Object.create(null);
+  var urls = {chartjs: cfg.chartjsUrl, plotly: cfg.plotlyUrl};
+  window.__ivRenderStatus = 'loading';
+
+  function removeLoader() {
+    var loader = document.getElementById('iv-loader');
+    if (loader) loader.remove();
+  }
+  function announceLive() {
+    if (typeof window.__ivLifecycleLive === 'function') window.__ivLifecycleLive();
+  }
+  function showError(error) {
+    if (window.__ivDisposed) return;
+    failure = error instanceof Error ? error : new Error(String(error));
+    window.__ivRenderStatus = 'error';
+    removeLoader();
+    var box = document.getElementById('iv-artifact-error');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'iv-artifact-error';
+      box.setAttribute('role', 'alert');
+      box.style.cssText = 'padding:16px;color:var(--color-text-danger);white-space:pre-wrap';
+      root.appendChild(box);
+    }
+    box.textContent = 'Visualization could not be restored: ' + failure.message +
+      '\nID: ' + (cfg.lifecycleKey || 'unknown') +
+      '\nThe saved HTML and data have not been replaced. Check the bundle URLs or the generated script.';
+    announceLive();
+  }
+  function onError(event) {
+    if (event.message) showError(new Error(event.message));
+  }
+  function onRejection(event) { showError(event.reason || new Error('Unhandled script rejection')); }
+  window.addEventListener('error', onError);
+  window.addEventListener('unhandledrejection', onRejection);
+  window.__ivOnDispose(function() {
+    pending.forEach(function(cancel) { cancel(); });
+    pending.clear();
+    window.removeEventListener('error', onError);
+    window.removeEventListener('unhandledrejection', onRejection);
+    window.__ivRefreshLayout = null;
+  });
+
+  // Each operation has an explicit failure deadline and can be cancelled on
+  // eviction. Never leave a missing bundle or module as an infinite spinner.
+  function loadScript(node) {
+    return new Promise(function(resolve) {
+      var done = false;
+      function finish(ok) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        pending.delete(cancel);
+        node.onload = node.onerror = null;
+        if (!ok) node.remove();
+        resolve(ok);
+      }
+      function cancel() { finish(false); }
+      var timer = setTimeout(function() { finish(false); }, 12000);
+      pending.add(cancel);
+      node.onload = function() { finish(true); };
+      node.onerror = function() { finish(false); };
+      node.setAttribute('data-iv-imported', '1');
+      document.head.appendChild(node);
+    });
+  }
+  function loadLibrary(name) {
+    var node = document.createElement('script');
+    node.src = urls[name];
+    return loadScript(node).then(function(ok) {
+      return ok && (name === 'chartjs' ? typeof window.Chart === 'function' :
+        !!(window.Plotly && typeof window.Plotly.newPlot === 'function'));
+    });
+  }
+  window.ivRequireLibraries = function(names) {
+    return Promise.all(names.map(function(name) {
+      if (!loads[name]) throw new Error('Unknown chart library: ' + name);
+      return loads[name].then(function(ok) {
+        if (!ok) throw new Error('Required library unavailable: ' + name + ' (' + urls[name] + ')');
+      });
+    }));
+  };
+  function hasLayout() {
+    try {
+      var frame = window.frameElement;
+      if (frame) {
+        var rect = frame.getBoundingClientRect();
+        var style = parent.getComputedStyle(frame);
+        return frame.isConnected && rect.width > 16 && rect.height > 0 &&
+          frame.getClientRects().length > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+      }
+    } catch(e) {}
+    return document.documentElement.clientWidth > 16;
+  }
+  function waitForLayout() {
+    return new Promise(function(resolve, reject) {
+      var started = Date.now(), timer = null, done = false;
+      function finish(error) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        pending.delete(cancel);
+        if (error) reject(error); else resolve();
+      }
+      function cancel() { finish(new Error('Rendering cancelled')); }
+      function check() {
+        if (window.__ivDisposed) { cancel(); return; }
+        if (hasLayout()) { finish(); return; }
+        if (Date.now() - started >= 12000) { finish(new Error('Chart container has no visible size')); return; }
+        timer = setTimeout(check, 100);
+      }
+      pending.add(cancel);
+      check();
+    });
+  }
+  function refreshLayout() {
+    if (window.__ivDisposed || !hasLayout()) return;
+    try {
+      Object.values((window.Chart && window.Chart.instances) || {}).forEach(function(chart) { chart.resize(); });
+    } catch(e) {}
+    if (window.Plotly && window.Plotly.Plots) {
+      root.querySelectorAll('.js-plotly-plot').forEach(function(el) {
+        try { Promise.resolve(window.Plotly.Plots.resize(el)).catch(function() {}); } catch(e) {}
+      });
+    }
+    if (typeof reportHeight === 'function') reportHeight();
+  }
+  window.__ivRefreshLayout = refreshLayout;
+
+  async function renderSaved() {
+    var payload = document.getElementById('iv-visualization-artifact');
+    if (!payload) throw new Error('Saved artifact is missing');
+    try { artifact = JSON.parse(payload.textContent); }
+    catch(e) { throw new Error('Saved artifact contains invalid JSON'); }
+    if (!artifact || artifact.schemaVersion !== 1) throw new Error('Unsupported saved artifact version');
+    if (!artifact.visualizationId || artifact.visualizationId !== cfg.lifecycleKey) throw new Error('Saved artifact identity mismatch');
+    if (artifact.runtimeVersion !== cfg.build) throw new Error('Saved runtime version mismatch');
+    if (typeof artifact.html !== 'string' || !artifact.html.trim() ||
+        !Object.prototype.hasOwnProperty.call(artifact, 'data')) throw new Error('Saved HTML or data is missing');
+    window.getToolData = function() { return artifact.data; };
+
+    // Both downloads start at admitted runtime startup, but a consumer only
+    // waits for the libraries it actually uses.
+    Object.keys(urls).forEach(function(name) { loads[name] = loadLibrary(name); });
+    var template = document.createElement('template');
+    template.innerHTML = artifact.html;
+    var scripts = Array.from(template.content.querySelectorAll('script'));
+    scripts.forEach(function(script) { script.remove(); });
+    root.replaceChildren(template.content);
+    await waitForLayout();
+    for (var i = 0; i < scripts.length; i++) {
+      if (window.__ivDisposed) return;
+      var incoming = scripts[i];
+      var src = incoming.getAttribute('src');
+      var type = (incoming.getAttribute('type') || '').trim().toLowerCase();
+      if (type && type !== 'module' && type !== 'text/javascript' && type !== 'application/javascript') {
+        root.appendChild(incoming); // inert JSON/data block, not executable code
+        continue;
+      }
+      if (src) {
+        var name = Object.keys(urls).find(function(key) {
+          return new URL(urls[key], document.baseURI).href === new URL(src, document.baseURI).href;
+        });
+        if (!name) throw new Error('Only the configured Chart.js and Plotly bundles are supported');
+        await window.ivRequireLibraries([name]);
+        continue;
+      }
+      var code = incoming.textContent || '';
+      var explicit = incoming.getAttribute('data-iv-libraries');
+      var names = explicit === null ? Object.keys(loads).filter(function(key) {
+        return (key === 'chartjs' ? /\bChart\b/ : /\bPlotly\b/).test(code);
+      }) : explicit.split(/[ ,]+/).filter(Boolean);
+      await window.ivRequireLibraries(names);
+      if (window.__ivDisposed) return;
+      var script = document.createElement('script');
+      Array.from(incoming.attributes).forEach(function(attr) { script.setAttribute(attr.name, attr.value); });
+      script.textContent = code;
+      script.setAttribute('data-iv-imported', '1');
+      if (type === 'module') {
+        if (!await loadScript(script)) throw new Error('Module failed to execute');
+      } else {
+        document.head.appendChild(script);
+      }
+      if (failure) throw failure;
+    }
+    if (window.__ivDisposed) return;
+    if (typeof window.__ivPostRenderFixes === 'function') window.__ivPostRenderFixes();
+    refreshLayout();
+    await new Promise(function(resolve) { requestAnimationFrame(function() { requestAnimationFrame(resolve); }); });
+    if (window.__ivDisposed) return;
+    if (failure) throw failure;
+    window.__ivRenderStatus = 'ready';
+    removeLoader();
+    announceLive();
+  }
+  var ready = renderSaved().catch(showError);
+  var snapshotReady = null;
+  window.__ivSnapshotReady = function() {
+    if (!snapshotReady) snapshotReady = ready.then(function() {
+      return new Promise(function(resolve) { setTimeout(resolve, 1100); });
+    });
+    return snapshotReady;
+  };
+})();
+</script>
+"""
+
+
 # Reuse the proven Svelte-safe marker hider for parked frames, without loading
 # their data, chart libraries, renderer, or child-window closures. It runs in
 # the parent realm and is released with the lifecycle record.
@@ -5590,6 +5843,7 @@ _IFRAME_EMBEDDED_SCRIPTS = {
     "DOWNSAMPLING_SCRIPT": DOWNSAMPLING_SCRIPT,
     "LIFECYCLE_BOOTSTRAP_SCRIPT": LIFECYCLE_BOOTSTRAP_SCRIPT,
     "STREAMING_OBSERVER_SCRIPT": STREAMING_OBSERVER_SCRIPT,
+    "SAVED_VISUALIZATION_SCRIPT": SAVED_VISUALIZATION_SCRIPT,
 }
 for _name, _body in _IFRAME_EMBEDDED_SCRIPTS.items():
     _assert_srcdoc_safe(_name, _body)
@@ -5709,13 +5963,15 @@ def _build_html(
     message_id: str = "",
     chartjs_url: str = _CHARTJS_URL,
     plotly_url: str = _PLOTLY_URL,
+    artifact: dict | None = None,
 ) -> str:
-    """Wrap the streaming visualization shell: empty render area + observer.
+    """Build a complete iframe document with deferred runtime admission.
 
-    The observer tails the parent chat DOM for an ``@@@VIZ-START`` …
-    ``@@@VIZ-END`` plain-text block in the assistant message and renders
-    its contents live into #iv-render.
+    New calls pass a saved artifact; HTML and data are restored locally from it.
+    Omitting it retains the legacy streaming shell for compatibility tests.
     """
+    if artifact is not None:
+        lifecycle_key = artifact["visualizationId"]
     csp_tag = _build_csp_tag(security_level)
     strict_script = (
         STRICT_SECURITY_SCRIPT if security_level in ("strict", "offline") else ""
@@ -5744,17 +6000,24 @@ def _build_html(
         message_id=message_id,
         chartjs_url=chartjs_url,
         plotly_url=plotly_url,
+        source_mode="saved" if artifact is not None else "streaming",
     )
 
-    # Loader sits *below* the render area so content appears to flow
-    # downward toward the pulsing dots — like a cursor following a pen.
-    # The observer removes #iv-loader entirely on finalize().
+    payload = (
+        '<script id="iv-visualization-artifact" type="application/json">'
+        + _safe_json_for_html(artifact)
+        + '</script>'
+        if artifact is not None else tool_data_bridge
+    )
+    renderer = SAVED_VISUALIZATION_SCRIPT if artifact is not None else STREAMING_OBSERVER_SCRIPT
+
+    # Keep the loading indicator below the content until the renderer finishes.
     body_inner = (
         '<div id="iv-render"></div>\n'
         '<div id="iv-loader" class="iv-loading" aria-live="polite">'
         '<div class="iv-loading-dots"><span></span><span></span><span></span></div>'
         '<div class="iv-loading-label">Rendering visualization\u2026</div>'
-        '<button id="iv-start" type="button" onclick="try{parent.__ivLifecycleV4.activate(window.frameElement);}catch(e){}">Load visualization</button>'
+        '<button id="iv-start" type="button" onclick="try{parent.__ivLifecycleV5.activate(window.frameElement);}catch(e){}">Load visualization</button>'
         "</div>\n"
         f"{DOWNLOAD_BUTTON}\n"
         f"{runtime_config}"
@@ -5762,9 +6025,9 @@ def _build_html(
         f"{CLEANUP_SCRIPT}"
         f"{THEME_DETECTION_SCRIPT}"
         f"{body_scripts}"
-        f"{tool_data_bridge}"
+        f"{payload}"
         f"{DOWNSAMPLING_SCRIPT}"
-        f"{STREAMING_OBSERVER_SCRIPT}"
+        f"{renderer}"
         f"{strict_script}"
         '</template>'
         f"{LIFECYCLE_BOOTSTRAP_SCRIPT}"
@@ -5873,6 +6136,7 @@ class Tools:
     async def visualize_tool_result(
         self,
         source_tool_call_id: str,
+        html: str,
         title: str = "Tool Result Visualization",
         retry_attempt: Literal[0, 1] = 0,
         __messages__=None,
@@ -5882,43 +6146,29 @@ class Tools:
         __event_emitter__=None,
     ):
         """
-        Visualize the result of exactly one completed tool call.
-        What this tool does: visualize_tool_result() resolves the selected source result and mounts an iframe sandbox directly in the chat.
-        After this tool is called, the assistant must stream exactly one HTML/SVG visualization fragment between the plain-text delimiters @@@VIZ-START and @@@VIZ-END.
-        The sandbox renders that fragment live for the user.
+        Render completed HTML with a snapshot of exactly one completed tool result.
+        BEFORE CALLING, read view_skill("visualize-tool-result").
+        Use only when system/developer instructions require a tool-result visualization.
+        The producer MUST finish first; never batch it with this call.
+        Copy its complete tool_call_id/call_id exactly into source_tool_call_id.
 
-        Use this tool only when a system or developer instruction explicitly requires a visualization based on the result of another tool call.
-        Never use it for an ordinary visualization; use visualize() for that workflow.
-        The data-producing call MUST finish before this tool is called. Never place the producer and visualize_tool_result() in the same parallel tool batch.
-        If this tool returns status="retry_required", call visualize_tool_result exactly once in the next tool round using retry.arguments exactly. Reuse the existing source call; never rerun the data-producing tool to recover a visualization.
-        Copy source_tool_call_id character-for-character from the completed source call's explicit tool_call_id or call_id. It is a call ID, not a tool name. Never construct, shorten, normalize, or repair it.
+        Pass the finished HTML/SVG fragment in html: styles first, content next,
+        scripts last. Use getToolData() for the selected result; never copy the
+        dataset into generated code. Chart.js and Plotly are preloaded from the
+        configured local bundles. Declare data-iv-libraries on consumer scripts.
+        Initialize immediately, not in window.onload or DOMContentLoaded handlers.
 
-        IMPORTANT:
-        BEFORE CALLING THIS TOOL, YOU MUST call view_skill("visualize-tool-result") first.
-        Never generate a tool-result visualization without reading that skill first.
+        The returned embed contains the fragment, data snapshot and stable ID.
+        Do not emit HTML or @@@VIZ markers in a later assistant message.
+        After the call, explain only what the visualization shows.
+        If status is retry_required, retry once with retry.arguments unchanged.
+        Never rerun the producer just to recover a visualization.
 
-        After calling this tool:
-        In the assistant message that follows, emit exactly one visualization block:
-
-        @@@VIZ-START
-        <!-- HTML/SVG fragment only -->
-        @@@VIZ-END
-
-        Hard output rules:
-        - Use the delimiters exactly: @@@VIZ-START and @@@VIZ-END.
-        - Put each delimiter on its own line.
-        - Emit exactly one @@@VIZ-START / @@@VIZ-END pair per tool call.
-        - Do not wrap the visualization in Markdown code fences.
-        - Do not use ```html, ```svg, ~~~, :::, or any other fenced block.
-        - Emit a fragment only: no <!DOCTYPE>, no <html>, no <head>, no <body>.
-        - Structure the fragment as: <style> first, visible content next, <script> last.
-        - Read the selected result with getToolData(). Never reproduce it as a JavaScript literal.
-        - Do not describe the HTML/SVG source to the user. Describe what the visualization shows.
-
-        :param source_tool_call_id: Required complete tool_call_id/call_id copied character-for-character from the completed source tool call. Preserve every prefix, separator, and numeric suffix. This is a call ID, not a tool name; never construct or modify it.
-        :param title: Short descriptive title for the visualization.
-        :param retry_attempt: Retry control. Leave at 0 for the initial call. Set to 1 only when a prior retry_required result supplies retry.arguments.
-        :return: Interactive rich embed rendered in the chat, with LLM context.
+        :param source_tool_call_id: Complete ID copied exactly from the completed source call, not a tool name.
+        :param html: Required finished HTML/SVG fragment, without Markdown fences, VIZ markers or document wrapper tags. Read data through getToolData().
+        :param title: Short descriptive title.
+        :param retry_attempt: Keep 0 initially; use 1 only when supplied in retry.arguments.
+        :return: Self-contained rich embed and model context; errors emit no embed.
         """
         if not isinstance(source_tool_call_id, str) or not source_tool_call_id.strip():
             return {
@@ -5957,6 +6207,7 @@ class Tools:
                         "arguments": {
                             "source_tool_call_id": source_tool_call_id,
                             "title": title,
+                            "html": html,
                             "retry_attempt": 1,
                         },
                     },
@@ -5974,11 +6225,11 @@ class Tools:
             }
 
         try:
-            tool_data_bridge = _build_tool_data_bridge(tool_result)
+            artifact = _build_saved_artifact(html, tool_result, source_tool_call_id, title)
         except (TypeError, ValueError, UnicodeError) as exc:
             return {
                 "status": "error",
-                "error": "Tool result cannot be serialized",
+                "error": "Invalid visualization artifact",
                 "source_tool_call_id": source_tool_call_id,
                 "detail": str(exc),
             }
@@ -6020,43 +6271,31 @@ return (() => {
             metadata.get("message_id") or metadata.get("assistant_message_id") or ""
         )
 
-        html = _build_html(
+        embed_html = _build_html(
             self.valves.security_level,
             title,
             lang,
             chime=self.valves.chime,
-            tool_data_bridge=tool_data_bridge,
+            artifact=artifact,
             max_active_visualizations=self.valves.max_active_visualizations,
             point_density=self.valves.point_density,
-            lifecycle_key=uuid.uuid4().hex,
             chat_id=chat_id,
             message_id=message_id,
             chartjs_url=self.valves.chartjs_url,
             plotly_url=self.valves.plotly_url,
         )
         response = HTMLResponse(
-            content=html,
+            content=embed_html,
             headers={"Content-Disposition": "inline"},
         )
         result_context = (
-            f'Visualization wrapper "{title}" is mounted and waiting for content. '
-            f"The selected tool result is available inside the iframe only via "
-            f"getToolData(). Do not reproduce it in the generated HTML or JavaScript. "
-            f"Chart.js (window.Chart) and Plotly (window.Plotly) are loaded automatically "
-            f"at admitted iframe startup. Mark chart scripts with data-iv-libraries=\"chartjs\" "
-            f"or data-iv-libraries=\"plotly\" (space-separated for both); only required libraries are awaited. Do not add script "
-            f"tags or other loaders for Chart.js or Plotly. "
-            f"Now emit the HTML/SVG in your NEXT text response wrapped in the "
-            f"TEXT delimiters @@@VIZ-START and @@@VIZ-END, each on their own line. "
-            f"The wrapper will tail your stream and render live. These are PLAIN "
-            f"TEXT markers — NOT a ``` code fence, NOT HTML tags, NOT a ::: fence. "
-            f"Example:\n\n"
-            f"    @@@VIZ-START\n"
-            f'    <svg viewBox="0 0 680 240">…</svg>\n'
-            f"    @@@VIZ-END\n\n"
-            f"Write explanatory prose BEFORE and AFTER the block — do not describe "
-            f"the HTML source itself. Emit exactly ONE @@@VIZ-START/@@@VIZ-END pair "
-            f"for this tool call."
+            f'Visualization "{title}" is packaged as a self-contained embed '
+            f'(ID: {artifact["visualizationId"]}, format: {_ARTIFACT_VERSION}). '
+            "Its HTML and getToolData() snapshot are included in both embed copies "
+            "for Open WebUI to persist with the chat. Browser render success is not "
+            "confirmed by this tool response. Do not emit HTML or VIZ markers now. "
+            "Do not add script tags or other loaders for Chart.js or Plotly. "
+            "Briefly explain what the visualization shows."
         )
         # Persist the message-level embed for SPA chat restoration and mount it
         # immediately in the live message. ALWAYS return the HTMLResponse too:
@@ -6070,7 +6309,7 @@ return (() => {
             await __event_emitter__(
                 {
                     "type": "embeds",
-                    "data": {"embeds": [html], "replace": False},
+                    "data": {"embeds": [embed_html], "replace": False},
                 }
             )
         return response, result_context

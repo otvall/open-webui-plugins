@@ -82,11 +82,15 @@ def extract_tool_json(html):
         html,
         re.DOTALL,
     )
-    assert match is not None
+    if match is None:
+        match = re.search(r'<script id="iv-visualization-artifact" type="application/json">(.*?)</script>', html, re.DOTALL)
+        assert match is not None
+        return json.loads(match.group(1))["data"]
     return json.loads(match.group(1))
 
 
 def capture_visualize(tool, **kwargs):
+    kwargs.setdefault("html", "<div>Saved chart</div>")
     events = []
 
     async def emitter(event):
@@ -328,6 +332,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     response, context = run(
         iv.Tools().visualize_tool_result(
             source_tool_call_id="call-data",
+            html="<div>Saved chart</div>",
             title="Fallback",
             __messages__=[tool_message("call-data", [{"x": 1}])],
             __metadata__={"chat_id": "chat/live", "message_id": "msg:live"},
@@ -336,9 +341,9 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
 
     assert isinstance(response, iv.HTMLResponse)
     assert response.headers["content-disposition"] == "inline"
-    assert "waiting for content" in context
+    assert "self-contained embed" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.2.0' in response.body
+    assert b'tool-result-1.3.0' in response.body
     runtime = re.search(
         rb'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
         response.body,
@@ -359,6 +364,7 @@ def test_event_emitter_persists_message_embed_and_html_response_is_still_returne
     response, context = run(
         iv.Tools().visualize_tool_result(
             source_tool_call_id="call-data",
+            html="<div>Saved chart</div>",
             title="Dual path",
             __messages__=[tool_message("call-data", [{"x": 1}])],
             __event_emitter__=emitter,
@@ -366,7 +372,7 @@ def test_event_emitter_persists_message_embed_and_html_response_is_still_returne
     )
 
     assert isinstance(response, iv.HTMLResponse)
-    assert "waiting for content" in context
+    assert "self-contained embed" in context
     assert events == [
         {
             "type": "embeds",
@@ -495,6 +501,7 @@ def test_unknown_or_unfinished_source_tool_call_id_requests_one_retry(
         "arguments": {
             "source_tool_call_id": "call-pending",
             "title": "Tool Result Visualization",
+            "html": "<div>Saved chart</div>",
             "retry_attempt": 1,
         },
     }
@@ -535,7 +542,7 @@ def test_retry_succeeds_when_source_result_becomes_visible():
         __messages__=[tool_message("call-data", [{"value": 42}])],
     )
 
-    assert "waiting for content" in result
+    assert "self-contained embed" in result
     assert extract_tool_json(html) == [{"value": 42}]
     assert len(events) == 1
 
@@ -566,7 +573,7 @@ def test_unserializable_result_is_a_controlled_error(monkeypatch):
     )
 
     assert result["status"] == "error"
-    assert result["error"] == "Tool result cannot be serialized"
+    assert result["error"] == "Invalid visualization artifact"
     assert result["source_tool_call_id"] == "call-nan"
     assert html is None
     assert events == []
@@ -655,7 +662,7 @@ const childWindow = {{frameElement:null,__ivRuntimeConfig:{{}}}};
 new Function('window','parent','document','MutationObserver','requestAnimationFrame',
   {json.dumps(match.group(1))}
 )(childWindow,parentWindow,{{getElementById:()=>null}},FakeMutationObserver,raf);
-const manager = parentWindow.__ivLifecycleV4;
+const manager = parentWindow.__ivLifecycleV5;
 function makeTestFrame(order, source='source-'+order, snapshot=null) {{
   const attrs = {{srcdoc:source}};
   return {{order, isConnected:true, style:{{}}, parentElement:null,
@@ -701,8 +708,8 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.2.0",
-        "lifecycleVersion": 4,
+        "build": "tool-result-1.3.0",
+        "lifecycleVersion": 5,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
         "chartjsUrl": "/static/custom/chart.js",
@@ -717,6 +724,7 @@ def test_tool_forwards_startup_library_valves_and_instructs_model_not_to_import(
     response, context = run(
         tool.visualize_tool_result(
             source_tool_call_id="call-data",
+            html="<div>Saved chart</div>",
             __messages__=[tool_message("call-data", [{"x": 1}])],
         )
     )
@@ -823,7 +831,7 @@ def test_lifecycle_parent_observer_cannot_loop_on_streaming_style_writes():
     source = iv.LIFECYCLE_BOOTSTRAP_SCRIPT
     assert "attributes: true" not in source
     assert "attributeFilter" not in source
-    assert "window.__ivLifecycleV4" in source
+    assert "window.__ivLifecycleV5" in source
 
 
 def test_lifecycle_reload_keeps_latest_dom_frames_and_waits_before_snapshot():
@@ -849,7 +857,7 @@ function frame(order) {
 function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
 (async function(){
   const frames=[frame(1),frame(2),frame(3),frame(4)];
-  const config={lifecycleVersion:4,maxActiveVisualizations:2};
+  const config={lifecycleVersion:5,maxActiveVisualizations:2};
   frames.forEach(function(item){manager.watch(item,config);});
   [frames[3],frames[0],frames[2],frames[1]].forEach(function(item){manager.live(item,config);});
   await pause();
@@ -908,14 +916,14 @@ function frame(source, order) {
 function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
 (async function(){
   const reused=frame('old-visualization',1);
-  manager.watch(reused,{lifecycleVersion:4,lifecycleKey:'old',maxActiveVisualizations:1});
-  manager.live(reused,{lifecycleVersion:4,lifecycleKey:'old',maxActiveVisualizations:1});
+  manager.watch(reused,{lifecycleVersion:5,lifecycleKey:'old',maxActiveVisualizations:1});
+  manager.live(reused,{lifecycleVersion:5,lifecycleKey:'old',maxActiveVisualizations:1});
   reused.setAttribute('srcdoc','new-visualization');
-  manager.watch(reused,{lifecycleVersion:4,lifecycleKey:'new',maxActiveVisualizations:1});
-  manager.live(reused,{lifecycleVersion:4,lifecycleKey:'new',maxActiveVisualizations:1});
+  manager.watch(reused,{lifecycleVersion:5,lifecycleKey:'new',maxActiveVisualizations:1});
+  manager.live(reused,{lifecycleVersion:5,lifecycleKey:'new',maxActiveVisualizations:1});
   const latest=frame('latest-visualization',2);
-  manager.watch(latest,{lifecycleVersion:4,lifecycleKey:'latest',maxActiveVisualizations:1});
-  manager.live(latest,{lifecycleVersion:4,lifecycleKey:'latest',maxActiveVisualizations:1});
+  manager.watch(latest,{lifecycleVersion:5,lifecycleKey:'latest',maxActiveVisualizations:1});
+  manager.live(latest,{lifecycleVersion:5,lifecycleKey:'latest',maxActiveVisualizations:1});
   await pause();
   const suspended=reused.getAttribute('data-iv-state');
   manager.activate(reused);
@@ -956,7 +964,7 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
 (async function(){
   const missing=frame(1,null);
   const available=frame(2,{url:'data:image/png;base64,eA=='});
-  const config={lifecycleVersion:4,maxActiveVisualizations:1};
+  const config={lifecycleVersion:5,maxActiveVisualizations:1};
   [missing,available].forEach(function(item){manager.watch(item,config);manager.live(item,config);});
   await pause();
   console.log(JSON.stringify({
@@ -996,7 +1004,7 @@ function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});
   const hidden=frame(1,false);
   const first=frame(2,true);
   const second=frame(3,true);
-  const config={lifecycleVersion:4,maxActiveVisualizations:1};
+  const config={lifecycleVersion:5,maxActiveVisualizations:1};
   [hidden,first,second].forEach(function(item){manager.watch(item,config);manager.live(item,config);});
   await pause();
   console.log(JSON.stringify({
@@ -1030,7 +1038,7 @@ function frame(order) {
 function pause(){return new Promise(function(resolve){setTimeout(resolve,10);});}
 (async function(){
   const frames=[frame(1),frame(2),frame(3),frame(4)];
-  const config={lifecycleVersion:4,maxActiveVisualizations:0};
+  const config={lifecycleVersion:5,maxActiveVisualizations:0};
   frames.forEach(function(item){manager.watch(item,config);manager.live(item,config);});
   await pause();
   console.log(JSON.stringify(frames.map(function(item){return item.getAttribute('data-iv-state');})));
@@ -1386,7 +1394,7 @@ def test_admission_starts_only_two_of_thirty_and_cleans_up_on_page_exit():
     result = _run_lifecycle_js(r"""
 (async()=>{
   const frames=Array.from({length:30},(_,i)=>makeTestFrame(i));
-  const config={lifecycleVersion:4,maxActiveVisualizations:2};
+  const config={lifecycleVersion:5,maxActiveVisualizations:2};
   const starts=[];
   frames.forEach(f=>{
     manager.watch(f,config);
@@ -1407,7 +1415,7 @@ def test_admission_starts_only_two_of_thirty_and_cleans_up_on_page_exit():
 def test_preview_cache_evicts_images_but_keeps_restore_sources():
     result = _run_lifecycle_js(r"""
 (async()=>{
-  const config={lifecycleVersion:4,maxActiveVisualizations:1};
+  const config={lifecycleVersion:5,maxActiveVisualizations:1};
   const frames=Array.from({length:5},(_,i)=>makeTestFrame(i,'source-'+i,
     {url:'data:image/png;base64,eA==',width:2000,height:2000}));
   frames.forEach(f=>{manager.watch(f,config);manager.live(f,config);});
@@ -1427,7 +1435,7 @@ def test_preview_cache_evicts_images_but_keeps_restore_sources():
 def test_admission_waits_for_old_iframe_document_to_unload():
     result = _run_lifecycle_js(r"""
 (async()=>{
-  const config={lifecycleVersion:4,maxActiveVisualizations:1};
+  const config={lifecycleVersion:5,maxActiveVisualizations:1};
   const first=makeTestFrame(0), second=makeTestFrame(1);
   let starts=0, loaded;
   first.addEventListener=(name,callback)=>{if(name==='load')loaded=callback;};
@@ -1439,7 +1447,7 @@ def test_admission_waits_for_old_iframe_document_to_unload():
   manager.requestStart(second,config,()=>{starts++;manager.live(second,config);});
   await new Promise(r=>setTimeout(r,130));
   const before={starts,states:manager.stats().states};
-  first.contentDocument.documentElement={getAttribute:()=> '4'};
+  first.contentDocument.documentElement={getAttribute:()=> '5'};
   loaded();
   await new Promise(r=>setTimeout(r,30));
   console.log(JSON.stringify({before,after:{starts,states:manager.stats().states}}));
@@ -1452,7 +1460,7 @@ def test_admission_waits_for_old_iframe_document_to_unload():
 def test_storage_failure_preserves_source_and_does_not_admit_over_budget():
     result = _run_lifecycle_js(r"""
 (async()=>{
-  const config={lifecycleVersion:4,maxActiveVisualizations:1};
+  const config={lifecycleVersion:5,maxActiveVisualizations:1};
   const first=makeTestFrame(0,'x'.repeat(5*1024*1024));
   const second=makeTestFrame(1);
   let starts=0;
@@ -1476,7 +1484,7 @@ def test_unmount_prunes_shared_text_nodes_and_disposes_child():
 const f=makeTestFrame(1);
 let disposed=0;
 f.contentWindow.__ivDispose=()=>disposed++;
-manager.watch(f,{lifecycleVersion:4,maxActiveVisualizations:2});
+manager.watch(f,{lifecycleVersion:5,maxActiveVisualizations:2});
 const stale={isConnected:false}, current={isConnected:true};
 parentWindow.__ivChatBlankedNodes=[stale,current];
 parentWindow.__ivChatOriginalText=new WeakMap([[stale,'large payload']]);
@@ -1519,8 +1527,9 @@ assert.equal(window.__ivDisposed,true);
         iv.LIFECYCLE_BOOTSTRAP_SCRIPT,
         iv.BODY_SCRIPTS,
         iv.STREAMING_OBSERVER_SCRIPT,
+        iv.SAVED_VISUALIZATION_SCRIPT,
     ],
-    ids=["downsampling", "cleanup", "lifecycle", "body-scripts", "streaming-observer"],
+    ids=["downsampling", "cleanup", "lifecycle", "body-scripts", "streaming-observer", "saved-renderer"],
 )
 def test_new_browser_scripts_parse_after_python_string_decoding(source):
     node = shutil.which("node")

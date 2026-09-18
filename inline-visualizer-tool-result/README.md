@@ -1,196 +1,190 @@
 # Inline Visualizer — Tool Result
 
-`visualize_tool_result()` renders an interactive visualization from the textual result of one completed Open WebUI tool call. It is a dedicated companion to the standard `visualize()` tool: the standard tool creates ordinary visualizations, while this tool always requires a source call ID and always exposes that call's result through `getToolData()`.
+Version 1.3 renders a **completed HTML fragment plus a snapshot of one completed
+tool result**. The returned embed is self-contained: restoration does not need
+VIZ markers, assistant-message DOM, a new producer call, or an old browser cache.
 
 ## Requirements
 
-- Open WebUI 0.10.2 or newer
-- **Settings → Interface → iframe Sandbox Allow Same Origin** enabled
-- The bundled `visualize-tool-result` skill available through `view_skill`
-- Both browser bundles served by Open WebUI: Chart.js at `/static/chart.umd.min.js` and Plotly at `/static/plotly.umd.min.js` (or configure `chartjs_url` and `plotly_url` in Tool valves). These are the only available libraries; use native SVG/Canvas for other visuals. The tool does not install these files on the server. If Tool valves already contain older URLs, update them explicitly; changing defaults does not override saved settings.
+- Open WebUI 0.10.2 or newer; validate upgrades against your deployed OWUI version.
+- Install both `tool.py` and the `visualize-tool-result` skill.
+- Serve Chart.js at `/static/chart.umd.min.js` and Plotly at
+  `/static/plotly.umd.min.js`. These are the only supported libraries.
+  The tool does not install them. Override `chartjs_url` / `plotly_url` in
+  Tool valves if needed; old saved valve values are not overwritten by new defaults.
+- Enable **Settings → Interface → iframe Sandbox Allow Same Origin** for the
+  shared lifecycle manager and parent bridges. Rendering itself no longer reads
+  the parent chat DOM, but without parent access the manager cannot enforce its
+  cross-iframe budget and browser-local state bridges may be unavailable.
+  Asset loading remains subject to the host sandbox and CSP.
 
-## Tool signature
+## New tool contract
 
 ```python
 visualize_tool_result(
     source_tool_call_id: str,
+    html: str,
     title: str = "Tool Result Visualization",
     retry_attempt: Literal[0, 1] = 0,
 )
 ```
 
-`source_tool_call_id` is required. It must be the complete `tool_call_id` or `call_id` copied from the completed source call. It is treated as an opaque string and matched exactly.
+1. Read the skill, call the data-producing tool, and wait for it to finish.
+2. Copy its complete explicit `tool_call_id` / `call_id`, not its tool name.
+3. Generate the finished fragment and pass it in `html` in a later tool round.
+   Access the actual result through `getToolData()`; do not copy the dataset into
+   model-generated arguments or code.
+4. After the visualizer returns, explain what the chart shows. **Do not emit
+   HTML or `@@@VIZ-START` / `@@@VIZ-END` blocks in the text response.**
 
-`retry_attempt` is a bounded recovery control. Omit it on the initial call. If the result is not visible yet, the tool returns `status="retry_required"` with exact `retry.arguments`; call `visualize_tool_result()` once more in the next sequential tool round using those arguments. The retry keeps the original source call ID and sets `retry_attempt=1`.
+The fragment contains styles first, content next, and scripts last. Do not use
+Markdown fences or document wrapper tags. Declare dependencies with
+`data-iv-libraries="chartjs"`, `"plotly"`, or `"chartjs plotly"`. Do not import
+the bundles again. Run initialization directly, not from `window.onload` or
+`DOMContentLoaded`: admission may happen after those events.
 
-## Workflow
+Scripts execute once **per activation**, not once per chat lifetime. Restoring
+a suspended visualization starts a new runtime. Initialization should draw from
+the saved data and must not submit prompts, rerun producer calls, or perform other
+external side effects.
 
-The producer and visualizer must run in separate tool rounds:
+If `status="retry_required"`, call the visualizer once in the next sequential
+round using `retry.arguments` unchanged, including `html`. Do not rerun the
+producer. If the bounded retry fails, report the error.
 
-```text
-Round 1:
-  query_database(...)
+## Persistence model
 
-Wait for the completed result and copy its exact call ID.
+Each successful call creates an `iv-visualization-artifact` JSON payload:
 
-Round 2:
-  visualize_tool_result(
-      title="Sales",
-      source_tool_call_id="<exact copied ID>"
-  )
-```
+| Field | Meaning |
+|-------|---------|
+| `schemaVersion` | Saved artifact format, currently 1 |
+| `visualizationId` | UUID generated once for this embed; independent of DOM position |
+| `runtimeVersion` | Runtime build embedded with this artifact |
+| `sourceToolCallId` | Exact original source call ID, for provenance |
+| `title`, `html` | Title and complete model-generated fragment |
+| `data` | Snapshot of the selected textual source result, including valid null |
 
-After the tool succeeds, emit one visualization block:
+The payload is safely JSON-encoded; HTML delimiters and Unicode line separators
+are escaped without changing the underlying fragment or data. The runtime
+configuration stores the same ID and the selected library URLs.
 
-```text
-@@@VIZ-START
-<style>
-  /* styles */
-</style>
+The exact same complete document is returned in `HTMLResponse` and emitted as a
+message-level embed with `replace=False`. This preserves the existing two OWUI
+mount/storage paths. There is **no separate artifact database or browser-side
+chat rewrite** in this stage: durable storage is OWUI's saved embed. Successful
+tool execution confirms packaging/emission, not a database commit or successful
+execution of model JavaScript.
 
-<div id="chart"></div>
+After a page reload, SPA chat remount, or opening a saved chat in a fresh browser,
+the saved embed supplies its HTML and data directly. It does not fetch the
+original producer result, search for markers, or depend on a particular embed
+index. The server must actually retain the complete embed; temporary/deleted
+chats or lost embeds cannot be recovered from nothing.
 
-<script>
-  const data = getToolData();
-  // Render data.
-</script>
-@@@VIZ-END
-```
+Schema, identity, missing data, library and script failures produce a visible
+error with the visualization ID. The saved source is not overwritten with the
+error or with a preview. Format checks do not validate the correctness or safety
+of arbitrary generated JavaScript.
 
-The producer and `visualize_tool_result()` cannot be called in the same parallel batch because the source result is not available until Open WebUI records the completed producer call.
+### Versions and old chats
 
-If a provider nevertheless puts them in one batch, the initial visualizer call returns `retry_required` instead of an error. Retry only `visualize_tool_result()` in the next tool round with the supplied arguments. Reuse the existing producer result; never rerun the producer to recover a visualization. A missing result after that single retry becomes `Tool result not found`, preventing an unbounded loop.
+This is a breaking tool-contract change: `html` is now required. Update the
+tool and skill together and reload OWUI after installing.
 
-## Result resolution
+Existing saved embeds keep their original code and streaming protocol; they are
+**not migrated or repaired automatically**. Legacy rendering helpers remain in
+the source for regression coverage, but new tool calls always use saved artifacts.
+Lifecycle V5 is isolated from older managers; mixed old/new embeds have separate
+manager budgets.
 
-The tool searches for an exact matching call ID in this order:
+The runtime build and asset URLs are recorded, but the files at those URLs are
+not copied into the artifact or content-hash pinned. Keep compatible library
+bundles at those paths. Updating files can still affect old charts. Offline HTML
+exports also require accessible bundles; they are not single-file library archives.
 
-1. the active response stream for the current assistant message;
-2. the saved `message.output` for that message;
-3. completed tool results in the current dialogue supplied through `__messages__`.
+## Source result resolution
 
-If an ID occurs more than once, the newest matching result is selected. Only the selected textual result is injected. Tool arguments, metadata, neighboring results, images, and file attachments are excluded.
+The tool searches for an exact source call ID in this order:
 
-JSON strings are parsed before injection. Ordinary text remains a string and JSON `null` becomes JavaScript `null`.
+1. Active response output for the current assistant message.
+2. Saved `message.output` for that message.
+3. Completed results in the supplied dialogue.
 
-## Browser performance
+Only the selected textual result is included; neighboring results, tool
+arguments, private metadata, images and attachments are excluded. JSON strings
+are normalized to their values; ordinary text remains a string. Later changes to
+the source call do not modify a previously packaged embed.
 
-Each iframe first mounts a lightweight shell. A shared lifecycle manager admits
-heavy runtimes before data parsing, library loading, or chart initialization.
-It coalesces history-mount bursts and prioritizes newer charts and explicit user
-restores. The default budget of two includes loading, live, and suspending
-iframes, including hidden chat routes. Older, never-started charts show a
-**Restore interactivity** placeholder instead of loading libraries just to make
-a preview. Raw visualization source remains hidden in the chat.
+## Runtime and caches
 
-Chart.js and Plotly start loading in parallel as soon as a runtime is admitted,
-without waiting for `@@@VIZ-START`. Do not add imports for either library.
-Imports of the same configured URL are deduplicated. Mark inline consumers with
-`data-iv-libraries="chartjs"`, `"plotly"`, or `"chartjs plotly"`. Each consumer
-waits only for its declared dependencies. For older generated code, direct
-`Chart`/`Plotly` references are detected conservatively; explicit attributes are
-recommended for aliases or dynamic access. `ivRequireLibraries(['plotly'])`
-is also available for asynchronous consumers.
+- Both libraries load in parallel when a runtime is admitted. Consumers await
+  only their declared dependency; an unused missing Plotly does not block Chart.js.
+- Inline scripts run in source order after the fragment is mounted and its
+  container has usable dimensions. Bundle/module loading and initial layout
+  waits have 12-second failure deadlines. Saved mode reports failures rather
+  than silently leaving a spinner; it does not inherit legacy loader retries.
+- The default limit is two resident runtimes, including loading and suspending.
+  Older frames become restorable previews or placeholders. New and explicitly
+  restored graphs retain the existing priority policy; viewport scheduling is
+  not part of this stage.
+- IndexedDB holds temporary original embed documents under page-session keys.
+  An 8 MiB RAM fallback is available if storage is blocked. Cache cleanup on
+  unmount/page exit and 24-hour expiry do not delete OWUI's saved embeds.
+- Previews have an estimated 16 MiB budget. Failure to capture a preview does not
+  remove the saved HTML/data. If neither cache can retain a source, admission
+  pauses rather than discarding it. These are cache budgets, not total RAM limits.
+- `saveState/loadState` use a visualization-ID prefix for new embeds, avoiding
+  collisions between charts in one message. This optional UI state is browser-local
+  and does not follow the saved data to another device.
+- The generated scripts, observers and known chart instances are disposed when
+  the runtime is parked or removed. IndexedDB is a cache, not the backup.
 
-Other referenced libraries are discovered while the visualization block is
-still streaming and execute in source order. Inline visualization
-code remains deferred until `@@@VIZ-END`, then waits for its required libraries,
-any additional imports in source order, and a usable iframe layout.
-The loader and "Visualization ready" notification
-remain active until that script chain has actually completed, so the first
-library load no longer produces a false-ready blank frame.
+Valves: `max_active_visualizations=2` (0 disables the cap; at most two simultaneous
+initializations) and `point_density=1.0` (0 disables the point budget).
 
-External and same-origin library loads are retried twice after a transient
-failure. If all attempts fail, the iframe shows a script-load error instead of
-silently collapsing to an empty rectangle. Under the default `strict` security
-level, chart libraries must be served from the Open WebUI origin (for example,
-under `/static`); public CDN scripts require `security_level="none"`.
-An unavailable Plotly bundle does not delay or block Chart.js-only scripts, and
-library-free scripts do not wait for either bundle. A failed required dependency
-skips its consumer and produces a visible error.
-Updating the tool changes new embeds; existing saved embeds keep their original
-startup code and must be regenerated to use this behavior.
-
-After the script chain completes, the wrapper immediately dispatches a resize
-and calls the public resize hooks exposed by Chart.js, ECharts, and Plotly.
-Canvas-based charts are kept in the loading state until their first painted
-frame (with a two-second safety timeout). This prevents responsive line charts
-from remaining blank until the surrounding assistant response finishes and
-causes Open WebUI to perform another layout pass.
-
-When a saved visualization is mounted inside a hidden SPA chat route, inline
-chart code waits until the iframe has a non-zero layout before executing. The
-parent lifecycle manager also watches iframe width and repeats the public resize
-hooks when a chat becomes visible again.
-
-Before admitting another runtime, the manager parks an older eligible iframe.
-Preview capture has a 1.5-second deadline; a failed snapshot produces a restorable
-placeholder and still releases the runtime. Explicit **Load visualization** or
-**Restore interactivity** requests can pause an initializing iframe to avoid
-waiting forever behind a stalled stream. Automatic admission does not interrupt
-initializing charts. At most two runtimes initialize concurrently even when
-`max_active_visualizations=0` disables the resident-runtime cap.
-
-Preview retention is capped at an estimated 16 MiB (encoded URL plus decoded
-pixels); older images are replaced with restore buttons. Source HTML, including
-the selected dataset, is cached separately in same-origin IndexedDB under a
-page-session key. Sources are deleted when records are removed or the page exits
-(best effort); abandoned entries expire after 24 hours and are swept on the next
-cache open. This cache is local to the browser and contains the same data as the
-embed; it is not encrypted. If IndexedDB is unavailable, a bounded 8 MiB RAM
-fallback is used. If neither store can preserve a source, admission pauses
-instead of discarding data or exceeding the runtime budget. Lightweight shells
-and Open WebUI's own chat state are outside these cache budgets.
-
-Theme observers and cross-document callbacks are disposed before parking and on
-unmount. Detached text nodes are pruned from the shared source-hiding registry.
-Lifecycle version 4 is isolated from older managers; old saved embeds must be
-regenerated, and a full page reload is recommended after upgrading.
-
-### Regression tests
-
-Run `pytest -q inline-visualizer-tool-result/tests`. Node enables executable JS
-tests. With Playwright and Chromium installed, set `IV_BROWSER_TESTS=1` to include
-the 20-iframe browser regression (optionally set `IV_CHROMIUM_PATH`). The browser
-test uses local mocked library responses; it covers admission, missing Plotly,
-IndexedDB restoration, failed preview capture, and SPA unmount cleanup, not live
-Open WebUI integration or real chart-library performance.
-
-Configure this behavior in the Tool valves:
-
-- `max_active_visualizations` defaults to `2` (`0` disables suspension; maximum `10`).
-- `point_density` defaults to `1.0` display point per CSS pixel (`0` disables point budgeting; maximum `4`).
-
-`getToolData()` always returns the complete source result. For dense line and scatter series, reduce only the display array:
-
-```js
-const rows = getToolData();
-const chart = document.getElementById('chart');
-const displayRows = ivDownsample(rows, {
-  container: chart,
-  x: 'date',
-  y: 'value',
-  mode: 'line',
-  seriesCount: 1
-});
-```
-
-`ivPointBudget(container, seriesCount)` returns the per-series budget. `ivDownsample(points, options)` uses LTTB for lines and spatial binning for scatter plots, never mutates the source array, and falls back to endpoint-preserving even sampling when coordinates are invalid. Keep calculations and aggregates on the original `rows` value.
+For dense lines/scatters, use `ivDownsample(points, {container, x, y, mode, seriesCount})`
+on display arrays before plotting. Keep summaries and calculations on the full
+`getToolData()` result. No automatic rewriting of generated chart code is performed.
 
 ## Security
 
-The selected result is serialized into a non-executable `<script type="application/json">` element. HTML delimiters and Unicode line separators are escaped before insertion. A result that cannot be serialized produces a controlled error and no iframe is mounted.
+Saved HTML still contains arbitrary model-generated JavaScript. This change is
+about reliable source restoration, not a new security boundary. Same-origin
+iframes can access the parent page when the OWUI setting allows it. Strict,
+balanced and offline modes restrict script loading to the OWUI origin.
+
+JSON encoding prevents the artifact from breaking out of its inert payload, but
+does not sanitize the HTML when it is deliberately executed. Never treat
+untrusted shared/imported chat HTML as trusted application code.
+
+## Tests
+
+Run `python3 -m pytest -q inline-visualizer-tool-result/tests`.
+Node enables executable JavaScript tests.
+
+With Playwright and Chromium installed, set `IV_BROWSER_TESTS=1`
+(optionally `IV_CHROMIUM_PATH` and `NODE_PATH`). Browser regressions cover:
+
+- Legacy 20-iframe admission, failed previews and unmount cleanup.
+- New embeds returned by the public tool, mounted without chat source or OWUI IDs.
+- Old-chart reactivation, reordered SPA remounts and a full page reload.
+- A clean browser context with IndexedDB blocked, simulating loss of caches.
+- Independent state keys and visible errors for corrupt/unsupported artifacts,
+  missing data, missing bundles and generated-script failures.
+
+Bundles in these tests are local stubs. They verify the browser lifecycle, not
+real Chart.js/Plotly performance or OWUI server persistence. Before deployment,
+verify new charts survive an actual OWUI reload, chat switch and second browser
+session, including multiple visualizations in one assistant message.
 
 ## Errors
 
-- `Invalid source_tool_call_id`: the required ID is empty or invalid.
-- `Invalid retry_attempt`: the retry control is outside its supported `0`/`1` range.
-- `retry_required`: the initial call could not see the source result yet; retry the visualizer once with the supplied arguments.
-- `Tool result not found`: the single visualization retry still could not resolve the exact ID.
-- `Tool result cannot be serialized`: the selected result cannot be safely encoded as JSON.
+- `Invalid source_tool_call_id`: empty/invalid source ID.
+- `Invalid retry_attempt`: outside the supported 0/1 range.
+- `retry_required`: source is not visible yet; retry once with supplied arguments.
+- `Tool result not found`: source is still absent after the retry.
+- `Invalid visualization artifact`: invalid fragment or data that cannot be JSON-encoded.
 
-When the tool returns `retry_required` or an error, do not emit a `@@@VIZ-START` block.
-
-## Standard visualizations
-
-Use the separate `visualize()` tool and its `visualize` skill for diagrams, explainers, widgets, or other visualizations that do not reuse a completed tool result.
+An error emits no new embed. Runtime errors are shown inside the existing embed.
+Use the separate `visualize()` tool for visuals unrelated to completed tool results.

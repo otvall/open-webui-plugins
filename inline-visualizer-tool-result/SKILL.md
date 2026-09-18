@@ -1,6 +1,6 @@
 ---
 name: visualize-tool-result
-description: Render one completed tool call's result as a rich interactive visualization using visualize_tool_result(). Use only when a system or developer instruction explicitly requires a visualization based on another tool's completed result. Use the standard visualize skill for all other visualizations
+description: Render one completed tool call's result as a focused visualization using visualize_tool_result(). Use only when a system or developer instruction explicitly requires a visualization based on another tool's completed result. Use the standard visualize skill for all other visualizations
 ---
 
 # Inline Visualizer — Tool Result
@@ -11,43 +11,26 @@ This handbook explains how to render the result of one completed tool call direc
 
 Use this skill only when a system or developer instruction explicitly tells you to visualize the result of another tool call. Do not choose this workflow on your own. For ordinary diagrams, explainers, widgets, or visuals that do not reuse a completed tool result, use `visualize()` and the standard `visualize` skill instead.
 
-1. Call the data-producing tool.
-2. Wait until that tool call has fully completed.
-3. Identify the completed call containing the required data and read its explicit `tool_call_id` or `call_id` from the structured conversation context.
-4. Copy the complete identifier character-for-character.
-5. In a later sequential tool round, call `visualize_tool_result(title="…", source_tool_call_id="<exact copied ID>")`. Leave `retry_attempt` at its default `0`. YOU MUST CALL THE TOOL, otherwise the visualization will not render.
-6. If the tool returns `status="retry_required"`, call `visualize_tool_result()` exactly once in the next sequential tool round using `retry.arguments` exactly. Reuse the existing source call; never rerun the producer to recover the visualization.
-7. Wait for `visualize_tool_result()` to complete successfully. It mounts an iframe wrapper sandbox in the chat and injects the selected result as `getToolData()`.
-8. Emit `@@@VIZ-START` on its own line.
-9. Emit exactly one HTML/SVG fragment with `<style>` first, visible content next, and `<script>` last. Access the source result with `getToolData()`.
-10. Emit `@@@VIZ-END` on its own line, then continue with any brief explanation for the user.
+1. Call the data-producing tool and wait until it has fully completed.
+2. Read its explicit `tool_call_id` or `call_id` from the structured conversation context and copy it character-for-character.
+3. Prepare the complete HTML/SVG fragment. Access the actual dataset through `getToolData()`; do not copy data into the fragment.
+4. In a later sequential tool round call `visualize_tool_result(source_tool_call_id="<exact ID>", html="<finished fragment>", title="…")`. Leave `retry_attempt=0`. YOU MUST CALL THE TOOL.
+5. If the result is `status="retry_required"`, retry once in the next tool round with `retry.arguments` unchanged, including the same HTML. Never rerun the producer solely for visualization recovery.
+6. After success, briefly explain what the chart shows. Do not output its HTML in the assistant message.
 
-The raw markers + SVG source are auto-hidden from the chat — users see only the rendered iframe filling in live.
+The tool packages the completed fragment and selected data snapshot in a versioned, self-contained embed with a permanent visualization ID. Open WebUI persists this embed with the chat. Rendering and restoration do not read the chat message DOM or depend on browser caches.
 
-**Example response structure:**
+**HTML argument rules:**
 
-"""
-I'll visualize the completed sales result for you.
-
-@@@VIZ-START
-<div id="chart"></div>
-<script>
-  const data = getToolData();
-  // Build the visualization from data.
-</script>
-@@@VIZ-END
-
-The chart shows the main changes in the completed result.
-"""
-
-**Streaming rules:**
-- Use the delimiters EXACTLY @@@VIZ-START and @@@VIZ-END — case-sensitive, on their own lines. Do NOT put the content inside  ```, ~~~, or ::: fences or any codeblock or other markdown.
-- Do NOT wrap in HTML tags like <viz> or <svg data-iv> — only the text markers are detected.
-- Emit **exactly ONE** @@@VIZ-START … @@@VIZ-END pair per tool call. For multiple visualizations, call the tool multiple times.
-- Structure the content as always: <style> first → visible content → <script> last.
-- Do NOT describe the HTML source in prose — users don't see it. Describe what the visualization **shows**.
-- Requires **iframe Sandbox Allow Same Origin** in Open WebUI Settings → Interface. If disabled, the wrapper shows a notice — and the user won't see the visualization itself, just the notice.
-- Inline <script> code runs **once**, **after** the full block has streamed in and its library dependencies are ready. External library downloads can start earlier.
+- Pass a fragment only: styles first, visible content next, scripts last; no document wrapper tags or Markdown fences.
+- Do not use `@@@VIZ-START` / `@@@VIZ-END`. The complete fragment belongs in the `html` argument, not in a later text response.
+- Initialize scripts directly. Do not wait for `window.onload` or `DOMContentLoaded`, which may have already fired when a parked runtime starts.
+- Declare `data-iv-libraries="chartjs"`, `"plotly"`, or `"chartjs plotly"` on scripts using those libraries. They are already preloaded; do not import libraries.
+- Scripts execute once per runtime activation. Restoring a parked graph creates a fresh runtime: avoid network requests, chat submissions, or other side effects during initialization.
+- Use `saveState/loadState` only for necessary local UI settings. They are separate from the saved data snapshot and do not synchronize to other devices.
+- Enable **iframe Sandbox Allow Same Origin** in OWUI for the shared lifecycle manager and optional parent bridges. Without parent access, self-contained rendering can run independently, but cross-iframe admission and state bridges are unavailable; library loading still depends on the host's sandbox/CSP.
+- Browser-render errors appear inside the embed. Tool success means the embed was constructed, not that the model's JavaScript has been verified to render correctly.
+- Old streaming embeds are not migrated by updating the tool or skill. Never claim a missing historical graph has been repaired automatically.
 
 ## What's auto-injected
 
@@ -56,8 +39,7 @@ The chart shows the main changes in the completed result.
 - Chart.js (`window.Chart`) and Plotly (`window.Plotly`), loaded in parallel when the runtime is admitted. Mark consumers with `data-iv-libraries="chartjs"`, `"plotly"`, or `"chartjs plotly"`; they wait only for their dependencies. Do not add imports for these libraries.
 - `ivPointBudget()` and `ivDownsample()` for density-limited line and scatter rendering
 - Automatic suspension of older completed visualizations; static previews can be reactivated by the user
-- Pre-styled bare-tag form elements (see below) — saves tokens on simple forms
-- Consider making diagrams **conversational** with sendPrompt() — see the "sendPrompt bridge" section further below for patterns and examples
+- Theme-aware bare-tag form elements for filters required by the task (see below)
 
 ## Source call ID
 
@@ -128,85 +110,21 @@ const displaySeries = payload.series.map(series => ({
 
 ### Pre-styled form elements
 
-These tags get theme-aware default styling **when emitted without a class or inline style attribute**.
-Other attributes (placeholder, value, id, aria-*, min/max, etc.) are fine — they don't disable the defaults.
-Adding class or style is treated as an opt-out: the default is suppressed and you can style it from scratch.
-Useful for short forms or quick UIs where the design doesn't need to deviate.
+When the task needs a filter, bare `input`, `select`, `button`, and `label` elements receive theme-aware styling. A class or inline style opts out of those defaults; other attributes, including `aria-*`, do not. Label controls and preserve keyboard focus indicators.
 
-Pre-styled elements included in the tool:
-
-- <button> — themed button. Use it for actions.
-- <input type="text|number|email|search|password|tel|url|date|time|datetime-local"> — themed text input. Use it where a user types or picks a value.
-- <input type="range"> — slider. Use it for "from–to" picks, intensity dials, or any continuous value where exact precision doesn't matter.
-- <input type="checkbox">, <input type="radio"> — multi-pick / single-pick. Self-explanatory.
-- <textarea> — multi-line text input.
-- <select> — dropdown. Use it when a list of choices is too long for radios.
-- <label>, <fieldset>, <legend> — form structure. Group related inputs and label them.
-- <kbd> — keyboard-key cap. Use it whenever you mention a shortcut, so the key visually pops as a key.
-  - Mac: <kbd>⌘</kbd><kbd>K</kbd>
-  - Windows / Linux: <kbd>Ctrl</kbd><kbd>K</kbd>
-- <hr> — horizontal divider. Separate sections inside a card or between groups of content.
-- <details> / <summary> — collapsible disclosure. Use it for progressive disclosure: hide secondary detail behind a clickable summary so the surface stays clean.
-- <blockquote> — pull-quote / callout. Use it to set apart a quote, an aside, or a piece of context the reader should pause on.
-- <table> (with <thead> / <tbody> / <th> / <td> / <caption>) — tabular data with multiple columns and rows. Use it when the relationship between rows and columns matters. For numeric columns add align="right" or class="num" to the cells (right-aligns + tabular-nums).
-- <mark> — highlighter. Use it sparingly to draw attention to a key word or number inside a sentence.
-- <dl> / <dt> / <dd> — definition lists. **Far cheaper than tables for label/value layouts**. Three modes:
-  - Bare <dl> → **stacked glossary**. Best when each term needs a sentence or two: definitions, FAQs, term-explained-below.
-  - <dl data-layout="grid"> → **two-column card**. The lightweight alternative to a table when you have key/value pairs and don't need row separators or hover: contact cards, metadata blocks, summary panels, settings rows.
-  - <dl data-layout="inline"> → **pill row** of label: value pairs (wrap each <dt>/<dd> in a <div>). Best for a tight strip of facts at the top of a card or near a chart: small numbers, status flags, tags. Colon separator is added automatically via CSS.
-
-Bonus on bare elements:
-
-- aria-invalid="true" paints a danger-colored border on input/textarea/select
-- :focus-visible keyboard focus draws a clear --accent outline (mouse focus stays subtle)
-
-### Accent color palette
-
-The default accent is **purple**. Switch to one of the other ramps via the data-accent attribute.
-The chosen color drives --accent and --accent-foreground, which in turn power focus rings, checkbox/radio fills, and any var(--accent) reference you write yourself.
-The same nine names match the chart color ramps, so a teal-accented form sits naturally next to a teal-accented chart.
-
-Available values: purple (default), teal, coral, pink, gray, blue, green, amber, red
-
-**To apply an accent color globally to the whole visualization**: wrap the entire content in a single root <div data-accent="…">.
-Every supported element inside inherits the chosen accent.
-
-<div data-accent="teal">
-  <style>/* CSS */</style>
-  …all focus rings, checkboxes, and var(--accent) consumers go teal…
-</div>
-
-**To apply an accent color to a specific section**: set data-accent on any inner container to recolor just its subtree:
-
-<div data-accent="teal">
-  <button>Save</button>            <!-- teal focus ring -->
-  <input type="checkbox" checked>  <!-- teal accent -->
-</div>
-<button>Cancel</button>            <!-- still default purple -->
-
-**To apply an accent color to a single element**: set directly on an element to recolor just it:
-
-<button data-accent="green">Approve</button>
-<button data-accent="red">Reject</button>
-
-Both light and dark themes are handled — accent values track per-theme ramp stops automatically, and foreground text color flips for legibility in dark mode.
-No manual override needed.
-
-Pick an accent that matches the topic: green for finance/positive, red for warnings/critical actions, blue for informational dashboards, amber for attention/caution, etc.
-Default to purple for neutral or multi-purpose visualizations.
+The default accent is purple. The optional `data-accent` attribute on an existing control or container selects purple, teal, coral, pink, gray, blue, green, amber, or red; colors adapt to light/dark mode. Do not add a wrapper just for decoration.
 
 ## Output rules
 
-These rules keep visuals clean, accessible, and consistent with the host UI:
-
-- **Flat design** — no gradients, drop shadows, blur, glow, or noise textures (the host UI is flat; matching it prevents visual jarring)
-- **Prefer no emojis**, instead use CSS shapes or SVG paths for icons (emoji render inconsistently across platforms)
-- **Sentence case** — all labels and headings
-- **Round displayed numbers** — use Math.round, toLocaleString, or Intl.NumberFormat
-- **Min font size 11px** — smaller becomes unreadable on most screens
-- **Text weights** — 400 regular, 500 for emphasis only
-- Keep long-form explanation in the prose response. Use concise labels, captions, legends, helper text, and short annotations inside the visual when they improve comprehension.
-- **Build ambitiously when the topic supports it.** Treat each visualization like a small product surface, not a single static graphic. Combine multiple elements: a chart paired with a metric strip, a diagram with collapsible deep-dives, a comparison card with sliders that let the user explore tradeoffs. Use animation, hover, and click interactions where they help the reader notice or explore something — not for decoration. If the user asked for "a chart" and the topic naturally extends into a small dashboard, build the dashboard. Restraint is for cases where extra structure would distract; default to richness, not minimalism.
+- **Chart first:** a chart request produces the chart, not a mini-dashboard.
+- Keep a concise title, axes, units, legend, tooltips, and filters necessary for the task. Omit elements that do not help read or operate the chart.
+- Put explanations and conclusions in the chat response, outside the visualization.
+- Do not add KPI strips, metric cards, extra mini-charts, decorative icons, badges, conversation buttons, or outer card backgrounds/borders around an ordinary chart. A plain sizing container is still required where the chart library needs it.
+- Add dashboards or supplementary panels only when the user explicitly requests them. Include only elements serving that request.
+- Preserve useful chart interaction, such as tooltips, legend toggles, and necessary filters; do not add animation or controls merely to decorate the output.
+- **Flat design:** no gradients, drop shadows, blur, glow, or noise textures.
+- Use sentence case, readable numbers (`toLocaleString` or `Intl.NumberFormat`), fonts of at least 11px, and weights 400 or 500.
+- Standalone SVG diagrams are valid when they represent the requested information. Do not append them as chart decoration.
 
 ---
 
@@ -263,8 +181,7 @@ For area/line fills, use same color at 20% opacity.
 
 ## SVG setup
 
-If you want to build a beautiful SVG to be rendered inside the chat, follow these rules too:
-Always use this SVG boilerplate:
+For an SVG that directly represents the requested data or relationships, use the setup below. Include arrow definitions only when the diagram has connectors:
 
 <svg width="100%" viewBox="0 0 680 H">
   <defs>
@@ -289,9 +206,9 @@ font-size. They track the theme automatically.
 |-------|------------|-------------|
 | .t | 14px primary-color text | Default for any visible label inside a node, axis tick, or callout. |
 | .ts | 12px secondary-color text | Subtitles, captions, units (e.g. "users", "ms"), supporting text under a .t label. |
-| .th | 14px primary text, 500 weight | Node titles, KPI numbers, anything that needs to read as "the headline" of a small region. |
-| .box | Neutral rect — secondary bg, tertiary border | Default container for a labeled region. Use whenever you need a neutral chip / panel and don't have a semantic color. |
-| .node | Cursor-pointer + hover opacity on a <g> | Mark a <g> as clickable. Pair with onclick="sendPrompt(...)" so a user can drill into the topic. |
+| .th | 14px primary text, 500 weight | Node titles and emphasized data labels. |
+| .box | Neutral rect — secondary bg, tertiary border | A region that encodes grouping or containment in a standalone diagram; not a decorative chart wrapper. |
+| .node | Cursor-pointer + hover opacity on a <g> | Only for a diagram node with an actual task-required interaction. |
 | .arr | 1.5px stroke matching theme borders | Arrow lines and connectors. Combine with marker-end="url(#arrow)". |
 | .leader | 0.5px dashed guide line | Pulling a label to a part of an illustration when the label can't sit on top of it. |
 | .c-{ramp} | Sets fill/stroke + text colors on a whole <g> from one of the 9 color ramps | Color a node by category — apply .c-teal (etc.) to a <g> and every shape and text inside picks up the matching ramp. Un-classed, un-filled <path>/<polygon> children (pie wedges, areas) take the ramp's series color; on a classed or filled mark, fill="currentColor" opts back in. |
@@ -324,6 +241,8 @@ them look ~4 px low instead.
 
 ## Diagram types
 
+Use these patterns for standalone diagrams that answer the task, not as extra elements around a chart.
+
 ### Flowchart — sequential steps, decisions
 
 - Max **4–5 nodes** per diagram — 6+ → decompose into overview + sub-flows
@@ -334,14 +253,14 @@ them look ~4 px low instead.
 
 Single-line node:
 
-<g class="node c-teal" onclick="sendPrompt('Tell me about X')">
+<g class="c-teal">
   <rect x="100" y="20" width="180" height="44" rx="8"/>
   <text class="th" x="190" y="42" text-anchor="middle" dominant-baseline="central">Label</text>
 </g>
 
 Two-line node:
 
-<g class="node c-teal">
+<g class="c-teal">
   <rect x="100" y="20" width="200" height="56" rx="8"/>
   <text class="th" x="200" y="38" text-anchor="middle" dominant-baseline="central">Title</text>
   <text class="ts" x="200" y="56" text-anchor="middle" dominant-baseline="central">Subtitle</text>
@@ -369,7 +288,7 @@ the thing itself**, not a labeled diagram about it.
 - Shapes are freeform — paths, ellipses, polygons, curves — not just rounded rects
 - Color encodes intensity or state, not category: warm ramps for active / hot / energized, cool ramps for calm / cold / passive, gray for neutral / inert
 - Labels live outside the object connected via .leader lines — reserve a ~140px gutter on the side you'll label from
-- Strongly prefer **interactive** illustrative diagrams: if the real system has a knob, a slider, or a phase, expose it. A prism with a draggable angle slider teaches refraction better than five static frames.
+- Add a control only when manipulating that parameter is part of the requested explanation.
 
 ---
 
@@ -378,7 +297,7 @@ the thing itself**, not a labeled diagram about it.
 Chart.js and Plotly are loaded automatically in parallel when the lifecycle
 manager admits the iframe runtime. Use `Chart` or `Plotly` directly; declare
 `data-iv-libraries="chartjs"` or `data-iv-libraries="plotly"` on the consumer
-script (space-separated for both). It runs after the full block arrives and its
+script (space-separated for both). It runs after the saved fragment is mounted and its
 declared dependencies are ready. Do not emit another loader for either library.
 An unused library's failure does not block your script. A required library's
 failure produces an error; the administrator must correct its asset URL.
@@ -429,22 +348,19 @@ new Chart(ctx, {
 | Parts of a whole, ≤5 slices | **Doughnut** | Use cutout: '60%' so the empty middle can hold a total or label. Skip if the segments are very uneven (one slice >70%) — the small slices vanish; show a stacked bar instead. |
 | Two continuous variables, looking for correlation | **Scatter** | Add a trend line if the relationship is the takeaway. For dense clouds, drop point opacity to 0.3–0.5 so density reads. |
 | Stacked / cumulative composition over time | **Stacked bar / stacked area** | Bar when the buckets are discrete (months, segments); area when the underlying signal is continuous. |
-| Single-value vs target / threshold | **Bar with reference line** or KPI card | A whole chart is overkill for one number — consider a metric card with a sparkline instead. |
+| Single-value vs target / threshold | **Bar with reference line** | If a chart adds no useful comparison, explain the number in the chat rather than adding a metric card. |
 | Multi-dimensional comparison (3–6 axes) | **Radar** | Only when the axes are genuinely commensurate — otherwise a small-multiples bar grid is clearer. |
 
 ### Inline SVG charts (no library)
 
-Reach for inline SVG when the data is small, the shape is simple, or
-you want the chart to share design with surrounding diagrams (matching
-corner radii, palette, type). No script, no CDN — just shapes and text.
+Use inline SVG as the chart itself when the data is small and the shape is simple.
+Do not add supplementary SVG graphics around a Chart.js or Plotly chart.
 Reach for Chart.js when you need axes, tooltips, hover, animation, or
 many series.
 
 **Good fits for inline SVG:**
 - **Progress / completion bar** — a value rendered against a fixed track, often paired with a percentage label to its right
 - **Ranking strip** — a small number of horizontal bars stacked vertically, each bar a different category color, sized by value
-- **Sparkline** — a terse trend line with no axes that sits next to a number to give the number context
-- **KPI donut / ring** — a single percentage rendered as a circle arc, with the number in the middle of the ring
 - **Stacked composition row** — one horizontal bar split into colored segments to show parts of a whole, when a doughnut would feel heavy
 - **Custom-shape charts** — anything where the chart shape is part of the metaphor (a thermometer for temperature, a battery for charge, a fuel gauge, a tide-line)
 
@@ -452,10 +368,10 @@ many series.
 - Use the .t / .ts / .th classes on <text> for labels, captions, and headlines.
   They pick up the theme's text colors and typography scale automatically.
   Never set font-size or fill on label text manually unless you need a specific deviation.
-- For neutral backgrounds (track behind a progress bar, empty slot in a ring), use fill="var(--color-bg-secondary)" so it blends into the surrounding card.
+- For neutral backgrounds (track behind a progress bar, empty slot in a ring), use fill="var(--color-bg-secondary)" so it tracks the host theme.
 - For data colors, prefer the chart-dataset 400-stop hexes from the table above — they're calibrated to read on both light and dark backgrounds.
   If you need a *whole group* recolored (rect + label + stroke together), wrap it in a <g class="c-teal"> (or any of the 9 ramp classes) and let the SVG class system handle fill + stroke + text in one shot.
-- Keep stroke-widths to 0.5 px for chrome (axis lines, grid) and 1.5 px for data (lines, sparklines) — matches the 0.5 px borders the rest of the host UI uses, so the chart doesn't feel chunkier than its neighbors.
+- Keep stroke-widths to 0.5 px for chrome (axis lines, grid) and 1.5 px for data lines — matches the 0.5 px borders the rest of the host UI uses, so the chart doesn't feel chunkier than its neighbors.
 - Add opacity="0.85" on data fills — softens the color slightly so it sits comfortably next to text without overwhelming it.
 
 **Math hints for the less obvious shapes:**
@@ -464,281 +380,27 @@ many series.
 
 ---
 
-## Component patterns
+## Hidden-container initialization
 
-### Metric cards — KPI strip
+If an explicitly requested dashboard has tabs or hidden panels, do not initialize a chart in a zero-size container. Initialize it the first time the panel becomes visible, or resize an existing chart after showing it:
 
-<div style="display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px;">
-  <div style="background:var(--color-bg-secondary); border:0.5px solid var(--color-border-tertiary);
-    border-radius:var(--radius-lg); padding:16px;">
-    <div style="font-size:12px; color:var(--color-text-secondary);">Revenue</div>
-    <div style="font-size:28px; font-weight:500; color:var(--color-text-primary); margin-top:4px;">$3,870</div>
-    <div style="font-size:12px; color:var(--color-text-success); margin-top:2px;">▲ 12.4%</div>
-  </div>
-  <!-- repeat for other metrics -->
-</div>
+- Chart.js: `chart.resize()` on the existing instance.
+- Plotly: `Plotly.Plots.resize(containerElement)`.
+- Inline SVG with a fixed viewBox needs no library resize hook. Defer any custom measurement until its container is visible.
 
-Pair with a chart below for a compact dashboard. Add a tiny inline-SVG
-sparkline under each value if the trend matters.
+## Optional helper reference
 
-### Comparison layout — two paths side by side
+These APIs are available when required by the task; their availability is not a reason to add buttons or panels. Use local JavaScript for filtering or changing chart views. Do not duplicate the tool's built-in controls.
 
-<div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
-  <div style="background:var(--color-bg-secondary); border:0.5px solid var(--color-border-tertiary);
-    border-radius:var(--radius-lg); padding:18px;">
-    <div style="font-size:14px; font-weight:500;">Monolith</div>
-    <dl data-layout="grid" style="margin-top:12px;">
-      <dt>Deploy unit</dt><dd>1 service</dd>
-      <dt>Latency</dt><dd>Low (in-process)</dd>
-      <dt>Scaling</dt><dd>Vertical</dd>
-    </dl>
-  </div>
-  <div style="background:var(--color-bg-secondary); border:0.5px solid var(--color-border-tertiary);
-    border-radius:var(--radius-lg); padding:18px;">
-    <div style="font-size:14px; font-weight:500;">Microservices</div>
-    <dl data-layout="grid" style="margin-top:12px;">
-      <dt>Deploy unit</dt><dd>N services</dd>
-      <dt>Latency</dt><dd>Higher (network)</dd>
-      <dt>Scaling</dt><dd>Horizontal per service</dd>
-    </dl>
-  </div>
-</div>
+| API | Behavior |
+|-----|----------|
+| `sendPrompt(text)` | Submits text as a new chat message. Use only from a deliberate user action in an explicitly requested conversational interface; never automatically during rendering. |
+| `openLink(url)` | Opens a URL through the parent window; ordinary iframe links may be affected by sandbox restrictions. |
+| `copyText(text)` | Copies text to the clipboard and shows localized feedback. |
+| `toast(message, kind)` | Shows temporary feedback; kind is `success` (default), `info`, `warn`, or `error`. |
+| `saveState(key, value)` / `loadState(key, fallback)` | Store and retrieve JSON-serializable state through parent localStorage. Use for existing filters or selections, not to justify adding controls. If storage is blocked, saving is a no-op and loading returns the fallback. |
 
-### Interactive explainer — slider drives output
-
-<label style="display:flex; gap:12px; align-items:center;">
-  <span style="min-width:80px;">Interest</span>
-  <input type="range" id="rate" min="0" max="20" step="0.1" value="5" style="flex:1;">
-  <span id="rate-out" style="min-width:48px; font-variant-numeric:tabular-nums;">5.0%</span>
-</label>
-<div id="result" style="margin-top:12px; font-size:24px; font-weight:500;"></div>
-
-<script>
-var rate = document.getElementById('rate');
-var out = document.getElementById('rate-out');
-var result = document.getElementById('result');
-function recalc() {
-  var r = parseFloat(rate.value);
-  out.textContent = r.toFixed(1) + '%';
-  result.textContent = '$' + (10000 * Math.pow(1 + r/100, 10)).toFixed(0);
-}
-rate.addEventListener('input', recalc);
-recalc();
-</script>
-
-The pattern generalises: every interactive element binds an input listener, recomputes a value, and writes it to a result node.
-Pair with an inline SVG that re-draws on every input change for a "live diagram".
-
-### Tabs — a piece of UI users already know
-
-
-<div style="display:flex; gap:4px; border-bottom:0.5px solid var(--color-border-tertiary);">
-  <button class="tab active" onclick="showTab('a', this)">Overview</button>
-  <button class="tab" onclick="showTab('b', this)">Details</button>
-  <button class="tab" onclick="showTab('c', this)">Source</button>
-</div>
-<div id="tab-a" class="tab-panel">…</div>
-<div id="tab-b" class="tab-panel" hidden>…</div>
-<div id="tab-c" class="tab-panel" hidden>…</div>
-
-<style>
-  .tab { background:none; border:none; padding:8px 12px; cursor:pointer;
-         border-bottom:2px solid transparent; }
-  .tab.active { border-bottom-color: var(--accent); color: var(--color-text-primary); }
-  .tab-panel { padding:12px 0; }
-</style>
-
-<script>
-function showTab(id, btn) {
-  document.querySelectorAll('.tab-panel').forEach(p => p.hidden = true);
-  document.getElementById('tab-' + id).hidden = false;
-  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-}
-</script>
-
-Persist the active tab with saveState/loadState so it survives reloads.
-
-**Charts in inactive tabs can render at 0×0.** Chart.js and Plotly measure their container at init time.
-If that container is inside a hidden / display:none panel, they paint into a zero-size canvas and stay blank even after the tab becomes visible.
-Two workarounds, pick one:
-
-1. **Lazy-init**: only call Plotly.newPlot / new Chart the first time its tab is shown (track a tabInit[id] flag in the handler).
-2. **Resize on show**: init everything up front (so data is ready), then in showTab call the right resize hook for whichever lib is in that tab.
-   Note the API differs per library — c.resize() does not work for all of them:
-
-   // Plotly: pass the container element, no .resize() on the chart
-   Plotly.Plots.resize(document.getElementById('plotly-container'));
-   // Chart.js: instance.resize() — but Chart.js auto-resizes on
-   // container size change so usually nothing needed.
-
-   Inline SVG with a fixed viewBox needs no library resize hook. If your own code measures a hidden container, defer that measurement until it is visible.
-
-### Step-through walkthrough — guided narrative
-A "Next ▶" button advances through a sequence of stages, each with its own caption and (optionally) a different highlighted region of the same diagram.
-Useful for explaining algorithms, processes, or any topic where the order matters more than the totals.
-
-
-<div id="stage" style="font-size:14px;">Click Next to begin.</div>
-<button onclick="step()">Next ▶</button>
-
-<script>
-var steps = [
-  'Step 1: request lands at the load balancer',
-  'Step 2: routed to a healthy backend',
-  'Step 3: backend writes to primary DB',
-  'Step 4: replica catches up async',
-];
-var i = 0;
-function step() {
-  document.getElementById('stage').textContent = steps[i % steps.length];
-  i++;
-}
-</script>
-
----
-
-## sendPrompt bridge — conversational diagrams
-
-sendPrompt(text) is the function that makes visualizations conversational. When called, it injects the given text into the chat input field and submits it — exactly as if the user had typed and sent it themselves. The model then receives that message and responds normally, creating a feedback loop between the visual and the conversation.
-
-This is what separates a static diagram from an **exploration interface**. A user sees a system architecture diagram, clicks on the "Load Balancer" node, and the model receives "Tell me more about the load balancer — how does it distribute traffic across the backend services?" as a user message. The model then responds with details, and could even generate a *new* sub-diagram showing the load balancer internals. The user never had to type anything — they just clicked.
-
-### Why this matters
-
-Without sendPrompt, interactive elements inside the iframe are isolated — they can toggle visibility, animate, or filter data, but they can never talk back to the model. The user sees a cool diagram but has to manually type follow-up questions. With sendPrompt, every clickable element becomes a conversation starter. The diagram itself becomes a navigation interface for the topic.
-
-### Writing good sendPrompt text
-
-The text you pass to sendPrompt becomes the user's message to the model. Write it as a natural follow-up question — conversational, specific, and referencing the context of the diagram:
-
-**Good prompt text** (specific, contextual, references the diagram):
-- "Explain the attention mechanism — how does it decide which tokens to focus on?"
-- "Break down the CI/CD pipeline stage. What tools are typically used here?"
-- "Show me a more detailed diagram of the data processing layer"
-- "What happens when the load balancer detects a failed backend node?"
-- "Compare the pros and cons of the monolith vs microservices approach shown here"
-
-### Usage patterns
-
-Simple patterns — single-click sendPrompt on a node or button:
-- **Drill-down**: onclick="sendPrompt('Explain the API gateway — what does it handle?')" on a diagram node
-- **Quiz answer**: onclick="sendPrompt('I chose B: O(n log n). Am I right? Explain why.')" on answer buttons
-- **Guided exploration**: onclick="sendPrompt('Show me a more advanced example with edge cases.')" on a "Go deeper →" button
-- **Comparison**: onclick="sendPrompt('Compare REST vs GraphQL — when should I use each?')" on one of two nodes
-
-**Form / preference collector** — gather multiple user selections, then send them all at once. Use local JS to track choices (button highlights, state object) and a submit button that composes a sendPrompt from the collected answers:
-
-<script>
-var choices = {};
-function pick(category, value, btn) {
-  choices[category] = value;
-  // Highlight selected button, dim siblings
-  btn.parentElement.querySelectorAll('button').forEach(function(b) {
-    b.classList.toggle('active', b === btn);
-  });
-}
-function submitChoices() {
-  var parts = [];
-  for (var k in choices) parts.push(k + ': ' + choices[k]);
-  sendPrompt('Here are my preferences:\n' + parts.join('\n') + '\nGive me a personalized recommendation based on these choices.');
-}
-</script>
-
-<h3>What's your style?</h3>
-<p style="margin:8px 0 4px;">Pace</p>
-<button onclick="pick('pace','relaxed',this)">Relaxed</button>
-<button onclick="pick('pace','moderate',this)">Moderate</button>
-<button onclick="pick('pace','intensive',this)">Intensive</button>
-
-<p style="margin:8px 0 4px;">Focus</p>
-<button onclick="pick('focus','culture',this)">Culture</button>
-<button onclick="pick('focus','nature',this)">Nature</button>
-<button onclick="pick('focus','food',this)">Food</button>
-
-<button onclick="submitChoices()" style="margin-top:12px; font-weight:500;">Get my recommendation →</button>
-
-This pattern is powerful because the model receives a structured summary of all user preferences in one message. Use local JS for the selection UI (instant feedback), then sendPrompt only on final submit.
-
-### When to use sendPrompt vs local JS:
-| User action | Use | Why |
-|------------|-----|-----|
-| Learn more about a component | sendPrompt | Model gives a contextual explanation |
-| Explore a stage / drill down | sendPrompt | Model can generate a sub-diagram |
-| Submit answers or preferences | sendPrompt | Model evaluates or personalizes |
-| Toggle views, adjust sliders | Local JS | Instant feedback, no reasoning needed |
-| Filter/sort data | Local JS | Instant response, no model needed |
-
----
-
-## Interactivity by default
-
-Build dashboards, charts, graphs, interactive functions, animated sections, moving objects, expandable detail sections, cards, copyable text elements and more. If the topic allows and it makes sense for the topic, build complex and visually stunning elements.
-
-Visualizations should feel alive and polished — not static images dumped into chat. Build interfaces that invite interaction:
-
-- **Expandable sections** — use collapsible <details> elements or JS-toggled sections so users can explore at their own pace without overwhelming them upfront
-- **Hover effects** — nodes, buttons, and cards should respond to hover (the .node class adds this for SVG elements; for HTML, use :hover styles)
-- **Smooth transitions** — add transition: all 0.2s ease to interactive elements for a polished feel
-- **Active states** — when a user selects an option or clicks a tab, make the selection visually clear with the .active class or distinct styling
-- **Progressive disclosure** — show a clean overview first, let the user click to reveal detail (tabs, accordions, or sendPrompt for model-powered drill-down)
-
-**The goal is to build something that feels like a real app component embedded in chat with reactivity, sections and extra elements** — not a screenshot. If the visualization has multiple facets, give the user controls to explore them. If it has hierarchical information, let them expand and collapse. If it has data, let them sort or filter.
-
----
-
-## openLink bridge — opening URLs from visualizations
-
-openLink(url) opens a URL in a new browser tab from within the visualization iframe. Normal <a href="..."> links inside an iframe can behave unpredictably (opening inside the iframe, being blocked by sandbox restrictions, etc.). This function handles that by opening the link in the parent window instead.
-
-<button onclick="openLink('https://docs.example.com/api-reference')">
-  Open API docs ↗
-</button>
-
-Or in SVG:
-
-<g class="node c-blue" onclick="openLink('https://github.com/org/repo')">
-  <rect x="100" y="20" width="200" height="44" rx="8"/>
-  <text class="th" x="200" y="42" text-anchor="middle" dominant-baseline="central">View source ↗</text>
-</g>
-
-Use openLink for external references, documentation links, or source code links. Unlike sendPrompt, this navigates away from the chat — use it when the user needs to access an external resource, not when they need the model to explain something.
-
----
-
-## copyText + toast bridges — feedback on user actions
-
-copyText(text) copies text to the system clipboard and automatically shows a localized "Copied" toast in the top-right corner of the iframe. Works from HTTPS and HTTP origins (falls back to execCommand('copy') if the async Clipboard API is blocked). Use this on "Copy" buttons inside interactive visualizations — data tables, code snippets, shareable values.
-
-<button onclick="copyText(JSON.stringify(data, null, 2))">Copy JSON</button>
-
-toast(message, kind) shows a small auto-dismissing banner inside the iframe. kind is optional and controls the text color: 'success' (green, default), 'info' (blue), 'warn' (amber), 'error' (red). Use it for status notifications inside long-running interactive tools — "Calculation done", "Invalid input", etc.
-
-<button onclick="recompute(); toast('Recomputed', 'info')">Recompute</button>
-
-Toasts auto-dismiss after ~2.2 s and stack vertically if fired in quick succession.
-
----
-
-## saveState + loadState bridges — persistent interactive state
-
-saveState(key, value) and loadState(key, fallback) proxy parent.localStorage with a key prefix scoped to **this assistant message**. State survives page reloads and tab switches, but two different chats (or different messages in the same chat) each get their own independent state — no cross-contamination.
-
-<script>
-  // Restore toggle state on load
-  var showRaw = loadState('showRaw', false);
-  document.getElementById('raw-toggle').checked = showRaw;
-  applyView(showRaw);
-
-  function onToggleChange(el) {
-    saveState('showRaw', el.checked);
-    applyView(el.checked);
-  }
-</script>
-
-Use it for: selected tabs, picked chart range, hidden/shown layers, theme overrides, collapsed sections — anything the user would expect to be remembered when they re-open the chat.
-
-Values are JSON-serialized. If localStorage is blocked (private browsing, sandboxed), both functions silently no-op and loadState returns fallback.
+In the saved format, state keys have the permanent visualization ID as a prefix, so charts in the same message do not collide. Restore needed state before drawing and save it when the user changes a control. This browser-local state is not a cross-device backup.
 
 ---
 

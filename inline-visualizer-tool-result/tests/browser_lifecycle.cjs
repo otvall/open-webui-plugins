@@ -68,7 +68,7 @@ const assert = require('node:assert/strict');
     assert.equal(await page.evaluate(() => window.peakHeavy), 2);
     assert.ok(chartLoads <= 2, `only admitted frames load Chart.js, got ${chartLoads}`);
     assert.equal(await page.evaluate(() => window.renderCount), 2);
-    assert.equal(await page.evaluate(() => window.__ivLifecycleV4.stats().sourceBytes), 0, 'parked sources live in IndexedDB, not the RAM fallback');
+    assert.equal(await page.evaluate(() => window.__ivLifecycleV5.stats().sourceBytes), 0, 'parked sources live in IndexedDB, not the RAM fallback');
     assert.equal(await page.evaluate(() => document.body.innerText.includes('@@@VIZ-START')), false, 'paused sources remain hidden');
     assert.equal(await page.locator('iframe').last().contentFrame().locator('#iv-script-load-error').count(), 0);
 
@@ -77,7 +77,7 @@ const assert = require('node:assert/strict');
       document.querySelectorAll('iframe[data-iv-state="live"]').forEach(f => {
         f.contentWindow._ivCreateSnapshot = () => Promise.resolve(null);
       });
-      window.__ivLifecycleV4.activate(document.querySelector('iframe'));
+      window.__ivLifecycleV5.activate(document.querySelector('iframe'));
     });
     await page.waitForFunction(() => document.querySelector('iframe').dataset.ivState === 'live', null, {timeout:15000});
     assert.equal(await page.evaluate(() => window.peakHeavy), 2);
@@ -88,8 +88,8 @@ const assert = require('node:assert/strict');
     await page.evaluate(() => {
       document.querySelectorAll('.chat-assistant').forEach(message=>message.remove());
     });
-    await page.waitForFunction(() => Object.keys(window.__ivLifecycleV4.stats().states).length === 0);
-    assert.equal(await page.evaluate(() => window.__ivLifecycleV4.stats().previewBytes), 0);
+    await page.waitForFunction(() => Object.keys(window.__ivLifecycleV5.stats().states).length === 0);
+    assert.equal(await page.evaluate(() => window.__ivLifecycleV5.stats().previewBytes), 0);
     assert.deepEqual(errors, [], errors.join('\n'));
     console.log(JSON.stringify({chartLoads, plotlyLoads, rendered:await page.evaluate(() => window.renderCount), peakHeavy:2}));
   } finally { await browser.close(); }
