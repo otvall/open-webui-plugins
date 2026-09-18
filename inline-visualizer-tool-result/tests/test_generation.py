@@ -27,6 +27,11 @@ def artifact(document):
     return json.loads(re.search(r'<script id="iv-visualization-artifact" type="application/json">(.*?)</script>', document, re.S)[1])
 
 
+def saved_document(host, result):
+    return next(doc for doc in host.saved["embeds"]
+                if iv._slot_id(doc) == result["visualization_id"])
+
+
 @pytest.fixture
 def host(monkeypatch):
     state = SimpleNamespace(MODELS={"main": {"id": "main"}, "fast": {"id": "fast"}})
@@ -128,8 +133,8 @@ def test_short_public_contract():
 def test_public_tool_repairs_missing_functions_prefix_and_saves_canonical_id(host):
     host.kwargs["source_tool_call_id"] = "get_sales:1"
     host.kwargs["__messages__"][-1]["tool_call_id"] = "functions.get_sales:1"
-    response, _ = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
-    saved = artifact(response.body.decode())
+    response = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    saved = artifact(saved_document(host, response))
     assert saved["sourceToolCallId"] == "functions.get_sales:1"
     assert saved["data"] == {"value": 42}
     assert len(host.calls) == 1
@@ -186,10 +191,11 @@ def test_prefixed_pending_result_is_not_accepted():
 
 
 def test_placeholder_precedes_generation_and_final_is_durable(host):
-    response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    response = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    context = response["message"]
     assert len(host.events) == 2 and len(host.calls) == 1
     pending = host.events[0]["data"]["embeds"][-1]
-    final = response.body.decode()
+    final = saved_document(host, response)
     assert host.saved["embeds"] == ["https://example.org/existing", final]
     assert iv._slot_id(pending) == iv._slot_id(final) == artifact(final)["visualizationId"]
     assert artifact(final)["data"] == {"value": 42}
@@ -197,6 +203,30 @@ def test_placeholder_precedes_generation_and_final_is_durable(host):
     assert "iv-visualization-artifact" not in pending and "/static/" not in pending
     assert "Загрузка" in pending and "self-contained" in context
     assert not host.request.app.state.iv_embed_locks
+
+
+@pytest.mark.parametrize("generation_fails", [False, True])
+def test_only_message_slot_contains_html_on_completion_and_reload(host, generation_fails):
+    if generation_fails:
+        host.model_error = RuntimeError("Pipe failed")
+    result = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    assert isinstance(result, dict)
+    assert set(result) == {"status", "visualization_id", "message", "retryable"}
+    assert result["status"] == ("error" if generation_fails else "success")
+    assert result["retryable"] is False
+    # A structured tool result is text, not an inline HTMLResponse. Native OWUI
+    # output snapshots render their embeds independently of message.embeds.
+    output = {"type": "function_call_output", "call_id": "visualizer",
+              "output": json.dumps(result), "embeds": []}
+    for event in host.events:
+        assert sum(iv._slot_id(doc) == result["visualization_id"]
+                   for doc in event["data"]["embeds"]) == 1
+    message = {**host.saved, "output": [output]}
+    reloaded = json.loads(json.dumps(message))
+    for snapshot in (message, reloaded):
+        visible = snapshot["embeds"] + [doc for item in snapshot["output"] for doc in item["embeds"]]
+        assert sum(iv._slot_id(doc) == result["visualization_id"] for doc in visible) == 1
+        assert saved_document(host, result) in visible
 
 
 def test_request_isolation_context_and_model_override(host):
@@ -230,8 +260,8 @@ def test_workspace_agent_uses_physical_kimi_without_preset_configuration(host, s
     else:
         host.request.app.state.MODELS["main"] = {"id": "main", "preset": True, "info": info}
     original_state = copy.deepcopy(host.request.scope["state"])
-    response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
-    assert artifact(response.body.decode())["data"] == {"value": 42}
+    response = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    assert artifact(saved_document(host, response))["data"] == {"value": 42}
     child, body, options = host.calls[0]
     assert body["model"] == "Kimi_K2.6"
     assert host.model_checks == ["main", "Kimi_K2.6"]
@@ -273,9 +303,9 @@ def test_logging_pipe_is_called_instead_of_bypassed(host, workspace):
         assert not any(key in child.state.metadata for key in ("chat_id", "session_id", "message_id", "tools"))
         return {"choices": [{"finish_reason": "stop", "message": {"content": FRAGMENT}}]}
     host.pipe_handler = logging_pipe
-    response, _ = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    response = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
     assert logged == [pipe_id]
-    assert artifact(response.body.decode())["data"] == {"value": 42}
+    assert artifact(saved_document(host, response))["data"] == {"value": 42}
     assert host.model_checks == (["main", pipe_id] if workspace else [pipe_id])
     assert not iv._IV_GENERATION_ACTIVE.get()
 
@@ -301,11 +331,12 @@ def test_pipe_failure_releases_recursion_guard_for_next_request(host):
         async def broken_pipe(child, body):
             raise RuntimeError("logging adapter unavailable")
         host.pipe_handler = broken_pipe
-        _, context = await iv.Tools().visualize_tool_result(**host.kwargs)
+        response = await iv.Tools().visualize_tool_result(**host.kwargs)
+        context = response["message"]
         assert "failed" in context and not iv._IV_GENERATION_ACTIVE.get()
         host.pipe_handler = None
-        response, _ = await iv.Tools().visualize_tool_result(**host.kwargs)
-        assert artifact(response.body.decode())["data"] == {"value": 42}
+        response = await iv.Tools().visualize_tool_result(**host.kwargs)
+        assert artifact(saved_document(host, response))["data"] == {"value": 42}
         assert not iv._IV_GENERATION_ACTIVE.get()
     asyncio.run(scenario())
 
@@ -321,9 +352,10 @@ def test_missing_base_cache_refreshes_once(host):
 def test_unwrapping_does_not_bypass_preset_or_base_permissions(host, denied):
     host.request.app.state.MODELS["main"] = {"id": "main", "info": {"base_model_id": "fast"}}
     host.denied_models.add(denied)
-    response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    response = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    context = response["message"]
     assert "failed" in context and not host.calls
-    assert 'role="alert"' in response.body.decode()
+    assert 'role="alert"' in saved_document(host, response)
 
 
 @pytest.mark.parametrize("kind, expected", [
@@ -342,8 +374,9 @@ def test_bad_workspace_routes_have_specific_visible_errors(host, kind, expected)
         host.request.app.state.MODELS["fast"]["owned_by"] = "arena"
     else:
         host.request.app.state.MODELS["fast"]["connection_type"] = "direct"
-    response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
-    assert expected in response.body.decode() and expected in context
+    response = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    context = response["message"]
+    assert expected in saved_document(host, response) and expected in context
     assert not host.calls
 
 
@@ -388,9 +421,10 @@ def test_unpersisted_event_does_not_start_paid_request(host):
 ])
 def test_failed_responses_replace_loading_without_retry(host, response):
     host.result = response
-    result, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    result = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    context = result["message"]
     assert len(host.calls) == 1 and len(host.saved["embeds"]) == 2
-    final = result.body.decode()
+    final = saved_document(host, result)
     assert 'role="alert"' in final and "Не удалось" in final
     assert "generation failed" in context
     assert "iv-visualization-artifact" not in final
@@ -401,8 +435,9 @@ def test_timeout_and_cancellation(host):
         host.started, host.release = asyncio.Event(), asyncio.Event()
         tool = iv.Tools()
         tool.valves.generation_timeout_seconds = 0.02
-        response, context = await tool.visualize_tool_result(**host.kwargs)
-        assert 'role="alert"' in response.body.decode() and "failed" in context
+        response = await tool.visualize_tool_result(**host.kwargs)
+        context = response["message"]
+        assert 'role="alert"' in saved_document(host, response) and "failed" in context
         tool.valves.generation_timeout_seconds = 120
         host.started.clear()
         task = asyncio.create_task(tool.visualize_tool_result(**host.kwargs))
@@ -420,7 +455,7 @@ def test_simultaneous_instances_preserve_all_slots(host):
         results = await asyncio.gather(*(iv.Tools().visualize_tool_result(**{**host.kwargs, "title": str(i)}) for i in range(5)))
         assert len(host.saved["embeds"]) == 6
         assert host.saved["embeds"][0] == "https://example.org/existing"
-        ids = {artifact(response.body.decode())["visualizationId"] for response, _ in results}
+        ids = {artifact(saved_document(host, response))["visualizationId"] for response in results}
         assert {iv._slot_id(doc) for doc in host.saved["embeds"][1:]} == ids
         assert all("iv-visualization-artifact" in doc for doc in host.saved["embeds"][1:])
         assert not host.request.app.state.iv_embed_locks
@@ -447,15 +482,17 @@ def test_unsupported_model_fails_visibly_without_provider_call(host, kind):
         host.request.app.state.MODELS.clear()
     else:
         host.request.app.state.MODELS["main"] = {"owned_by": "arena"}
-    response, context = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
-    assert "failed" in context and 'role="alert"' in response.body.decode() and not host.calls
+    response = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    context = response["message"]
+    assert "failed" in context and 'role="alert"' in saved_document(host, response) and not host.calls
 
 
 def test_oversize_context_is_not_silently_truncated(host):
     tool = iv.Tools()
     tool.valves.generation_context_max_chars = 1000
-    response, context = asyncio.run(tool.visualize_tool_result(**host.kwargs))
-    assert "failed" in context and not host.calls and 'role="alert"' in response.body.decode()
+    response = asyncio.run(tool.visualize_tool_result(**host.kwargs))
+    context = response["message"]
+    assert "failed" in context and not host.calls and 'role="alert"' in saved_document(host, response)
 
 
 def test_missing_source_retry_carries_instruction_not_html(host):
@@ -474,8 +511,12 @@ def test_final_save_error_does_not_claim_success_or_regenerate(host):
         if host.events:
             raise RuntimeError("DB unavailable")
         await original(event)
-    response, context = asyncio.run(iv.Tools().visualize_tool_result(**{**host.kwargs, "__event_emitter__": emit}))
-    assert artifact(response.body.decode())["data"] == {"value": 42}
+    response = asyncio.run(iv.Tools().visualize_tool_result(**{**host.kwargs, "__event_emitter__": emit}))
+    context = response["message"]
+    assert response["status"] == "error"
+    assert "Загрузка" in saved_document(host, response)
+    assert "iv-visualization-artifact" not in saved_document(host, response)
+    assert "embeds" not in response and "html" not in response
     assert "save failed" in context and len(host.calls) == 1
 
 
@@ -507,11 +548,12 @@ def test_redis_lock_wraps_read_emit_and_releases(host):
 
 @pytest.mark.skipif(not os.environ.get("IV_BROWSER_TESTS"), reason="Set IV_BROWSER_TESTS=1")
 def test_browser_loading_replace_reload_and_expiry(host):
-    response, _ = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
-    final = response.body.decode()
+    response = asyncio.run(iv.Tools().visualize_tool_result(**host.kwargs))
+    final = saved_document(host, response)
     key = iv._slot_id(final)
     fixtures = {
         "pending": host.events[0]["data"]["embeds"][-1], "final": final,
+        "toolResult": response,
         "expired": iv._build_progress(key, "Value", time.time() - 1),
         "error": iv._build_progress(key, "<img src=x onerror=alert(1)>", 0, "Генерация прервана."),
         "key": key,

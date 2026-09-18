@@ -343,7 +343,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "self-contained embed" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.4.3' in response.body
+    assert b'tool-result-1.4.4' in response.body
     runtime = re.search(
         rb'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
         response.body,
@@ -708,7 +708,7 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.4.3",
+        "build": "tool-result-1.4.4",
         "lifecycleVersion": 5,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,

@@ -3,7 +3,7 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.4.3
+version: 1.4.4
 required_open_webui_version: 0.10.2
 description: Shows a loading embed, generates HTML in a separate model request, then saves a self-contained visualization of one completed tool result. Pass the exact source call ID and a short instruction, not HTML. Requires native tool calling and a saved chat.
 """
@@ -26,7 +26,7 @@ from typing import Any, Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.4.3"
+_IV_BUILD = "tool-result-1.4.4"
 _ARTIFACT_VERSION = 1
 
 _CHARTJS_URL = "/static/chart.umd.min.js"
@@ -6601,6 +6601,7 @@ class Tools:
                 chartjs_url=self.valves.chartjs_url, plotly_url=self.valves.plotly_url,
             ), visualization_id)
 
+        status = "success"
         try:
             document = await asyncio.wait_for(render(), self.valves.generation_timeout_seconds)
         except asyncio.CancelledError:
@@ -6610,6 +6611,7 @@ class Tools:
                 log.warning("Could not persist cancellation for %s", visualization_id)
             raise
         except Exception as exc:
+            status = "error"
             log.exception("Visualization generation failed %s", visualization_id)
             message = str(exc) if isinstance(exc, _GenerationModelError) else (
                 "Не удалось создать визуализацию. Запрос прерван, превышен лимит или модель вернула ошибку.")
@@ -6625,12 +6627,15 @@ class Tools:
         try:
             await publish(document)
         except Exception:
+            status = "error"
             log.exception("Could not persist final visualization %s", visualization_id)
             context = (f"Visualization final message-level save failed (ID: {visualization_id}). "
                        "Do not claim it was saved. Do not regenerate automatically.")
-        # Native output snapshots retain this copy; message-level storage is used
-        # on chat remount. Never return the loading document as a tool result.
-        return HTMLResponse(content=document, headers={"Content-Disposition": "inline"}), context
+        # OWUI renders message.embeds and function_call_output.embeds separately.
+        # Returning HTML here mounts a second iframe, even with the same slot ID.
+        # The persisted message slot is the sole display/restoration channel.
+        return {"status": status, "visualization_id": visualization_id,
+                "message": context, "retryable": False}
 
     async def _render_completed_html(
         self,

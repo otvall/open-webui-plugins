@@ -131,13 +131,18 @@ The payload is safely JSON-encoded; HTML delimiters and Unicode line separators
 are escaped without changing the underlying fragment or data. The runtime
 configuration stores the same ID and the selected library URLs.
 
-The final complete document is returned in `HTMLResponse` and emitted inside a
-message-level snapshot with `replace=True`; the placeholder is not returned as a
-tool result. This preserves the existing two OWUI
-mount/storage paths. There is **no separate artifact database or browser-side
-chat rewrite** in this stage: durable storage is OWUI's saved embed. Successful
-tool execution confirms packaging/emission, not a database commit or successful
-execution of model JavaScript.
+The final complete document replaces the placeholder in a message-level snapshot
+with `replace=True`. This is the only display/restoration channel. The tool returns
+plain structured status, visualization ID and a short message, never an
+`HTMLResponse`: OWUI renders tool-output embeds separately, so returning the same
+HTML would create a duplicate iframe. Generation errors also replace this same slot.
+If final persistence fails, the tool returns an error without a second HTML fallback;
+the saved placeholder expires instead. There is **no separate artifact database or
+browser-side chat rewrite**: durable storage is OWUI's saved embed. Success confirms
+packaging and read-back of the stored slot, not successful execution of model JavaScript.
+
+Version 1.4.4 prevents duplicate panels for new calls. Updating the tool does not
+remove duplicate HTML already saved in older tool outputs.
 
 After a page reload, SPA chat remount, or opening a saved chat in a fresh browser,
 the saved embed supplies its HTML and data directly. It does not fetch the
@@ -262,8 +267,9 @@ session, including multiple visualizations in one assistant message.
 - Generation failure: model error/refusal, incomplete response, invalid fragment,
   context limit or data that cannot be JSON-encoded; replaces loading with an error.
 - Loading save failure: no internal model request starts.
-- Final save failure: the returned tool-output copy still contains the final
-  document, but the response explicitly does not claim durable message-level saving.
+- Final save failure: the tool returns an error and does not claim durable saving.
+  No duplicate tool-output document is created; if the saved slot is still the
+  placeholder, its deadline changes it to a timeout/interruption notice.
 
 Validation failures before loading emit no embed. Once loading was emitted,
 generation errors replace that slot. Runtime errors appear inside the final embed.

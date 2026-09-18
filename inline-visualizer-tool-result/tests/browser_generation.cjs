@@ -32,11 +32,29 @@ const assert = require('node:assert/strict');
       }, document);
     }
     const progress = () => page.locator('#chart').contentFrame().locator('#iv-progress');
+    async function mountToolOutput() {
+      await page.evaluate(result => {
+        const output = document.createElement('div');
+        output.id = 'tool-output';
+        output.textContent = JSON.stringify(result);
+        // A separate surface, as in OWUI: output embeds are not deduplicated
+        // against message embeds by visualization ID.
+        for (const html of result.embeds || []) {
+          const frame = document.createElement('iframe');
+          frame.srcdoc = html;
+          output.appendChild(frame);
+        }
+        document.body.appendChild(output);
+      }, fixtures.toolResult);
+      assert.equal(await page.locator('iframe').count(), 2, 'one chart plus the untouched neighbor');
+      assert.equal(await page.locator('#tool-output iframe').count(), 0, 'tool output must not mount a second chart');
+    }
     await mount(fixtures.pending);
     await progress().waitFor();
     assert.match(await progress().textContent(), /Загрузка/);
     assert.equal(bundles, 0, 'loading must not download chart bundles');
     await mount(fixtures.final);
+    await mountToolOutput();
     await page.waitForFunction(() => chartFrame.contentWindow.__ivRenderStatus === 'ready');
     assert.equal(await page.locator('#chart').contentFrame().locator('#value').textContent(), '42');
     assert.equal(await page.locator('#neighbor').contentFrame().locator('#kept').textContent(), 'Existing chart');
@@ -44,6 +62,7 @@ const assert = require('node:assert/strict');
     // Restore the persisted final document, not an in-memory HTML patch.
     await page.reload();
     await mount(fixtures.final);
+    await mountToolOutput();
     await page.waitForFunction(() => chartFrame.contentWindow.__ivRenderStatus === 'ready');
     assert.equal(await page.locator('#chart').contentFrame().locator('#value').textContent(), '42');
     await mount(fixtures.expired);
