@@ -13,17 +13,21 @@ Use this skill only when a system or developer instruction explicitly tells you 
 
 1. Call the data-producing tool and wait until it has fully completed.
 2. Read its explicit `tool_call_id` or `call_id` from the structured conversation context and copy it character-for-character.
-3. Prepare the complete HTML/SVG fragment. Access the actual dataset through `getToolData()`; do not copy data into the fragment.
-4. In a later sequential tool round call `visualize_tool_result(source_tool_call_id="<exact ID>", html="<finished fragment>", title="…")`. Leave `retry_attempt=0`. YOU MUST CALL THE TOOL.
-5. If the result is `status="retry_required"`, retry once in the next tool round with `retry.arguments` unchanged, including the same HTML. Never rerun the producer solely for visualization recovery.
+3. Describe the visualization briefly: chart type, fields, units, transformations and necessary filters. Do not write HTML or repeat the dataset.
+4. In a later sequential tool round call `visualize_tool_result(source_tool_call_id="<exact ID>", instruction="Plot monthly revenue using month and revenue fields", title="…")`. Leave `retry_attempt=0`. Call visualizations sequentially, not in parallel. YOU MUST CALL THE TOOL.
+5. If the result is `status="retry_required"`, retry once in the next tool round with `retry.arguments` unchanged. Never rerun the producer solely for visualization recovery. Do not automatically retry generation failures: another call incurs another model request.
 6. After success, briefly explain what the chart shows. Do not output its HTML in the assistant message.
 
-The tool packages the completed fragment and selected data snapshot in a versioned, self-contained embed with a permanent visualization ID. Open WebUI persists this embed with the chat. Rendering and restoration do not read the chat message DOM or depend on browser caches.
+The tool first displays “Загрузка визуализации…”, then makes a separate server-side model request using the available conversation context and selected result, without tools. The renderer creates HTML internally. The placeholder is replaced with a versioned, self-contained embed holding HTML, the data snapshot and the same permanent visualization ID. Rendering and restoration do not call a model, read the chat DOM or depend on browser caches. Interrupted placeholders expire visibly; reloading never starts another paid request.
 
-**HTML argument rules:**
+This workflow requires native function calling, a saved chat and a server-connected model. The administrator may set `generation_model_id`; an empty value uses the current model. Pipe, Arena and browser-direct models are not supported for the internal request. Oversized context fails rather than silently dropping history. Tool success does not prove browser rendering succeeded.
+
+The rest of this handbook is **renderer reference**, not a request for the main assistant to generate HTML. Runtime-critical generation rules are also embedded in `tool.py`, because OWUI installs it separately from this skill.
+
+**Internal HTML rules:**
 
 - Pass a fragment only: styles first, visible content next, scripts last; no document wrapper tags or Markdown fences.
-- Do not use `@@@VIZ-START` / `@@@VIZ-END`. The complete fragment belongs in the `html` argument, not in a later text response.
+- Do not use `@@@VIZ-START` / `@@@VIZ-END`. The complete fragment is the internal model's response, not a main-model argument or a later chat response.
 - Initialize scripts directly. Do not wait for `window.onload` or `DOMContentLoaded`, which may have already fired when a parked runtime starts.
 - Declare `data-iv-libraries="chartjs"`, `"plotly"`, or `"chartjs plotly"` on scripts using those libraries. They are already preloaded; do not import libraries.
 - Scripts execute once per runtime activation. Restoring a parked graph creates a fresh runtime: avoid network requests, chat submissions, or other side effects during initialization.

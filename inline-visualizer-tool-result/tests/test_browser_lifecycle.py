@@ -40,7 +40,7 @@ new Chart(document.getElementById('chart'), {type:'bar',data:{labels:['value'],d
 </script>'''
     fixtures = {"valid": [], "ids": []}
     for i in range(4):
-        response, _ = asyncio.run(tool.Tools().visualize_tool_result(
+        response, _ = asyncio.run(tool.Tools()._render_completed_html(
             source_tool_call_id=f"source-{i}", html=fragment,
             __messages__=[{"role":"tool", "tool_call_id":f"source-{i}", "content":{"value":10 * (i + 1)}}],
         ))

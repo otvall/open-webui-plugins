@@ -1,13 +1,18 @@
 # Inline Visualizer — Tool Result
 
-Version 1.3 renders a **completed HTML fragment plus a snapshot of one completed
-tool result**. The returned embed is self-contained: restoration does not need
+Version 1.4 displays a **loading placeholder before a separate model generates HTML**,
+then replaces that slot with completed HTML and a snapshot of one tool result.
+The final embed is self-contained: restoration does not need
 VIZ markers, assistant-message DOM, a new producer call, or an old browser cache.
 
 ## Requirements
 
 - Open WebUI 0.10.2 or newer; validate upgrades against your deployed OWUI version.
 - Install both `tool.py` and the `visualize-tool-result` skill.
+- Use native function calling in a saved chat. The tool requires authenticated
+  user/request context and the server's event emitter; temporary chats are rejected.
+- Internal generation uses `generation_model_id` (empty: current model). Select
+  a server-connected model, not a Pipe, Arena or browser-direct connection.
 - Serve Chart.js at `/static/chart.umd.min.js` and Plotly at
   `/static/plotly.umd.min.js`. These are the only supported libraries.
   The tool does not install them. Override `chartjs_url` / `plotly_url` in
@@ -23,7 +28,7 @@ VIZ markers, assistant-message DOM, a new producer call, or an old browser cache
 ```python
 visualize_tool_result(
     source_tool_call_id: str,
-    html: str,
+    instruction: str,
     title: str = "Tool Result Visualization",
     retry_attempt: Literal[0, 1] = 0,
 )
@@ -31,9 +36,10 @@ visualize_tool_result(
 
 1. Read the skill, call the data-producing tool, and wait for it to finish.
 2. Copy its complete explicit `tool_call_id` / `call_id`, not its tool name.
-3. Generate the finished fragment and pass it in `html` in a later tool round.
-   Access the actual result through `getToolData()`; do not copy the dataset into
-   model-generated arguments or code.
+3. Pass a short `instruction` describing fields, chart type and transformations
+   in a later tool round. Do not generate HTML or copy data into arguments.
+   Run visualizations sequentially. The loading slot is emitted before the
+   internal model request starts; the completed fragment uses `getToolData()`.
 4. After the visualizer returns, explain what the chart shows. **Do not emit
    HTML or `@@@VIZ-START` / `@@@VIZ-END` blocks in the text response.**
 
@@ -49,8 +55,38 @@ the saved data and must not submit prompts, rerun producer calls, or perform oth
 external side effects.
 
 If `status="retry_required"`, call the visualizer once in the next sequential
-round using `retry.arguments` unchanged, including `html`. Do not rerun the
+round using `retry.arguments` unchanged. Do not rerun the
 producer. If the bounded retry fails, report the error.
+
+## Internal request and progress
+
+The child receives available `__messages__` history, supplied retrieved sources,
+the selected dataset and renderer instructions. Historical tool results are plain
+reference messages, not active tool calls. Tool schemas, reasoning fields, private
+request metadata and chat/session event routing are not forwarded. This is not a
+claim to reproduce the provider's exact original prompt or hidden model state.
+Original request state is untouched. Model access checks remain enabled.
+
+Valves: `generation_timeout_seconds=120`, `generation_max_tokens=8000`,
+`generation_context_max_chars=400000`. The context ceiling rejects oversized input
+without silently truncating it. Generation is non-streaming internally; an incomplete
+finish, refusal, tool call or malformed fragment becomes a visible error. There is
+no automatic model retry, and browser rendering is not a server-side validation step.
+
+Placeholders are small independent documents: no chart bundles or saved dataset.
+They have an absolute expiry (generation timeout plus 30 seconds). Cancellation
+tries to persist an error; after process failure, expired placeholders display a
+timeout/interruption message on reload. Reload never starts another request.
+This is not a durable background job: server restart loses pending generation.
+
+Each update reads the saved message's latest embeds, replaces only the matching
+UUID slot and emits the entire preserved array with `replace=True`, then reads
+the message back to check that the slot was stored. Updates from
+this tool share a per-message app lock and, when `app.state.redis` is configured,
+a Redis lease. Read/emit work has a shorter deadline than the lease. Redis errors
+fail closed. Without Redis, protection is single-process only. Unrelated writers
+that do not take this lock can still race: OWUI has no atomic per-embed update API.
+Do not run competing embed-producing tools in the same parallel batch.
 
 ## Persistence model
 
@@ -69,8 +105,9 @@ The payload is safely JSON-encoded; HTML delimiters and Unicode line separators
 are escaped without changing the underlying fragment or data. The runtime
 configuration stores the same ID and the selected library URLs.
 
-The exact same complete document is returned in `HTMLResponse` and emitted as a
-message-level embed with `replace=False`. This preserves the existing two OWUI
+The final complete document is returned in `HTMLResponse` and emitted inside a
+message-level snapshot with `replace=True`; the placeholder is not returned as a
+tool result. This preserves the existing two OWUI
 mount/storage paths. There is **no separate artifact database or browser-side
 chat rewrite** in this stage: durable storage is OWUI's saved embed. Successful
 tool execution confirms packaging/emission, not a database commit or successful
@@ -89,7 +126,7 @@ of arbitrary generated JavaScript.
 
 ### Versions and old chats
 
-This is a breaking tool-contract change: `html` is now required. Update the
+This is a breaking tool-contract change: `instruction` replaces `html`. Update the
 tool and skill together and reload OWUI after installing.
 
 Existing saved embeds keep their original code and streaming protocol; they are
@@ -167,11 +204,16 @@ With Playwright and Chromium installed, set `IV_BROWSER_TESTS=1`
 (optionally `IV_CHROMIUM_PATH` and `NODE_PATH`). Browser regressions cover:
 
 - Legacy 20-iframe admission, failed previews and unmount cleanup.
-- New embeds returned by the public tool, mounted without chat source or OWUI IDs.
+- Public short-call tool: loading before generation, replacement, expiry and reload.
+- Saved renderer embeds mounted without chat source or OWUI IDs.
 - Old-chart reactivation, reordered SPA remounts and a full page reload.
 - A clean browser context with IndexedDB blocked, simulating loss of caches.
 - Independent state keys and visible errors for corrupt/unsupported artifacts,
   missing data, missing bundles and generated-script failures.
+
+Mocked Python integration tests exercise request-state isolation, access-check flags,
+model selection, incomplete responses, cancellation, context limits, save failures,
+multiple tool instances updating one message, and Redis lease use/failure.
 
 Bundles in these tests are local stubs. They verify the browser lifecycle, not
 real Chart.js/Plotly performance or OWUI server persistence. Before deployment,
@@ -181,10 +223,15 @@ session, including multiple visualizations in one assistant message.
 ## Errors
 
 - `Invalid source_tool_call_id`: empty/invalid source ID.
-- `Invalid retry_attempt`: outside the supported 0/1 range.
+- Invalid title/retry: title longer than 300 characters or retry outside 0/1.
 - `retry_required`: source is not visible yet; retry once with supplied arguments.
 - `Tool result not found`: source is still absent after the retry.
-- `Invalid visualization artifact`: invalid fragment or data that cannot be JSON-encoded.
+- Generation failure: model error/refusal, incomplete response, invalid fragment,
+  context limit or data that cannot be JSON-encoded; replaces loading with an error.
+- Loading save failure: no internal model request starts.
+- Final save failure: the returned tool-output copy still contains the final
+  document, but the response explicitly does not claim durable message-level saving.
 
-An error emits no new embed. Runtime errors are shown inside the existing embed.
+Validation failures before loading emit no embed. Once loading was emitted,
+generation errors replace that slot. Runtime errors appear inside the final embed.
 Use the separate `visualize()` tool for visuals unrelated to completed tool results.

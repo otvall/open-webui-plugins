@@ -96,7 +96,7 @@ def capture_visualize(tool, **kwargs):
     async def emitter(event):
         events.append(event)
 
-    returned = run(tool.visualize_tool_result(__event_emitter__=emitter, **kwargs))
+    returned = run(tool._render_completed_html(__event_emitter__=emitter, **kwargs))
     result = returned[1] if isinstance(returned, tuple) else returned
     html = events[0]["data"]["embeds"][0] if events else None
     return result, html, events
@@ -311,7 +311,7 @@ def test_resolve_result_falls_back_to_messages(monkeypatch):
 
 
 def test_source_tool_call_id_is_required_in_public_signature():
-    parameter = inspect.signature(iv.Tools.visualize_tool_result).parameters[
+    parameter = inspect.signature(iv.Tools._render_completed_html).parameters[
         "source_tool_call_id"
     ]
 
@@ -320,7 +320,7 @@ def test_source_tool_call_id_is_required_in_public_signature():
 
 
 def test_retry_attempt_is_bounded_in_public_signature():
-    parameter = inspect.signature(iv.Tools.visualize_tool_result).parameters[
+    parameter = inspect.signature(iv.Tools._render_completed_html).parameters[
         "retry_attempt"
     ]
 
@@ -330,7 +330,7 @@ def test_retry_attempt_is_bounded_in_public_signature():
 
 def test_visualize_without_event_emitter_returns_html_response_tuple():
     response, context = run(
-        iv.Tools().visualize_tool_result(
+        iv.Tools()._render_completed_html(
             source_tool_call_id="call-data",
             html="<div>Saved chart</div>",
             title="Fallback",
@@ -343,7 +343,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "self-contained embed" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.3.0' in response.body
+    assert b'tool-result-1.4.0' in response.body
     runtime = re.search(
         rb'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
         response.body,
@@ -362,7 +362,7 @@ def test_event_emitter_persists_message_embed_and_html_response_is_still_returne
         events.append(event)
 
     response, context = run(
-        iv.Tools().visualize_tool_result(
+        iv.Tools()._render_completed_html(
             source_tool_call_id="call-data",
             html="<div>Saved chart</div>",
             title="Dual path",
@@ -708,7 +708,7 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.3.0",
+        "build": "tool-result-1.4.0",
         "lifecycleVersion": 5,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
@@ -722,7 +722,7 @@ def test_tool_forwards_startup_library_valves_and_instructs_model_not_to_import(
     tool.valves.chartjs_url = "/assets/chart.js"
     tool.valves.plotly_url = "/assets/plotly.js"
     response, context = run(
-        tool.visualize_tool_result(
+        tool._render_completed_html(
             source_tool_call_id="call-data",
             html="<div>Saved chart</div>",
             __messages__=[tool_message("call-data", [{"x": 1}])],

@@ -23,7 +23,7 @@ def artifact_from(html):
 
 
 def render(html=FRAGMENT, data=None, **kwargs):
-    return asyncio.run(iv.Tools().visualize_tool_result(
+    return asyncio.run(iv.Tools()._render_completed_html(
         source_tool_call_id="call:data:123", html=html,
         __messages__=[{"role": "tool", "tool_call_id": "call:data:123", "content": json.dumps(data)}],
         **kwargs,
@@ -31,7 +31,7 @@ def render(html=FRAGMENT, data=None, **kwargs):
 
 
 def test_finished_html_is_a_required_tool_argument():
-    parameter = inspect.signature(iv.Tools.visualize_tool_result).parameters["html"]
+    parameter = inspect.signature(iv.Tools._render_completed_html).parameters["html"]
     assert parameter.default is inspect.Parameter.empty
     assert parameter.annotation is str
 
@@ -83,9 +83,9 @@ def test_invalid_fragment_emits_nothing(html):
 
 def test_retry_preserves_exact_fragment_until_source_is_available():
     tool = iv.Tools()
-    first = asyncio.run(tool.visualize_tool_result(source_tool_call_id="id", html=FRAGMENT))
+    first = asyncio.run(tool._render_completed_html(source_tool_call_id="id", html=FRAGMENT))
     assert first["retry"]["arguments"]["html"] == FRAGMENT
-    response, _ = asyncio.run(tool.visualize_tool_result(
+    response, _ = asyncio.run(tool._render_completed_html(
         **first["retry"]["arguments"],
         __messages__=[{"role": "tool", "tool_call_id": "id", "content": "{\"value\":42}"}],
     ))
