@@ -7,7 +7,7 @@
 - Open WebUI 0.10.2 or newer
 - **Settings → Interface → iframe Sandbox Allow Same Origin** enabled
 - The bundled `visualize-tool-result` skill available through `view_skill`
-- Both browser bundles served by Open WebUI: Chart.js at `/static/iv-libs/chart.umd.min.js` and Plotly at `/static/iv-libs/plotly.min.js` (or configure `chartjs_url` and `plotly_url` in Tool valves). The tool does not install these files on the server.
+- Both browser bundles served by Open WebUI: Chart.js at `/static/chart.umd.min.js` and Plotly at `/static/plotly.umd.min.js` (or configure `chartjs_url` and `plotly_url` in Tool valves). These are the only available libraries; use native SVG/Canvas for other visuals. The tool does not install these files on the server. If Tool valves already contain older URLs, update them explicitly; changing defaults does not override saved settings.
 
 ## Tool signature
 

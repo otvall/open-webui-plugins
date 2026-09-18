@@ -87,7 +87,7 @@ Never call the producer and `visualize_tool_result()` in the same parallel batch
 
 ## Dense line and scatter data
 
-`getToolData()` always returns the full source result. Use the full value for totals, averages, thresholds, annotations, and every other calculation. For each line or scatter series whose length exceeds its display budget, you MUST pass a separate display array through `ivDownsample()` before giving it to Chart.js, Plotly, ECharts, D3, or an SVG path generator.
+`getToolData()` always returns the full source result. Use the full value for totals, averages, thresholds, annotations, and every other calculation. For each line or scatter series whose length exceeds its display budget, you MUST pass a separate display array through `ivDownsample()` before giving it to Chart.js, Plotly, or an SVG path generator.
 
 The default budget is one displayed point per CSS pixel across the chart. Multiple visible series share it. `ivDownsample()` does not mutate its input, uses LTTB for `mode: 'line'`, and uses spatial binning for `mode: 'scatter'`.
 
@@ -559,25 +559,20 @@ function showTab(id, btn) {
 
 Persist the active tab with saveState/loadState so it survives reloads.
 
-**Charts in inactive tabs render at 0×0.** Plotly, ECharts, and vis-network all measure their container at init time.
+**Charts in inactive tabs can render at 0×0.** Chart.js and Plotly measure their container at init time.
 If that container is inside a hidden / display:none panel, they paint into a zero-size canvas and stay blank even after the tab becomes visible.
 Two workarounds, pick one:
 
-1. **Lazy-init**: only call Plotly.newPlot / echarts.init / new vis.Network the first time its tab is shown (track a tabInit[id] flag in the handler).
+1. **Lazy-init**: only call Plotly.newPlot / new Chart the first time its tab is shown (track a tabInit[id] flag in the handler).
 2. **Resize on show**: init everything up front (so data is ready), then in showTab call the right resize hook for whichever lib is in that tab.
    Note the API differs per library — c.resize() does not work for all of them:
 
-   // ECharts: instance.resize()
-   echartsInstance.resize();
    // Plotly: pass the container element, no .resize() on the chart
    Plotly.Plots.resize(document.getElementById('plotly-container'));
-   // vis-network: redraw + fit — the instance has no .resize()
-   networkInstance.redraw();
-   networkInstance.fit();
    // Chart.js: instance.resize() — but Chart.js auto-resizes on
    // container size change so usually nothing needed.
 
-   Skip the resize call for D3 / Vega-Lite / inline SVG — they paint declaratively into the SVG namespace and aren't bothered by hidden parents.
+   Inline SVG with a fixed viewBox needs no library resize hook. If your own code measures a hidden container, defer that measurement until it is visible.
 
 ### Step-through walkthrough — guided narrative
 A "Next ▶" button advances through a sequence of stages, each with its own caption and (optionally) a different highlighted region of the same diagram.
@@ -749,30 +744,17 @@ Values are JSON-serialized. If localStorage is blocked (private browsing, sandbo
 
 ## Chart libraries and security
 
-Strict and balanced modes load scripts only from the Open WebUI origin.
-Use administrator-provided files under `/static/iv-libs/`, or build the chart
-as inline SVG. Public CDN libraries require `security_level="none"` and should
-be used only when that policy has been explicitly configured.
+Only two libraries are installed, both served by the Open WebUI origin:
 
-Common public hosts when unrestricted mode is intentionally enabled:
-- cdnjs.cloudflare.com — widest coverage
-- cdn.jsdelivr.net — npm / GitHub backed, supports minor-version pinning
-- unpkg.com — npm mirror
+| Library | Local bundle | Available global |
+|---------|--------------|------------------|
+| **Chart.js** | `/static/chart.umd.min.js` | `window.Chart` |
+| **Plotly** | `/static/plotly.umd.min.js` | `window.Plotly` |
 
-Common picks:
-
-| Library | Why reach for it | Example loader |
-|---------|------------------|----------------|
-| **Chart.js** | Bar / line / doughnut / scatter with animation out of the box | Automatic: `window.Chart`; no loader needed |
-| **D3.js** | Custom data-driven SVG (force graphs, arcs, maps, non-standard charts) | <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script> |
-| **Vega-Lite** | Declarative grammar of graphics — feed it a JSON spec, it draws the chart | <script src="https://cdn.jsdelivr.net/npm/vega@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script> |
-| **ECharts** | Rich interactive dashboards, advanced chart types | <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js"></script> |
-| **Plotly** | Scientific / 3D plots, statistical charts | Automatic: `window.Plotly`; no loader needed |
-| **vis-network** | Force-directed network / node-link graphs | <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script> (the **standalone** UMD bundle — exposes vis.Network *and* vis.DataSet. The bare vis-network.min.js on cdnjs is the *peer* build and requires vis-data loaded separately, otherwise new vis.DataSet(...) throws vis is not defined.) |
-| **Tone.js / Wavesurfer** | Audio synthesis, waveform visualisation | <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/15.0.4/Tone.js"></script> |
-
-In explicitly configured unrestricted mode, other libraries on those hosts are
-also available. In strict or balanced mode, use only same-origin assets.
+The runtime loads both automatically. Do not add script imports for them,
+request public CDNs, or assume any other libraries or plugins are installed.
+Use Chart.js, Plotly, native SVG/Canvas, and plain JavaScript only.
+Strict and balanced modes allow scripts only from the Open WebUI origin.
 
 ---
 
@@ -796,11 +778,11 @@ If the canvas has no intrinsic height (e.g. inside a flex column without a heigh
   });
 </script>
 
-### 2 · Source order matters
+### 2 · Declare dependencies
 
 Chart.js and Plotly load automatically; declare the used library names in
-`data-iv-libraries` on each inline consumer. For other libraries, put <script src="…"> tags **before** the
-inline <script> that uses them. Additional imports execute in source order.
+`data-iv-libraries` on each inline consumer. A consumer waits only for its
+declared dependencies; a failure in the unused library does not block it.
 
-<script src="/static/iv-libs/d3.min.js"></script>
-<script>/* uses Chart and d3 */</script>
+<script data-iv-libraries="chartjs">/* uses Chart */</script>
+<script data-iv-libraries="plotly">/* uses Plotly */</script>

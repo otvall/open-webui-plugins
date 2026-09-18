@@ -19,8 +19,8 @@ from typing import Any, Literal
 # so stale cached iframes can be spotted immediately.
 _IV_BUILD = "tool-result-1.2.0"
 
-_CHARTJS_URL = "/static/iv-libs/chart.umd.min.js"
-_PLOTLY_URL = "/static/iv-libs/plotly.min.js"
+_CHARTJS_URL = "/static/chart.umd.min.js"
+_PLOTLY_URL = "/static/plotly.umd.min.js"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -4348,8 +4348,8 @@ STREAMING_OBSERVER_SCRIPT = """
   var _ivLibraryLoads = Object.create(null);
   var _ivLibraryUrlLoads = Object.create(null);
   var _ivLibraryUrls = {
-    chartjs: _ivBootstrapConfig.chartjsUrl || '/static/iv-libs/chart.umd.min.js',
-    plotly: _ivBootstrapConfig.plotlyUrl || '/static/iv-libs/plotly.min.js'
+    chartjs: _ivBootstrapConfig.chartjsUrl || '/static/chart.umd.min.js',
+    plotly: _ivBootstrapConfig.plotlyUrl || '/static/plotly.umd.min.js'
   };
   Object.keys(_ivLibraryUrls).forEach(function(name) {
     var src = _ivLibraryUrls[name];
@@ -5673,7 +5673,7 @@ def _build_csp_tag(level: str) -> str:
         # so admins can serve pinned libraries from the instance's own
         # /static directory (srcdoc iframes inherit the parent page's
         # origin and base URL, so 'self' == the Open WebUI host and
-        # paths like /static/iv-libs/chart.umd.min.js resolve locally).
+        # paths like /static/chart.umd.min.js resolve locally).
         return (
             '<meta http-equiv="Content-Security-Policy" content="'
             "default-src 'self'; "

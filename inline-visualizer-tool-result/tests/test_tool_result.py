@@ -685,8 +685,8 @@ def test_runtime_config_and_valve_defaults_are_injected():
     valves = iv.Tools.Valves()
     assert valves.max_active_visualizations == 2
     assert valves.point_density == 1.0
-    assert valves.chartjs_url == "/static/iv-libs/chart.umd.min.js"
-    assert valves.plotly_url == "/static/iv-libs/plotly.min.js"
+    assert valves.chartjs_url == "/static/chart.umd.min.js"
+    assert valves.plotly_url == "/static/plotly.umd.min.js"
 
     html = iv._build_html(
         max_active_visualizations=4,
@@ -1232,8 +1232,8 @@ def test_startup_loads_both_libraries_immediately_and_waits_without_duplicates(
         if custom_urls else {}
     )
     urls = [
-        config.get("chartjsUrl", "/static/iv-libs/chart.umd.min.js"),
-        config.get("plotlyUrl", "/static/iv-libs/plotly.min.js"),
+        config.get("chartjsUrl", "/static/chart.umd.min.js"),
+        config.get("plotlyUrl", "/static/plotly.umd.min.js"),
     ]
     _run_startup_loader_js(
         "const urls = " + json.dumps(urls) + ";\n"

@@ -17,7 +17,7 @@ const assert = require('node:assert/strict');
     let chartLoads = 0, plotlyLoads = 0;
     await page.route('http://iv.test/**', async route => {
       const path = new URL(route.request().url()).pathname;
-      if (path.endsWith('chart.umd.min.js')) {
+      if (path === '/static/chart.umd.min.js') {
         chartLoads++;
         await route.fulfill({contentType:'application/javascript', body:`
           window.Chart = function(el) {
@@ -27,7 +27,7 @@ const assert = require('node:assert/strict');
           };
           Chart.instances = {}; Chart.defaults = {plugins:{legend:{labels:{}}}};
         `});
-      } else if (path.endsWith('plotly.min.js')) {
+      } else if (path === '/static/plotly.umd.min.js') {
         plotlyLoads++;
         // Chart-only consumers must render despite an unavailable Plotly bundle.
         await route.fulfill({status:404, body:'not installed'});
