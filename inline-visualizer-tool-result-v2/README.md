@@ -1,539 +1,84 @@
-# 🎨 Inline Visualizer — Tool Result Edition
+# Inline Visualizer — Tool Result Edition
 
-<img width="6400" height="1600" alt="banner-inline-visualizer-v2" src="https://github.com/user-attachments/assets/a96bc28d-ee9c-403a-a5a4-0429b6c154ce" />
+Turn a JSON result from a Native tool call into an interactive chart or HTML/SVG view in Open WebUI. The tool generates the visual in a separate, nonstreaming model call. The chat shows a loading placeholder, then a completed visualization or an error. The assistant never prints the visual's source in its answer.
 
-**Turn a JSON tool result into a live chart or interactive HTML view.** The model chooses the visual and writes its HTML/SVG, while the iframe loads the original tool result by call ID. This avoids generating thousands of SQL rows a second time.
+## How it works
 
-This variant requires a JSON-producing Native tool call for every visualization. The model passes its exact `tool_call_id` to `visualize(source_tool_call_id=…, title=…)`, writes arbitrary HTML/SVG, and calls `getToolData()` inside the fragment. The iframe loads and parses the original result from the saved chat. Thousands of SQL rows therefore do not have to be generated again in the assistant's HTML. They still enter the model's input context and Open WebUI's chat history.
+1. A JSON-producing tool finishes. The assistant reads `view_skill("visualize")` and calls `visualize(source_tool_call_id="<exact call ID>", title="…")`.
+2. `visualize` checks the call ID and result before spending tokens on HTML generation. It publishes a loading embed in the current message.
+3. The tool sends the available conversation and selected result to the chat model, or to the model configured in `generation_model_id`. It requests one complete HTML/SVG fragment with `stream=False`.
+4. The tool replaces the loading embed with a complete iframe. The iframe loads the original JSON through `getToolData()` and displays the chart after its initial scripts and data have loaded. An error replaces the loader if generation or browser rendering fails.
+5. The assistant briefly describes the finished chart in ordinary text. It does not emit HTML or visualization markers.
 
-Interactive. Stateful. Themed. Localized into 48 languages. Renders as the stream arrives — no waiting, no static pop-in.
+The result is selected by exact tool call ID. The model sees the selected JSON while designing the chart, but the data is not copied into generated HTML. The iframe reads it from the saved chat when it mounts.
 
-> [!TIP]
-> **🚀 [Jump to Setup](#setup)** — up and running in about a minute.
+### Example request
 
-<video src="https://github.com/user-attachments/assets/8bb8bd13-7b23-43c5-9dd4-e2b1b2cb304a"></video>
+> Run the SQL query for daily revenue and plot its result as a line chart.
 
----
-
-## ⚡ v2 vs v1 — what's new
-
-This variant builds on the streaming inline visualizer. Its tool call now requires `source_tool_call_id`; the rest of the rendering pipeline remains the same.
-
-Legend: 🚫 feature not in that version · ⚡ present, v2 expands it · ✅ present and working
-
-| | **v1 — classic** | **v2 — streaming** |
-|---|---|---|
-| **Rendering timing** | ✅ Static. Model finishes writing → tool assembles a complete HTML payload → `HTMLResponse` comes back → iframe mounts fully formed. User waits for the whole response before seeing anything. | ✅ **Live.** Tool returns an empty wrapper; the model streams the HTML/SVG inline between markers. Iframe paints token-by-token as the model types — first elements appear within ~50 ms of the opening marker arriving. |
-| **Protocol** | ✅ Model calls `render_visualization(title=…, html_code=…)` with the full HTML as a tool argument. Tool returns `HTMLResponse`, Open WebUI mounts it as an iframe via `message.embeds[]`. One-shot, server-side. | ✅ Model calls `visualize(source_tool_call_id=…, title=…)`, then emits HTML/SVG between `@@@VIZ-START … @@@VIZ-END`. The iframe reads the chat's Native tool output by call ID; `getToolData()` returns parsed JSON to the generated script. |
-| **Refresh / reload behavior** | ✅ Saved HTML lives in `message.embeds[]`; reopens render instantly. | ✅ Markers live in the saved message body; observer reconstructs iframe state and fires `finalize()` immediately on mount. No re-streaming needed. |
-| **Bridges** | ⚡ `sendPrompt`, `openLink` | ✅ `sendPrompt`, `openLink`, **`copyText`** (auto-toast), **`toast(msg, kind)`** (success/info/warn/error, auto-dismiss), **`saveState(k,v)`** / **`loadState(k,fallback)`** (per-message `localStorage` scope, survives reloads) |
-| **Pre-styled bare HTML** | 🚫 N/A — model styles every primitive from scratch. | ✅ Drop a vanilla `<button>`, `<input>` (every common type), `<textarea>`, `<select>`, `<label>`, `<fieldset>`, `<table>`, `<details>` / `<summary>`, `<blockquote>`, `<kbd>`, `<hr>`, `<mark>`, `<dl>` (in `data-layout="grid"` and `inline` modes too) and they come out theme-matched. Adding `class` or `style` opts out — model can still go fully custom. **Smaller payloads, faster generation, consistent look across visualizations.** |
-| **Accent palette** | 🚫 N/A | ✅ `data-accent="teal"` (or `coral`, `pink`, `gray`, `blue`, `green`, `amber`, `red`) on any element recolors focus rings, checkboxes, radios, and `var(--accent)` consumers. 9 named values matching the chart ramps. Light/dark handled per-theme. |
-| **Accessibility defaults** | 🚫 N/A | ✅ `aria-invalid="true"` paints a red border on inputs/textareas/selects; `:focus-visible` draws a clear accent outline on keyboard focus only (mouse focus stays subtle). |
-| **CDN library catalog in skill** | ⚡ Chart.js, D3.js examples | ✅ Chart.js, D3.js, Vega-Lite, **ECharts**, **Plotly**, **vis-network** (standalone bundle), **Tone.js / Wavesurfer** — each with a vetted CDN URL and "when to reach for it" guidance. Allowlisted in strict CSP out of the box. |
-| **Chart-type coverage in skill** | ⚡ Bar / line / doughnut / scatter | ✅ Adds stacked bars/areas, radar, KPI cards with sparklines, progress bars, ranking strips, KPI donuts, custom-shape charts (thermometers, batteries, fuel gauges), plus comparison cards, slider-driven explainers, tabs (with hidden-panel init guidance), step-through walkthroughs. |
-| **Stream-completion feedback** | 🚫 N/A — no stream. | ✅ Localized "Visualization ready" toast in the top-right + an optional soft chime. Fires only when a real stream was seen — reopening a finished chat stays quiet. The chime is off-switchable via the `chime` valve (off → chime code isn't shipped at all). |
-| **i18n surface** | ⚡ 1 string × 47 languages = 47 translations (download tooltip) | ✅ 8 strings × 48 languages = **384 translations** — download tooltip, loader label, "unavailable" notice (title + body), "Copied" toast, "Visualization ready" toast, "Export failed" toast, "Visualization script error" toast. Auto-detected from `<html data-iv-lang>`, `localStorage.locale`, and `navigator.language`. |
-| **Mid-stream reconciler** | 🚫 N/A — the iframe is built once from a complete payload. | ✅ Custom safe-cut HTML parser flushes the longest valid prefix on each chunk. Incremental DOM reconciler only appends new nodes and **leaves script-populated containers alone** so `d3.select(...).append('svg')`, `new vis.Network(...)`, ECharts canvases, etc. survive the final paint pass. **Existing nodes never re-mount, animations never re-trigger, zero flicker.** |
-| **Per-tick efficiency** | 🚫 N/A | ✅ `msg.textContent` cached between ticks; unchanged → full pipeline (regex extract, DOM walk, reconciler) short-circuits to a string compare. Only one tick per real DOM mutation does real work. |
-| **Dynamic script injection** | 🚫 N/A — scripts come baked into the static srcdoc and are parsed by the browser normally. | ✅ External `<script src>` + inline scripts injected at finalize() are **serialized via a Promise chain**. Each link wrapped + `.catch`'d so a single bad script can't stall the rest. `Chart`, `d3`, `vega-embed` etc. are guaranteed defined before consumer code runs. |
-| **Script-boundary safety** | 🚫 N/A — the browser parses the srcdoc once, no re-injection. | ✅ Safe-cut parser tracks the tokenizer state across HTML's script-data-escape and double-escape transitions. **Module-load guard** refuses to start the plugin if any embedded script body contains a literal `<!--`, `<script>`, etc. that would silently break the IIFE. |
-| **Tool-result-example bleed** | 🚫 N/A — observer doesn't scan chat DOM. | ✅ TreeWalker excludes `<details type="tool_calls" \| reasoning \| code_execution \| code_interpreter>` when scanning, with a lax fallback that recovers responses from providers that wrap the visible answer inside a reasoning block (Bedrock-hosted Haiku 4.5). |
-| **Bootstrap resilience** | 🚫 N/A | ✅ Initial tick, inner observer, parent observer, and poll timer each independently guarded — any one failure can't leave the iframe silently dormant. Height reporter collapses `100vh` / `100vw` descendants during measurement to break the feedback loop. |
-| **Standalone HTML export** | ⚡ Save HTML → opens fine. | ✅ Imported library scripts are relocated to the end of `<body>` before serialization so charts paint correctly when the file is opened directly (head-loaded scripts otherwise run before their target divs exist). |
-| **Plugin footprint** | ✅ `tool.py` + `SKILL.md` | ✅ Same two files, same install flow — **no Open WebUI core patches**. |
-
-### The one-line summary
-
-> **v1 builds the visualization and shows you the finished poster. v2 hands the model a brush and a canvas and lets you watch it paint.**
-
----
-
-## ✨ Features
-
-### 🎬 Streaming render
-The tool returns an empty wrapper. The model then emits HTML/SVG between `@@@VIZ-START` / `@@@VIZ-END` text markers in its response. An observer tails the parent chat's live DOM, extracts the growing block, and reconciles new nodes into the iframe in real time. You see cards, SVGs, and charts appear as the model writes them — not all at once when the message completes.
-
-### 🌍 Built-in localization
-Auto-detects the user's language from `<html data-iv-lang>` (injected server-side), then from parent `localStorage.locale`, then `navigator.language`. 48 languages for:
-- Download button tooltip
-- "Rendering visualization…" loader label
-- "Streaming visualization unavailable" notice (title and body, shown if `allow-same-origin` is off)
-- "Copied" confirmation toast
-- "Visualization ready" done toast
-- "Export failed" toast
-- "Visualization script error" toast
-
-### 🎨 Design system
-- **9 color ramps** — purple, teal, coral, pink, gray, blue, green, amber, red — each with fill / stroke / text variants that auto-swap for light/dark mode
-- **SVG utility classes** — `.t` `.ts` `.th` text, `.box` `.node` `.arr` `.leader` shapes, `.c-{ramp}` color application
-- **Theme CSS variables** — dozens of aliases (`--bg`, `--fg`, `--surface`, `--border`, …) so the model can hardcode without breaking light/dark parity
-- **`data-accent` palette** — set `data-accent="teal"` on any element (root, container, or single tag) to recolor focus rings, checkboxes, radios, and `var(--accent)` consumers. 9 named values matching the chart ramps. Light/dark handled per-theme.
-- **Pre-styled bare HTML** — drop a vanilla `<button>`, `<input>` (every common type — `text`, `email`, `number`, `range`, `date`, `checkbox`, `radio`, …), `<textarea>`, `<select>`, `<label>`, `<fieldset>`, `<legend>`, `<table>`, `<details>` / `<summary>`, `<blockquote>`, `<kbd>`, `<hr>`, `<mark>`, `<dl>` (in `data-layout="grid"` and `data-layout="inline"` modes too) and they come out themed. Add `class` or `style` to opt out. Saves tokens on simple UIs without locking the design space.
-- **Accessibility defaults** — `aria-invalid="true"` paints a red border on inputs/textareas/selects; `:focus-visible` draws a clear accent outline on keyboard focus only.
-
-### 🌉 Bridges — visualizations that talk back
-
-| Bridge | What it does |
-|---|---|
-| `sendPrompt(text)` | Submits `text` as a user message in the chat. Makes any node a drill-down trigger. |
-| `openLink(url)` | Opens `url` in a new tab (bypasses iframe sandbox weirdness on anchor clicks). |
-| `copyText(text)` | Copies to clipboard (async API + legacy fallback) and fires a localized "Copied" toast. |
-| `toast(msg, kind)` | Top-right auto-dismissing banner. `kind`: `success` / `info` / `warn` / `error`. |
-| `saveState(key, value)` | Persists to `parent.localStorage` keyed by the assistant message id. |
-| `loadState(key, fallback)` | Reads what `saveState` wrote. Survives reloads, scoped per-message. |
-
-### 🔒 Configurable CSP
-
-| Level | Outbound fetch | External images | Script CDNs | Use case |
-|---|:-:|:-:|:-:|---|
-| **Offline** | ❌ | ❌ | ❌ self-hosted only | Air-gapped / zero external connections. [Self-hosting tutorial ↓](#-offline-mode--self-hosting-the-cdn-libraries) |
-| **Strict** (default) | ❌ | ❌ | ✅ 3 allowlisted | Maximum sandboxing, CDN charts still work. |
-| **Balanced** | ❌ | ✅ | ✅ 3 allowlisted | Flags, logos, external image references. |
-| **None** | ✅ | ✅ | ✅ any | Live API data pulls from inside the iframe. |
-
-### 🎉 Done toast + chime
-When a live stream finalizes, a localized "Visualization ready" toast slides in top-right and a soft three-note C-major arpeggio plays on Web Audio sine oscillators. Refreshes of completed messages are silent — the observer only celebrates when it actually witnessed the stream. Mute via `saveState('iv-sound', false)` per viz, or `localStorage['iv-sound-off']='1'` globally.
-
-### 🧼 Efficient tick loop
-- `msg.textContent` cached between ticks; unchanged → full pipeline short-circuits to a string compare
-- DOM hide walker skips text nodes inside `<details type="tool_calls">` so the skill's own example markers never hijack detection
-- Dynamic `<script>` insertion serialized through a promise chain — external `<script src>` tags are awaited via `onload` before any subsequent inline `<script>` executes, so `Chart` / `d3` / `vega-embed` / etc. are always defined by the time your consumer code runs
-- `navigator.vibrate` is silently stubbed inside the iframe — models sometimes reach for haptic feedback on click, and Chrome logs an `[Intervention]` line every time without a user gesture; the stub keeps the console clean
-- Safe-cut HTML parser lets the reconciler flush partial markup (`<svg><rect/><g>` renders during stream) without breaking on unclosed tags
-
----
-
-## 📦 Components
-
-Two parts. Same as v1. Install both.
-
-| File | Type | Install location |
-|------|------|-----------------|
-| `tool.py` | Tool | Workspace → Tools |
-| `SKILL.md` | Skill | Workspace → Knowledge → Create Skill (name it **`visualize`**) |
-
-The **tool** mounts the iframe wrapper, injects the design-system CSS/JS, and tails the chat for markers. The **skill** teaches the model the protocol (markers, color ramps, SVG patterns, when to use `sendPrompt` vs local JS, CDN libraries, common failures).
-
----
+The assistant calls the SQL tool, then `visualize(source_tool_call_id="<SQL call ID>", title="Daily revenue")`. The tool handles generation and display. For another chart, call `visualize` again with the relevant result ID. Calls should be sequential so each loader and final embed has its own place in the message.
 
 ## Setup
 
-> [!NOTE]
-> **Prerequisite.** Open WebUI 0.11.1, a saved chat, Native function calling, and a JSON-producing tool. The GLM-5.3-Flash → SGLang → LiteLLM deployment still needs an end-to-end check with its actual tool-call IDs and PostgreSQL MCP response.
+Requirements: Open WebUI 0.11.1, a saved chat, Native function calling, a JSON-producing tool, a server-side model available to the user, and **Allow iframe same origin** enabled. The current `getToolData()` reads the saved chat from the iframe, so the same-origin setting remains required even though HTML generation is no longer streamed.
 
-### 1. Install the tool
+1. Copy [tool.py](tool.py) into **Workspace → Tools → Create New**, then save it.
+2. Import [SKILL.md](SKILL.md) as a skill named `visualize` in **Workspace → Knowledge / Skills**.
+3. Attach the tool and skill to the model under **Admin Panel → Settings → Models**. Set **Function Calling** to **Native**.
+4. In **User Settings → Interface**, enable **Allow iframe same origin**.
 
-1. Copy the contents of `tool.py`
-2. In Open WebUI: **Workspace → Tools → + Create New**
-3. Paste. **Save**.
+The tool call needs the exact ID of a completed JSON result. It checks current conversation messages, the active response stream, and saved message output before it starts the internal model call. If the ID is absent or the result is not a JSON object or array, it returns an error without generating HTML.
 
-### 2. Install the skill
+## Tool settings
 
-1. Copy the contents of `SKILL.md`
-2. In Open WebUI: **Workspace → Knowledge → Create Skill**
-3. Name it **`Visualize`** (the tool calls `view_skill("visualize")` by this name)
-4. Paste. **Save**.
+| Valve | Default | Purpose |
+| --- | --- | --- |
+| `security_level` | `strict` | Iframe CSP: `strict`, `balanced`, `offline`, or `none`. |
+| `chime` | `true` | Soft sound when a live loading embed becomes ready. Reopened charts stay silent. |
+| `generation_model_id` | empty | Override the chat model for the internal HTML generation call. Use a server-side model or Pipe. |
+| `generation_max_tokens` | `12000` | Output token limit for the complete HTML fragment. |
+| `generation_timeout_seconds` | `180` | Limit for the internal model call. |
+| `generation_context_max_chars` | `1000000` | Reject larger serialized context instead of silently truncating it. |
 
-> [!TIP]
-> Or drag `SKILL.md` straight into the import field on **Workspace → Skills** — Open WebUI reads the YAML frontmatter (`name: visualize`, `description: …`) and pre-fills the create form for you. Just click **Save**.
+The internal call consumes additional model tokens and may add latency. It receives the full context available to the tool, including the selected result. If the selected model cannot handle that context, generation fails visibly; the tool does not silently remove earlier messages or retry.
 
-### 3. Attach to your model
+### Security levels
 
-1. **Admin Panel → Settings → Models** → edit the model you want
-2. Under **Tools**, enable **Visualizer**
-3. Under **Skills**, attach **Visualizer**
-4. Set **Function Calling** to **Native** (Advanced Params).
-5. Save.
+| Level | Runtime data fetch | External images | Script libraries |
+| --- | --- | --- | --- |
+| `strict` | Blocked | Blocked | Three allowlisted CDNs |
+| `balanced` | Blocked | Allowed | Three allowlisted CDNs |
+| `offline` | Blocked | Blocked | Same-origin self-hosted files |
+| `none` | Allowed | Allowed | Unrestricted by this CSP |
 
-### 4. Enable same-origin access — **required**
+The iframe calls `parent.fetch` to read the chat's JSON result; the iframe's `connect-src` policy does not govern that parent request. With **Allow iframe same origin**, generated JavaScript can also reach the parent Open WebUI page. This is a platform permission, and the tool cannot narrow it through CSP. Use a trusted model and review this setting for your deployment.
 
-> [!IMPORTANT]
-> Streaming mode **does not work without this setting.** The observer's entire job is reading the parent chat's DOM to find markers as they stream in — that requires cross-frame access, which the browser blocks unless the iframe is allowed same-origin. With the setting off, every visualization renders a localized "Streaming visualization unavailable" notice instead of content.
+In `offline` mode, inline SVG/HTML works without library files. To use Chart.js, D3, or another library, host its script under your Open WebUI `/static/` path and reference that path in the skill instructions. No external CDN is allowed in that mode.
 
-Steps:
+## What the iframe provides
 
-1. **User Settings → Interface**
-2. Scroll down
-3. Enable **Allow iframe same origin**
+- Theme-aware CSS, nine color ramps, SVG classes, and default styles for plain HTML controls.
+- `getToolData()` — Promise of a fresh parsed copy of the selected JSON result.
+- `sendPrompt(text)`, `openLink(url)`, `copyText(text)`, and `toast(message, kind)` bridges.
+- `saveState(key, value)` and `loadState(key, fallback)` for per-message interactive state.
+- HTML, SVG, and PNG download controls; 48-language labels and ready feedback in the completed iframe.
+- Resize reporting, a localized loader while browser data loads, and an error message if data or chart code fails.
 
-> [!NOTE]
-> Enabling same-origin means JavaScript inside a visualization can reach the parent Open WebUI page. That is a platform-level permission the tool cannot narrow — it's the cost of this streaming architecture. If your threat model can't accept that, use the original v1 inline-visualizer instead (static mode doesn't need same-origin).
+The completed iframe stores its HTML in the chat embed. Old saved chats with the previous marker protocol retain their embedded runtime and should continue to reopen. New calls use the one-shot protocol.
 
----
+### Download limitation
 
-## 🎯 Usage
+A downloaded HTML file includes the current DOM, but a data-driven script that calls `getToolData()` cannot reload JSON outside its saved Open WebUI chat. Use PNG or SVG for a portable snapshot. Making HTML exports fully standalone would require embedding the source data in the artifact, which this version does not do.
 
-In a saved chat with Native function calling, first run a JSON-producing tool such as the PostgreSQL MCP tool. The model calls `view_skill("visualize")`, then `visualize(source_tool_call_id="<exact SQL call ID>", title="…")`, and streams HTML/SVG between `@@@VIZ-START` / `@@@VIZ-END`. The fragment's script awaits `getToolData()` and builds the chart from the returned JSON. Open WebUI 0.11.1 and **Allow iframe same origin** are required.
+## Troubleshooting
 
-### Example prompts
+- **No placeholder appears:** save the chat, enable Native function calling, and check that the selected result is a completed JSON tool output with the exact call ID.
+- **The loader turns into an error:** the internal model may have timed out, returned incomplete HTML, or lacked enough context. The tool does not retry automatically.
+- **The final iframe reports unavailable data:** enable **Allow iframe same origin**, keep the chat saved, and confirm the source tool result remains in chat history.
+- **A chart is blank:** give Chart.js canvases an explicitly sized container and use `maintainAspectRatio: false`. Put external library scripts before the script that uses them.
+- **A library fails in `offline` mode:** serve it from `/static/` and update the URL in the skill.
+- **No sound on an old chart:** the chime is intentionally limited to a live placeholder-to-ready transition. Disable it globally with the `chime` valve.
 
-- *"Run the PostgreSQL query for daily revenue and plot the result as a line chart."*
-- *"Use the earlier SQL result in this chat to compare revenue by region."*
-- *"Show the query result as an interactive HTML table with sorting and filters."*
+## Development
 
-### The protocol in one example
-
-```
-I'll chart the SQL result for you.
-
-@@@VIZ-START
-<div id="summary"></div>
-<script>
-getToolData().then(function(result) {
-  const rows = Array.isArray(result) ? result : result.rows;
-  document.getElementById('summary').textContent = rows.length + ' rows loaded';
-});
-</script>
-@@@VIZ-END
-
-The visualization uses the original tool result.
-```
-
-Everything between the markers is hidden from the chat body and piped into the iframe. Prose before and after renders normally. The fragment may use any HTML/SVG, but every call to `visualize` requires a source tool call ID. `getToolData()` returns a Promise with a parsed JSON copy of that result, including results from earlier messages in the same chat. Missing IDs and invalid JSON show an error in the iframe.
-
----
-
-## 🌉 Bridges — deep dive
-
-### `sendPrompt(text)`
-Turns any node into a conversational drill-down. The iframe `postMessage`s the parent with Open WebUI's native prompt-submit protocol.
-
-```html
-<g class="node c-purple" onclick="sendPrompt('Explain attention — how does softmax(QKᵀ/√d)V work and why scale by √d?')">
-  <rect x="100" y="20" width="200" height="44" rx="8"/>
-  <text class="th" x="200" y="42" text-anchor="middle" dominant-baseline="central">Attention</text>
-</g>
-```
-
-### `openLink(url)`
-Opens URLs in a new tab — safer than anchor tags inside sandboxed iframes.
-
-```html
-<button onclick="openLink('https://arxiv.org/abs/1706.03762')">View paper ↗</button>
-```
-
-### `copyText(text)` — fires a localized toast automatically
-
-```html
-<button onclick="copyText(document.getElementById('snippet').textContent)">Copy</button>
-<pre id="snippet">from anthropic import Anthropic
-client = Anthropic()
-…</pre>
-```
-
-### `toast(msg, kind)` — standalone status banners
-
-```html
-<button onclick="recompute(); toast('Recomputed', 'info')">Recompute</button>
-```
-
-`kind` ∈ `success` (default) / `info` / `warn` / `error`.
-
-### `saveState` / `loadState` — per-message persistence
-
-```html
-<script>
-  const initial = loadState('showAdvanced', false);
-  document.getElementById('adv').checked = initial;
-  applyView(initial);
-
-  function toggle(el) {
-    saveState('showAdvanced', el.checked);
-    applyView(el.checked);
-  }
-</script>
-```
-
-Keys are prefixed with the assistant message id, so a chart in Chat A and a chart in Chat B never share state. A slider value survives page reloads — the user's last setting is there when they come back.
-
----
-
-## 🎨 Design system — at a glance
-
-### Color ramps
-```
-purple · teal · coral · pink · gray · blue · green · amber · red
-```
-Apply via CSS class on any `<g>` — child `<rect>`, `<circle>`, `<ellipse>` get the ramp's fill + stroke automatically, un-classed, un-filled child `<path>` / `<polygon>` (pie wedges, areas) get the ramp's saturated stroke color (an explicit `fill` attribute always wins), and child `.th` / `.ts` get the ramp's text colors. `currentColor` anywhere inside the group resolves to the ramp color, so classed marks can opt back in with `fill="currentColor"`. Light/dark adaptation is automatic.
-
-```html
-<g class="node c-teal">
-  <rect x="100" y="20" width="180" height="44" rx="8"/>
-  <text class="th" x="190" y="42" text-anchor="middle" dominant-baseline="central">Compute</text>
-</g>
-```
-
-### SVG utility classes
-
-| Class | Purpose |
-|---|---|
-| `.t` `.ts` `.th` | 14 px primary text / 12 px secondary / 14 px bold |
-| `.box` | Neutral rect (secondary bg, tertiary border) |
-| `.node` | Clickable element (cursor, hover opacity) |
-| `.arr` | Arrow line (1.5 px, border-secondary) |
-| `.leader` | Dashed guide line (0.5 px, tertiary) |
-| `.c-{ramp}` | Apply a color ramp to all descendants |
-
-### Themed HTML elements
-
-A wide set of bare tags ship with theme-aware default styling. The model
-writes `<button>`, `<select>`, `<table>`, `<details>` etc. and gets
-polished output — no class or inline style needed.
-
-| Group | Tags |
-|---|---|
-| **Forms** | `<button>` · `<input>` (`text`, `email`, `number`, `search`, `password`, `tel`, `url`, `date`, `time`, `datetime-local`, `range`, `checkbox`, `radio`) · `<textarea>` · `<select>` · `<label>` · `<fieldset>` · `<legend>` |
-| **Tables** | `<table>` · `<thead>` · `<tbody>` · `<th>` · `<td>` · `<caption>` (numeric cells: `align="right"` or `class="num"` → tabular-nums) |
-| **Disclosure** | `<details>` / `<summary>` (rotating chevron) |
-| **Inline** | `<kbd>` · `<mark>` · `<code>` · `<blockquote>` · `<hr>` |
-| **Definition lists** | `<dl>` in three layouts — bare (stacked glossary), `data-layout="grid"` (two-column card), `data-layout="inline"` (pill row) |
-
-Adding a `class` or `style` attribute to any of these opts out of the
-default styling — the model can still go fully custom when the design
-calls for it.
-
----
-
-## 🌍 Localization
-
-The tool bakes `<html data-iv-lang="{detected}">` on the server (reads parent `localStorage.locale` via `__event_call__`). Client-side fallbacks chain through `parent.localStorage` and `navigator.language`. 48 languages covered: en, de, cs, hu, hr, pl, fr, nl, es, pt, it, ca, gl, eu, da, sv, no, fi, is, sk, sl, sr, bs, bg, mk, uk, ru, be, lt, lv, et, ro, el, sq, tr, az, ar, he, zh, ja, ko, vi, th, id, ms, hi, bn, sw.
-
-Eight strings translated per language. That's **384 translations shipping** in the tool.
-
----
-
-## 🔒 Security
-
-Every visualization renders in a sandboxed iframe with a configurable Content Security Policy. Open **Workspace → Tools → Inline Visualizer → gear icon** to change the valve.
-
-| Level | Outbound requests | External images | URL param stripping | Use case |
-|-------|:-:|:-:|:-:|---|
-| **Offline** *(new in 2.2.0)* | ❌ | ❌ | ✅ | **Nothing leaves your instance** — even the three script CDNs are blocked. Libraries can be self-hosted on your instance ([tutorial ↓](#-offline-mode--self-hosting-the-cdn-libraries)). |
-| **Strict** (default) | ❌ | ❌ | ✅ | Max safety with CDN charts. All core features work normally. |
-| **Balanced** | ❌ | ✅ | — | Visualizations displaying external images (flags, logos). |
-| **None** | ✅ | ✅ | — | Visualizations fetching live API data from within the iframe. |
-
-### What works in Strict mode
-
-Chart.js, D3.js, Vega-Lite, and any other pure-client-side library load and render normally — the three major CDN hosts (cdnjs, jsdelivr, unpkg) are on the `script-src` allowlist, and `'unsafe-eval'` is granted so runtime expression compilers (Vega's `new Function(...)`, some templating libs) work. `getToolData()` reads the same-origin chat API through the parent page, so it works in Strict mode without changing the iframe's `connect-src` policy.
-
-**What Strict blocks:** runtime `fetch()` calls, `d3.csv('https://…')`, Vega-Lite specs with `data: { url: '…' }`, external images, form submits. If you want a live-updating weather widget or a chart that pulls a CSV at render time, switch to **None**.
-
-**What Offline additionally blocks:** the three CDN hosts themselves. In Offline mode the iframe cannot make a single request that leaves your Open WebUI server — `script-src` drops the CDN allowlist and permits `'self'` instead, so the only scripts that load are inline ones and files served by your own instance. Pure inline SVG/HTML visualizations (the skill's default) work unchanged; library charts (Chart.js, D3, …) keep working too **if you self-host the files** — see [Offline mode](#-offline-mode--self-hosting-the-cdn-libraries) below.
-
-> [!NOTE]
-> Strict allows `'unsafe-inline'` and `'unsafe-eval'` for scripts because LLM-generated visualizations ship their own inline code and some libraries compile expressions at runtime. Those relaxations don't create exfil channels — the real outbound blockers (`connect-src 'none'`, `form-action 'none'`, `img-src` restricted, `object-src 'none'`) stay in place regardless. If you need a truly locked-down iframe, disable JavaScript entirely at the Open WebUI level; the tool can't render anything useful without `'unsafe-inline'` scripts.
-
-### Why `script-src` allows a CDN but `connect-src` doesn't
-
-Loading a library from a CDN is a plain `GET` of a fixed public URL — zero data leaves the browser. Allowing `fetch()` to the same CDN opens an exfiltration channel: the URL itself becomes the payload (`fetch('https://cdn.example/?data=' + userContent)` gets logged server-side even if it returns 404). Different directions, different risks — Strict grants "read known public asset", denies "write arbitrary data anywhere". This is intentional, not an oversight.
-
-### Sourcemap warnings in DevTools
-
-When DevTools is open, the browser attempts to fetch `.map` files for loaded libraries from the same CDN. Strict blocks those via `connect-src 'none'` — you'll see lines like `Connecting to 'https://cdn.jsdelivr.net/npm/vega.min.js.map' violates CSP…` in the console. Those are DevTools-only noise (end users with DevTools closed never see them). We intentionally don't relax `connect-src` to fix this because that would reopen the exfil surface above for all users.
-
-> [!WARNING]
-> With `allow-same-origin` enabled (required for streaming and `getToolData()`), JavaScript in a visualization has reach into the parent Open WebUI page. That is a platform-level permission the tool cannot narrow. This variant reads the same-origin chats API to find the referenced tool result and to recover raw visualization source if a script is corrupted by chat rendering. If you need full isolation, disable same-origin and use the original inline-visualizer (static mode only).
-
-> [!NOTE]
-> Even in **None** mode, external API calls may still fail due to CORS — that's the remote server's policy, not ours.
-
----
-
-## 🔌 Offline mode — self-hosting the CDN libraries
-
-*(new in v2.2.0)* The **Offline** security level guarantees **nothing leaves your Open WebUI host**: no CDNs, no external images, fonts, or media. The only request the tool itself ever makes is the same-origin chats-API read described under [Security](#-security). It exists for air-gapped networks and privacy-hardened deployments.
-
-Two ways to use it:
-
-### Option A — no libraries at all (zero setup)
-
-Just set the valve: **Workspace → Tools → Inline Visualizer → gear icon → `security_level` → `offline`**. Done.
-
-Everything the design system ships — inline SVG diagrams, themed HTML components, interactive explainers, sparklines, KPI cards, `sendPrompt` drill-downs — is baked into the iframe itself and needs no network. Only *library* charts (Chart.js, D3, ECharts, Plotly, Vega-Lite, vis-network, Tone.js) normally come from a CDN. If you can live without those, you're finished. Optionally delete the **CDN libraries** section from `SKILL.md` before importing it, so the model doesn't try to load them in the first place.
-
-### Option B — keep the libraries, serve them yourself
-
-Open WebUI already serves a static folder at `https://<your-instance>/static/` — and in Offline mode the CSP allows `'self'`, so anything you drop in there loads fine inside visualizations. Small tutorial:
-
-**1. Set the valve to `offline`** (see Option A).
-
-**2. Download the libraries you want** (these are the exact pinned builds from `SKILL.md`):
-
-```bash
-mkdir iv-libs && cd iv-libs
-curl -LO https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js
-curl -LO https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js
-curl -LO https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js
-curl -Lo plotly.min.js https://cdn.jsdelivr.net/npm/plotly.js-dist@2
-curl -Lo vega.min.js https://cdn.jsdelivr.net/npm/vega@5
-curl -Lo vega-lite.min.js https://cdn.jsdelivr.net/npm/vega-lite@5
-curl -Lo vega-embed.min.js https://cdn.jsdelivr.net/npm/vega-embed@6
-curl -Lo vis-network.min.js https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js
-curl -Lo Tone.js https://cdnjs.cloudflare.com/ajax/libs/tone/15.0.4/Tone.js
-```
-
-(Only grab what you actually use — Chart.js alone covers most chart prompts.)
-
-**3. Put the folder inside Open WebUI's static directory.**
-
-*Docker (recommended — survives image updates):* bind-mount the folder into the static dir when starting the container:
-
-```bash
-docker run -d ... -v /path/on/host/iv-libs:/app/backend/open_webui/static/iv-libs ...
-```
-
-*Docker (quick test — lost on image update):*
-
-```bash
-docker exec open-webui mkdir -p /app/backend/open_webui/static/iv-libs
-docker cp iv-libs/. open-webui:/app/backend/open_webui/static/iv-libs/
-```
-
-*Bare-metal / pip:* the served folder is the `static/` directory of the installed `open_webui` package (or wherever the `STATIC_DIR` environment variable points, if you set one). Create `iv-libs/` inside it and copy the files there.
-
-**4. Verify.** Open `https://<your-instance>/static/iv-libs/chart.umd.min.js` in your browser — you should see minified JavaScript. If you get a 404, the files aren't in the folder Open WebUI is actually serving.
-
-**5. Teach the model the local paths.** The model writes the `<script src=…>` tags, so `SKILL.md` must point it at your copies instead of the CDNs. Before importing the skill, search-replace the loader URLs in the **CDN libraries** section (and the Chart.js setup example), e.g.:
-
-```html
-<!-- before -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<!-- after -->
-<script src="/static/iv-libs/chart.umd.min.js"></script>
-```
-
-Keeping the filenames identical makes this a plain search-replace. If you already imported the skill, just edit it in **Workspace → Knowledge/Skills** and save.
-
-**6. Done.** New visualizations now load every byte from your own server. You can confirm in DevTools → Network: the only requests are same-origin.
-
-> [!NOTE]
-> **Sub-path deployments:** if Open WebUI is served under a sub-path (e.g. `https://example.com/webui/`), use the full path in the skill: `/webui/static/iv-libs/…`. The iframe inherits the parent page's origin and base URL, so absolute paths resolve against your domain root.
-
-> [!NOTE]
-> **Why not just mirror the CDN hostnames?** You can (DNS override + an internally-trusted TLS cert for the CDN hosts works with zero plugin changes), but it's operationally heavy. The `/static` route is two files and one valve.
-
----
-
-## 🧰 Troubleshooting
-
-<details>
-<summary><b>The iframe shows a "Streaming visualization unavailable" notice</b></summary>
-
-`allow-same-origin` is off. Enable it in **Settings → Interface → iframe Sandbox Allow Same Origin**.
-</details>
-
-<details>
-<summary><b>The iframe is a thin empty strip</b></summary>
-
-Usually means the model emitted an empty `@@@VIZ-START … @@@VIZ-END` block, or stopped mid-stream without closing the block and hit the idle-finalize fallback. Try regenerating. See the next entry for how the idle fallback works.
-</details>
-
-<details>
-<summary><b>How does the plugin know when to stop streaming?</b></summary>
-
-Two triggers:
-
-1. **`@@@VIZ-END` marker arrives** — fires `finalize()` instantly. Scripts run, loader is replaced with the rendered viz, done toast + chime fire. This is the 99%+ case.
-2. **Idle fallback — 30 seconds of completely stable source text.** Catches three edge cases: the user stopped generation mid-viz, the model forgot to close the block, or the network died.
-
-The 30s window is deliberately much longer than any realistic inter-chunk stall. Gemini 3.1 Pro's 200-token chunks with 3-6s gaps, proxy buffering under poor network (10-20s silent pauses), and occasional Claude stalls all comfortably fit inside it. An earlier 5s fallback produced a thin-strip regression in ~40% of long streams; **30s is the sweet spot** between surviving real stalls and still recovering from a user-stop within half a minute.
-
-**If a browser tab's network completely dies for more than 30s**, the fallback will finalize on whatever partial content arrived before the outage. At that point the stream is already gone, so a frozen loader-forever would be worse. Refresh the chat and the saved markdown (which has both markers) finalizes instantly on first tick.
-</details>
-
-<details>
-<summary><b>A "Visualization script error" toast appears</b></summary>
-
-An inline script in the visualization does not parse. The usual cause is not the model: Open WebUI's citation rendering can silently swallow single-line numeric array literals like `[21, 11, 4]` from the message, corrupting the source the plugin reads from the chat DOM. The plugin detects the broken script before running it and re-reads the raw message text from your instance's chats API, which fixes the corrupted case automatically. The toast only appears when that recovery also dead-ends: the model genuinely wrote invalid JavaScript, the chat is unsaved (temporary chat), or the message kept streaming past the ~90s retry window — in the last case a refresh fixes it, because the saved chat recovers on the first attempt. The exact parse error is in the browser console.
-</details>
-
-<details>
-<summary><b>Chart.js / D3 renders but nothing appears</b></summary>
-
-Chart.js needs `<div style="position: relative; height: Xpx;">` around its canvas and `maintainAspectRatio: false` in options. See **Library init** in SKILL.md.
-</details>
-
-<details>
-<summary><b>I switched to Offline and Chart.js / D3 stopped loading</b></summary>
-
-Expected — Offline blocks the CDNs by design. Either self-host the libraries under `/static/iv-libs/` and point `SKILL.md` at them (see [Offline mode](#-offline-mode--self-hosting-the-cdn-libraries)), or stay on **Strict**, which allowlists the three public CDNs while still blocking every data-exfiltration channel.
-</details>
-
-<details>
-<summary><b>External images don't load</b></summary>
-
-Strict CSP blocks external images. Switch to **Balanced** in the tool's valves.
-</details>
-
-<details>
-<summary><b>fetch() fails with CORS</b></summary>
-
-Set CSP to **None** AND the remote server must allow cross-origin requests. If it doesn't, there's nothing any client-side config can do.
-</details>
-
-<details>
-<summary><b>The done chime is annoying</b></summary>
-
-Open **Workspace → Tools → Inline Visualizer (Streaming) → gear icon**, flip the **`chime`** valve to off, save. Chime disabled globally — the function definition is stripped from the iframe entirely (not shipped as a silent no-op), saving ~1 KB per visualization.
-</details>
-
-<details>
-<summary><b>I updated <code>tool.py</code> and nothing changed</b></summary>
-
-**BEFORE Open WebUI 0.9.5**, Open WebUI didn't hot-reload tool source codes if the tool changed. You have to paste the new contents into **Workspace → Tools → Inline Visualizer (Streaming) → Save** again and then restart your Open WebUI.
-
-Additionally, existing chats keep their old iframe baked into `message.embeds[]` — only newly-triggered tool calls pick up the update.
-
-On **multi-worker deployments** (`UVICORN_WORKERS > 1`), each worker process has its own in-memory tool module cache. A save updates the worker that handled the save request; every other worker keeps its old compiled module until the backend restarts. If you're on a multi-worker setup and you see stale behavior even from fresh chats, restart the backend.
-
-**Open WebUI 0.9.5 and newer is no longer affected by this. Changing the tool's source code will update it across all workers instantly now**
-</details>
-
----
-
-## 📐 Architecture
-
-```
-┌──────────────────── Assistant message ────────────────────┐
-│                                                            │
-│  <p>Here's the architecture:</p>                           │
-│                                                            │
-│  <p>@@@VIZ-START</p>       ← hidden by observer            │
-│  <p>&lt;svg…&gt;…&lt;/svg&gt;</p>  ← hidden, piped to iframe    │
-│  <p>@@@VIZ-END</p>         ← hidden by observer            │
-│                                                            │
-│  ┌──────────────── tool embed iframe ─────────────────┐    │
-│  │ #iv-render      ← live SVG reconciles here         │    │
-│  │ #iv-loader      ← dots + "Rendering visualization…"│    │
-│  │ #iv-dl-wrap     ← download button                  │    │
-│  │ #iv-toast-wrap  ← top-right toast stack            │    │
-│  └────────────────────────────────────────────────────┘    │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
-```
-
-The observer inside the iframe uses `parent.document` (via `allow-same-origin`) to `getSearchableText(msg)` — a TreeWalker that excludes `<details type="tool_calls">` — runs a regex for the N-th `@@@VIZ-START…@@@VIZ-END` block (N = iframe's embed index), safe-cuts the partial HTML, parses into a detached tree, and reconciles into `#iv-render`. On `@@@VIZ-END` it finalizes: injects scripts via a promise chain (external waits on `onload` before the next inline script executes), fires the done toast + chime, hides the loader.
-
-### Finalize triggers
-
-| Trigger | Delay | When it fires |
-|---|---|---|
-| `@@@VIZ-END` in source | instant | Model closed the block cleanly (the 99%+ case) |
-| 30s of source stability | 30s | User stopped generation, model forgot END, or network died |
-| Raw-source recovery | up to ~90s | An inline script failed to parse (chat renderer corrupted the DOM source); finalize waits on the raw message text from the chats API, instant on saved chats |
-
-The idle fallback is deliberately much longer than any realistic inter-chunk stall — Gemini 3.1 Pro's 200-token chunks with 3-6s gaps, proxy buffering under poor network (10-20s silent pauses), and occasional stalls on other models all fit comfortably inside. If a stream genuinely dies for 30s+, the visualization is already gone — finalizing on the partial content beats a loader frozen forever, and refreshing the chat re-finalizes instantly from the saved markdown (which has both markers).
-
----
-
-## 🙏 Credits
-
-Built on top of [**Open WebUI**](https://github.com/open-webui/open-webui) and its tool / skill system.
-
----
-
-<div align="center">
-<sub>Built for the humans who want their models to <em>show</em>, not just tell.</sub>
-</div>
+Run `pytest -q` for the tool contract, source-result bridge, embed lifecycle, and CSP checks. [CONTEXT.md](CONTEXT.md) defines the project language; [ADR 0001](docs/adr/0001-generate-visualization-inside-tool.md) records why HTML generation lives inside the tool.

@@ -10,52 +10,25 @@ The visualizer tool can render rich interactive visuals directly inline in chat 
 
 ## How to use
 
-you called the view_skill() tool to read the tutorial/handbook about this tool.
-Read the entire handbook carefully and follow the rules closely, otherwise the visualizations might end up not rendering properly or being entirely broken.
-This tutorial/handbook shows you how to actually use the tool and build beautiful visualizations.
+1. Identify the exact `tool_call_id` of a completed JSON-producing Native tool call in this saved chat.
+2. Call `visualize(source_tool_call_id="…", title="…")`. The tool validates the result, shows a loading placeholder, and asks the selected model to generate a complete HTML/SVG fragment using the current conversation and selected result.
+3. When the tool succeeds, briefly describe what the visualization shows. Do not emit HTML, code fences, or visualization delimiters in your chat response. For multiple visualizations, call the tool sequentially with each source call ID.
+4. If the tool returns an error, explain that error. Do not automatically rerun the source tool or visualization generation.
 
-1. Identify the exact `tool_call_id` of the JSON-producing tool call in this chat. Call `visualize(source_tool_call_id="…", title="…")`. The ID is required for every visualization.
-2. Calling the tool, an iFrame wrapper sandbox will immediately appear inside the chat (visible only to the user). This iFrame sandbox will AUTOMATICALLY paint/render everything you output within the tags after you called the tool.
-3. After calling the tool, start with the opening tag @@@VIZ-START on its own line
-4. Next, after the opening tag, emit the HTML/SVG content (no <!DOCTYPE>, <html>, <head>, <body>)
-5. In the fragment's script, call `getToolData()` and use its parsed JSON result. Never copy rows or point arrays into the fragment.
-6. Once you are done writing the code for the visualization, immediately close with @@@VIZ-END on its own line
-7. Done! The visualization is complete. Continue with any follow-up text to the user.
-
-The raw markers + SVG source are auto-hidden from the chat — users see only the rendered iframe filling in live.
+The model that runs inside the tool receives the full available conversation and the selected JSON result. It uses `getToolData()` in the generated fragment so the dataset is not duplicated in HTML. The tool replaces the loading placeholder with the finished embed or an error.
 
 ### Tool result data
 
-`getToolData()` returns a Promise with a fresh parsed JSON copy of the tool result selected by `source_tool_call_id`. It works for a result from the current answer or an earlier answer in the same saved chat. Inspect the source tool's JSON shape and select fields inside your script. If the result is absent or is not valid JSON, the iframe shows an error and the Promise rejects. Open WebUI 0.11.1 must use Native function calling and allow iframe same origin. The full result still enters the model's input context; this protocol saves the model from generating it again.
+`getToolData()` returns a Promise with a fresh parsed JSON copy of the source result. It works for a result from the current answer or an earlier answer in the same saved chat. The browser loads that result by call ID after the iframe mounts. Open WebUI 0.11.1 needs Native function calling and **Allow iframe same origin** enabled in User Settings → Interface. If data loading or the chart script fails, the embed shows an error.
 
-If no JSON tool result and exact call ID are available, do not call `visualize`.
+If no completed JSON result and exact call ID are available, do not call `visualize`.
 
-**Example response structure:**
+### Rules for the internal HTML renderer
 
-"""
-I'll chart the SQL result for you.
-
-@@@VIZ-START
-<div id="summary"></div>
-<script>
-getToolData().then(function(result) {
-  const rows = Array.isArray(result) ? result : result.rows;
-  document.getElementById('summary').textContent = rows.length + ' rows loaded';
-});
-</script>
-@@@VIZ-END
-
-The chart uses the original SQL tool result.
-"""
-
-**Streaming rules:**
-- Use the delimiters EXACTLY @@@VIZ-START and @@@VIZ-END — case-sensitive, on their own lines. Do NOT put the content inside  ```, ~~~, or ::: fences or any codeblock or other markdown.
-- Do NOT wrap in HTML tags like <viz> or <svg data-iv> — only the text markers are detected.
-- Emit **exactly ONE** @@@VIZ-START … @@@VIZ-END pair per tool call. For multiple visualizations, call the tool multiple times.
-- Structure the content as always: <style> first → visible content → <script> last.
-- Do NOT describe the HTML source in prose — users don't see it. Describe what the visualization **shows**.
-- Requires **iframe Sandbox Allow Same Origin** in Open WebUI Settings → Interface. If disabled, the wrapper shows a notice — and the user won't see the visualization itself, just the notice.
-- Any <script> you include runs **once**, **after** the full block has streamed in.
+- Return one complete HTML/SVG fragment: `<style>` first, visible content next, scripts last. Omit document wrapper tags and Markdown fences.
+- Use `getToolData()` inside the script to read the selected result; never repeat rows or arrays in the fragment.
+- Initialize chart code directly. Load any library before the script that uses it. Give canvas charts an explicitly sized container.
+- Describe the chart to the user only after the tool returns; the generated HTML is embedded, not printed in chat.
 
 ## What's auto-injected
 
