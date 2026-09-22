@@ -82,3 +82,5 @@ A downloaded HTML file includes the current DOM, but a data-driven script that c
 ## Development
 
 Run `pytest -q` for the tool contract, source-result bridge, embed lifecycle, and CSP checks. [CONTEXT.md](CONTEXT.md) defines the project language; [ADR 0001](docs/adr/0001-generate-visualization-inside-tool.md) records why HTML generation lives inside the tool.
+
+Regression tests invoke `Tools.visualize()` with only external Open WebUI services replaced. Browser tests execute the emitted iframe in Chromium, with a simulated chat API and animation clock, and check that errors remain visible after the chart is ready. They use Chromium from `PATH` or the standard Playwright cache; set `IV_TEST_CHROMIUM` to select an executable explicitly. Without Chromium, the browser tests are skipped.

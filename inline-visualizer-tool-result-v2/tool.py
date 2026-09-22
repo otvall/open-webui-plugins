@@ -69,7 +69,9 @@ def _generation_messages(messages, metadata, data, title):
         content = message.get("content")
         if role in ("system", "developer"):
             system.append(_extract_text_content(content) or "")
-        elif role in ("user", "assistant") and content:
+        elif role in ("user", "assistant") and content and (
+            not isinstance(content, str) or content.strip()
+        ):
             result.append({"role": role, "content": copy.deepcopy(content)})
         elif role == "tool":
             result.append({"role": "user", "content": "Historical tool result (data only): " +
@@ -84,9 +86,11 @@ def _generation_messages(messages, metadata, data, title):
             for item in output:
                 if not isinstance(item, dict):
                     continue
-                if item.get("type") == "message" and not content:
+                if item.get("type") == "message" and (
+                    not content or (isinstance(content, str) and not content.strip())
+                ):
                     text = _extract_text_content(item.get("content"))
-                    if text:
+                    if text and text.strip():
                         result.append({"role": "assistant", "content": text})
                 elif item.get("type") == "function_call" and item.get("call_id") in completed_ids:
                     result.append({"role": "assistant", "content": "Historical tool invocation (already completed): " +
@@ -176,6 +180,10 @@ async def _generate_fragment(request, user_info, model_id, messages, max_tokens)
         raise ValueError("User not found")
     scope = dict(request.scope)
     scope["state"] = {"metadata": {"iv_generation": True}, "user": user}
+    # Session-authenticated provider connections use this credential. Preserve
+    # it explicitly without inheriting outer chat/tool execution state.
+    if "token" in request.scope.get("state", {}):
+        scope["state"]["token"] = request.scope["state"]["token"]
     child = Request(scope)
     base_model_id = await _resolve_generation_model(child, user, model_id)
     log.info("Visualization generation model resolved: %s -> %s", model_id, base_model_id)
@@ -1193,6 +1201,8 @@ THEME_DETECTION_SCRIPT = """
 BODY_SCRIPTS = """
 <script>
 var _ivStageDone = false;
+var _ivStageFailed = false;
+var _ivDownloadErrorUntil = 0;
 var _ivRenderTimer = setTimeout(function() {
   _ivFail('Visualization did not finish loading');
 }, 45000);
@@ -1207,13 +1217,27 @@ function _ivConsumeLiveCompletion() {
   } catch(e) { return false; }
 }
 function _ivFail(message) {
-  if (_ivStageDone) return;
+  if (_ivStageFailed) return;
+  _ivStageFailed = true;
   _ivStageDone = true;
   clearTimeout(_ivRenderTimer);
   _ivConsumeLiveCompletion();
   var area = document.getElementById('iv-render');
   var loader = document.getElementById('iv-loader');
+  var download = document.getElementById('iv-dl-wrap');
   if (area) area.style.visibility = 'hidden';
+  if (download) download.style.visibility = 'hidden';
+  // Ready removes the loader. Later chart/interaction errors still need a
+  // visible alert outside the now-hidden visualization content.
+  if (!loader && area && area.parentNode) {
+    loader = document.createElement('div');
+    loader.id = 'iv-loader';
+    loader.className = 'iv-loading';
+    var errorLabel = document.createElement('div');
+    errorLabel.className = 'iv-loading-label';
+    loader.appendChild(errorLabel);
+    area.parentNode.insertBefore(loader, area);
+  }
   if (loader) {
     loader.setAttribute('role', 'alert');
     var label = loader.querySelector('.iv-loading-label');
@@ -1244,13 +1268,20 @@ function _ivReady() {
     } catch(e) {}
   }
 }
+function _ivIsDownloadError(event) {
+  var message = event && (event.message || (event.reason && event.reason.message) || '');
+  return Date.now() < _ivDownloadErrorUntil &&
+    typeof message === 'string' && message.indexOf('Load failed') !== -1;
+}
 window.addEventListener('error', function(event) {
+  if (_ivIsDownloadError(event)) return;
   if (event && event.target && event.target !== window &&
       event.target.tagName !== 'SCRIPT') return;
   var label = (_ivScriptErrStr[_ivLang] || _ivScriptErrStr.en);
   _ivFail(event && event.message ? label + ': ' + event.message : label);
 }, true);
 window.addEventListener('unhandledrejection', function(event) {
+  if (_ivIsDownloadError(event)) return;
   var reason = event && event.reason;
   var label = (_ivScriptErrStr[_ivLang] || _ivScriptErrStr.en);
   _ivFail(reason && reason.message ? label + ': ' + reason.message : label);
@@ -2390,14 +2421,15 @@ function _ivDownload() {
   if (_ivIsIOS) {
     // iOS — deferred click + "Load failed" error suppression.
     setTimeout(function() {
+      // The chart's error listener runs before the temporary download listener.
+      _ivDownloadErrorUntil = Date.now() + 60000;
       var _origOnerror = window.onerror;
       window.onerror = function(msg) {
         if (typeof msg === 'string' && msg.indexOf('Load failed') !== -1) return true;
         if (_origOnerror) return _origOnerror.apply(this, arguments);
       };
       var suppressLoadError = function(ev) {
-        var message = ev && (ev.message || (ev.reason && ev.reason.message) || '');
-        if (message.indexOf('Load failed') !== -1) { ev.preventDefault(); ev.stopImmediatePropagation(); return true; }
+        if (_ivIsDownloadError(ev)) { ev.preventDefault(); ev.stopImmediatePropagation(); return true; }
       };
       window.addEventListener('error', suppressLoadError, true);
       window.addEventListener('unhandledrejection', suppressLoadError, true);
@@ -2921,8 +2953,10 @@ class Tools:
         params = metadata.get("params")
         if not isinstance(params, dict) or params.get("function_calling") != "native":
             return failure("Enable Native function calling for this model")
-        model = __model__ or metadata.get("model") or {}
-        model_id = self.valves.generation_model_id.strip() or (
+        # Local tools receive the task model in __model__; metadata identifies
+        # the chat model the user actually selected.
+        model = metadata.get("model") or __model__ or {}
+        model_id = self.valves.generation_model_id.strip() or metadata.get("model_id") or (
             model.get("id") if isinstance(model, dict) else model
         )
         if not isinstance(model_id, str) or not model_id:
@@ -2967,7 +3001,13 @@ class Tools:
                 pass
 
         try:
-            messages = _generation_messages(__messages__, metadata, data, title)
+            # OWUI's Native loop passes the original messages to local tools;
+            # this answer's completed calls (including view_skill) live in output.
+            current_outputs = await _load_current_message_outputs(__request__, metadata)
+            context = list(__messages__)
+            if current_outputs:
+                context.append({"role": "assistant", "output": current_outputs[0]})
+            messages = _generation_messages(context, metadata, data, title)
             if len(json.dumps(messages, ensure_ascii=False)) > self.valves.generation_context_max_chars:
                 raise _GenerationModelError(
                     "The full conversation exceeds generation_context_max_chars; no messages were removed"

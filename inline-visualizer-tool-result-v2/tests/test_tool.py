@@ -1,7 +1,11 @@
 import asyncio
+import copy
+import html
 import importlib.util
 import inspect
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +26,275 @@ SPEC.loader.exec_module(iv)
 
 def run(awaitable):
     return asyncio.run(awaitable)
+
+
+def test_generation_omits_whitespace_only_history_messages():
+    messages = iv._generation_messages(
+        [
+            {"role": "user", "content": "Plot the result"},
+            {"role": "assistant", "content": "\n \n", "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "\n\n\n"}]},
+            ]},
+            {"role": "assistant", "content": "\n", "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "Data is ready"}]},
+            ]},
+        ],
+        {},
+        {"rows": [{"day": "2026-09-01", "online": 12}]},
+        "Sales",
+    )
+    assert all(str(message["content"]).strip() for message in messages)
+    assert {message["content"] for message in messages if message["role"] == "assistant"} == {"Data is ready"}
+
+
+@pytest.fixture
+def owui(monkeypatch):
+    """OWUI boundaries only: run the complete public tool without an LLM/server."""
+    from starlette.requests import Request
+
+    user = SimpleNamespace(id="user-1", role="user")
+    metadata = {
+        "chat_id": "chat-1", "message_id": "message-1",
+        "model_id": "chat-model", "params": {"function_calling": "native"},
+    }
+    app = SimpleNamespace(state=SimpleNamespace(
+        redis=None, MODELS={"chat-model": {"id": "chat-model"}},
+    ))
+    env = SimpleNamespace(
+        metadata=metadata,
+        request=Request({"type": "http", "app": app, "state": {"metadata": metadata}}),
+        messages=[{"role": "user", "content": "Plot daily revenue using the visualize skill"}],
+        output=[], saved_message={"embeds": [], "output": []},
+        generations=[], events=[],
+        session_auth=False, provider_authorization=None,
+        injected_model={"id": "chat-model"},
+        fragment='<div id="chart">Revenue chart</div>',
+    )
+
+    class Chats:
+        @staticmethod
+        async def get_chat_by_id_and_user_id(chat_id, user_id):
+            assert (chat_id, user_id) == ("chat-1", "user-1")
+            return {"id": chat_id}
+
+        @staticmethod
+        async def get_message_by_id_and_message_id(chat_id, message_id):
+            assert (chat_id, message_id) == ("chat-1", "message-1")
+            return copy.deepcopy(env.saved_message)
+
+    class Users:
+        @staticmethod
+        async def get_user_by_id(user_id):
+            assert user_id == "user-1"
+            return user
+
+    class Models:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            return None
+
+    async def get_all_models(*args, **kwargs):
+        return list(app.state.MODELS.values())
+
+    async def check_model_access(user, model):
+        return None
+
+    async def get_response_streams_by_chat_id(redis, chat_id):
+        assert chat_id == "chat-1"
+        return [{"message_id": "message-1", "output": copy.deepcopy(env.output)}] if env.output else []
+
+    async def generate_chat_completion(request, form_data, **kwargs):
+        if env.session_auth:
+            # Same requirement as OWUI's OpenAI connection auth_type="session".
+            env.provider_authorization = f"Bearer {request.state.token.credentials}"
+        env.generations.append((request, copy.deepcopy(form_data)))
+        return {"choices": [{"finish_reason": "stop", "message": {"content": env.fragment}}]}
+
+    async def emit(event):
+        env.events.append(copy.deepcopy(event))
+        assert event["type"] == "embeds"
+        if event["data"].get("replace"):
+            env.saved_message["embeds"] = copy.deepcopy(event["data"]["embeds"])
+        else:
+            env.saved_message["embeds"].extend(event["data"]["embeds"])
+
+    boundaries = {
+        "open_webui.models.chats": {"Chats": Chats},
+        "open_webui.models.users": {"Users": Users},
+        "open_webui.models.models": {"Models": Models},
+        "open_webui.utils.models": {"get_all_models": get_all_models, "check_model_access": check_model_access},
+        "open_webui.utils.chat": {"generate_chat_completion": generate_chat_completion},
+        "open_webui.tasks": {"get_response_streams_by_chat_id": get_response_streams_by_chat_id},
+    }
+    for name, attributes in boundaries.items():
+        module = types.ModuleType(name)
+        module.__dict__.update(attributes)
+        monkeypatch.setitem(sys.modules, name, module)
+
+    env.tool = iv.Tools()
+    env.invoke = lambda **kwargs: env.tool.visualize(
+        source_tool_call_id="call_sql", title="Daily revenue",
+        __request__=env.request, __metadata__=env.metadata,
+        __user__={"id": user.id}, __model__=env.injected_model,
+        __messages__=env.messages, __event_emitter__=emit, **kwargs,
+    )
+    return env
+
+
+@pytest.mark.parametrize("source", ["live", "saved"])
+def test_visualize_generates_with_the_skill_and_source_query_from_this_answer(owui, source):
+    skill = (MODULE_PATH.parent / "SKILL.md").read_text()
+    query = "SELECT day, SUM(revenue) AS revenue FROM sales GROUP BY day"
+    output = [
+        {"type": "function_call", "call_id": "call_sql", "name": "query", "arguments": query},
+        {"type": "function_call_output", "call_id": "call_sql", "status": "completed",
+         "output": [{"type": "input_text", "text": '{"rows":[{"day":"Monday","revenue":42}]}'}]},
+        {"type": "function_call", "call_id": "call_skill", "name": "view_skill", "arguments": '{"name":"visualize"}'},
+        {"type": "function_call_output", "call_id": "call_skill", "status": "completed",
+         "output": [{"type": "input_text", "text": skill}]},
+        {"type": "function_call", "call_id": "call_visualize", "name": "visualize", "arguments": '{"source_tool_call_id":"call_sql"}'},
+        {"type": "function_call_output", "call_id": "call_visualize", "status": "in_progress", "output": []},
+    ]
+    if source == "live":
+        owui.output = output
+    else:
+        owui.saved_message["output"] = output
+
+    result = run(owui.invoke())
+
+    assert result["status"] == "success"
+    context = json.dumps(owui.generations[0][1]["messages"], ensure_ascii=False)
+    assert "Build ambitiously when the topic supports it" in context
+    assert query in context
+    assert "call_visualize" not in context
+    assert "Revenue chart" in owui.events[-1]["data"]["embeds"][0]
+
+
+@pytest.mark.parametrize("override,expected_model", [("", "chat-model"), ("custom-model", "custom-model")])
+def test_visualize_uses_the_chat_model_unless_explicitly_overridden(owui, override, expected_model):
+    # OWUI 0.11.1 injects the configured task model as __model__ for local tools.
+    owui.injected_model = {"id": "task-model"}
+    owui.request.app.state.MODELS.update({
+        "task-model": {"id": "task-model"}, "custom-model": {"id": "custom-model"},
+    })
+    owui.tool.valves.generation_model_id = override
+    owui.messages.append({"role": "tool", "tool_call_id": "call_sql", "content": '{"rows":[]} '})
+
+    result = run(owui.invoke())
+
+    assert result["status"] == "success"
+    assert owui.generations[0][1]["model"] == expected_model
+
+
+def test_visualize_can_generate_through_a_session_authenticated_connection(owui):
+    owui.session_auth = True
+    owui.request.state.token = SimpleNamespace(credentials="test-session-token")
+    owui.messages.append({"role": "tool", "tool_call_id": "call_sql", "content": '{"rows":[]}'})
+
+    result = run(owui.invoke())
+
+    assert result["status"] == "success"
+    assert owui.provider_authorization == "Bearer test-session-token"
+    # Session credentials must not bring the outer chat/tool execution into the child.
+    assert owui.generations[0][0].state.metadata == {"iv_generation": True}
+    assert "Revenue chart" in owui.events[-1]["data"]["embeds"][0]
+
+
+@pytest.fixture
+def chromium():
+    """Use an installed Chromium; no downloads or browser dependencies in pytest."""
+    configured = os.environ.get("IV_TEST_CHROMIUM")
+    if configured:
+        assert Path(configured).is_file(), "IV_TEST_CHROMIUM must point to a Chromium executable"
+        return configured
+    for name in ("chromium", "chromium-browser", "google-chrome", "chrome-headless-shell"):
+        executable = shutil.which(name)
+        if executable:
+            return executable
+    for cache in (Path.home() / "Library/Caches/ms-playwright", Path.home() / ".cache/ms-playwright"):
+        for name in ("chrome-headless-shell", "headless_shell", "chrome"):
+            for executable in sorted(cache.glob(f"chromium*/**/{name}"), reverse=True):
+                if executable.is_file() and os.access(executable, os.X_OK):
+                    return str(executable)
+    pytest.skip("Install Chromium or set IV_TEST_CHROMIUM to run the iframe browser regression")
+
+
+@pytest.mark.parametrize("handler,expected_error", [
+    ("throw new Error('Chart update failed')", "Chart update failed"),
+    ("Promise.reject(new Error('Chart update failed'))", "Chart update failed"),
+    ("throw new Error('Load failed')", "Load failed"),
+    ("_ivIsIOS = true; HTMLAnchorElement.prototype.click = function() { "
+     "window.dispatchEvent(new ErrorEvent('error', {message: 'Load failed', cancelable: true})); "
+     "}; _ivDownload();", None),
+    ("_ivIsIOS = true; HTMLAnchorElement.prototype.click = function() { "
+     "Promise.reject(new Error('Load failed')); }; _ivDownload();", None),
+    ("_ivIsIOS = true; HTMLAnchorElement.prototype.click = function() { "
+     "window.dispatchEvent(new ErrorEvent('error', {message: 'Chart update failed', cancelable: true})); "
+     "}; _ivDownload();", "Chart update failed"),
+], ids=["script-error", "unhandled-rejection", "load-error-outside-download",
+        "ios-download-error", "ios-download-rejection", "chart-error-during-download"])
+def test_visualization_handles_errors_after_the_chart_is_ready(owui, chromium, tmp_path, handler, expected_error):
+    owui.output = [{
+        "type": "function_call_output", "call_id": "call_sql", "status": "completed",
+        "output": [{"type": "input_text", "text": '{"rows":[]}'}],
+    }]
+    owui.fragment = f'<button id="update-chart" onclick="{html.escape(handler, quote=True)}">Update chart</button>'
+    result = run(owui.invoke())
+    assert result["status"] == "success"
+    document = owui.events[-1]["data"]["embeds"][0]
+    # Chromium's --virtual-time-budget advances timers but not compositor frames.
+    # Replace only the animation clock, before any iframe scripts execute.
+    clock = """<script>
+window.requestAnimationFrame = function(callback) { return setTimeout(function() { callback(performance.now()); }, 16); };
+window.cancelAnimationFrame = clearTimeout;
+</script>"""
+    document = document.replace("<head>", "<head>" + clock, 1)
+    chat = {"chat": {"history": {"messages": {"message-1": {"output": owui.output}}}}}
+    # Replace the external saved chat API; the complete iframe still runs with
+    # actual DOM, CSS and JavaScript event handling in Chromium.
+    page = """<!doctype html><html><body><pre id="test-result">pending</pre>
+<script>
+window.fetch = async function() { return {ok: true, json: async function() { return CHAT; }}; };
+function report(value) { document.getElementById('test-result').textContent = JSON.stringify(value); }
+function inspectChart() {
+  var frame = document.getElementById('visualization');
+  var doc = frame.contentDocument, win = frame.contentWindow;
+  var button = doc && doc.getElementById('update-chart');
+  if (!button || win.getComputedStyle(button).visibility !== 'visible' || doc.getElementById('iv-loader')) {
+    setTimeout(inspectChart, 50);
+    return;
+  }
+  button.click();
+  setTimeout(function() {
+    var alerts = Array.from(doc.querySelectorAll('[role="alert"]')).filter(function(el) {
+      return win.getComputedStyle(el).visibility === 'visible' && el.getClientRects().length > 0;
+    }).map(function(el) { return el.textContent; });
+    report({readyBeforeClick: true, alerts: alerts,
+      chartVisible: win.getComputedStyle(button).visibility === 'visible'});
+  }, 100);
+}
+setTimeout(inspectChart, 50);
+</script>
+<iframe id="visualization" sandbox="allow-scripts allow-same-origin" srcdoc="DOCUMENT"></iframe>
+</body></html>""".replace("CHAT", json.dumps(chat)).replace("DOCUMENT", html.escape(document, quote=True))
+    path = tmp_path / "c" / "chat-1" / "index.html"
+    path.parent.mkdir(parents=True)
+    path.write_text(page)
+    completed = subprocess.run([
+        chromium, "--headless", "--no-sandbox", "--disable-gpu", "--disable-background-networking",
+        "--allow-file-access-from-files", f"--user-data-dir={tmp_path / 'browser-profile'}",
+        "--dump-dom", "--virtual-time-budget=5000", path.as_uri(),
+    ], text=True, capture_output=True, timeout=30, check=True)
+    match = re.search(r'<pre id="test-result">([^<]*)</pre>', completed.stdout)
+    assert match and match[1] != "pending", completed.stderr[-3000:]
+    observed = json.loads(html.unescape(match[1]))
+    assert observed["readyBeforeClick"] is True
+    if expected_error:
+        assert any(expected_error in alert for alert in observed["alerts"]), observed
+        assert observed["chartVisible"] is False
+    else:
+        assert observed["alerts"] == [], observed
+        assert observed["chartVisible"] is True
 
 
 def test_visualize_contract_and_early_invalid_id():
