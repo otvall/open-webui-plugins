@@ -1,6 +1,6 @@
 # Inline Visualizer — Tool Result
 
-`visualize_tool_result()` renders an interactive visualization from the textual result of one completed Open WebUI tool call. It is a dedicated companion to the standard `visualize()` tool: the standard tool creates ordinary visualizations, while this tool always requires a source call ID and always exposes that call's result through `getToolData()`.
+`visualize_tool_result()` renders an interactive visualization from the textual result of one completed Open WebUI tool call. It is a dedicated companion to the standard `visualize()` tool: the standard tool creates ordinary visualizations, while this tool requires a source tool name and exposes its latest call's result through `getToolData()`.
 
 ## Requirements
 
@@ -12,15 +12,15 @@
 
 ```python
 visualize_tool_result(
-    source_tool_call_id: str,
+    source_tool_name: str,
     title: str = "Tool Result Visualization",
     retry_attempt: Literal[0, 1] = 0,
 )
 ```
 
-`source_tool_call_id` is required. It must be the complete `tool_call_id` or `call_id` copied from the completed source call. It is treated as an opaque string and matched exactly.
+`source_tool_name` is required: pass the exact function name, such as `query_database`. Matching is case-sensitive and preserves namespaces. The visualizer selects the latest invocation of that function in the current dialogue; the model does not need access to call IDs. Version 1.2.0 replaces the previous ID-based argument; update the installed tool and bundled skill together.
 
-`retry_attempt` is a bounded recovery control. Omit it on the initial call. If the result is not visible yet, the tool returns `status="retry_required"` with exact `retry.arguments`; call `visualize_tool_result()` once more in the next sequential tool round using those arguments. The retry keeps the original source call ID and sets `retry_attempt=1`.
+`retry_attempt` is a bounded recovery control. Omit it on the initial call. If the result is not visible yet, the tool returns `status="retry_required"` with exact `retry.arguments`; call `visualize_tool_result()` once more in the next sequential tool round using those arguments. The retry keeps the source tool name and sets `retry_attempt=1`.
 
 ## Workflow
 
@@ -30,12 +30,12 @@ The producer and visualizer must run in separate tool rounds:
 Round 1:
   query_database(...)
 
-Wait for the completed result and copy its exact call ID.
+Wait for the completed result.
 
 Round 2:
   visualize_tool_result(
       title="Sales",
-      source_tool_call_id="<exact copied ID>"
+      source_tool_name="query_database"
   )
 ```
 
@@ -58,17 +58,21 @@ After the tool succeeds, emit one visualization block:
 
 The producer and `visualize_tool_result()` cannot be called in the same parallel batch because the source result is not available until Open WebUI records the completed producer call.
 
-If a provider nevertheless puts them in one batch, the initial visualizer call returns `retry_required` instead of an error. Retry only `visualize_tool_result()` in the next tool round with the supplied arguments. Reuse the existing producer result; never rerun the producer to recover a visualization. A missing result after that single retry becomes `Tool result not found`, preventing an unbounded loop.
+If the latest source call is visible but its result is not ready, the initial visualizer call returns `retry_required` instead of an error. Retry only `visualize_tool_result()` in the next tool round with the supplied arguments. Reuse the existing producer result; never rerun the producer to recover a visualization. A missing result after that single retry becomes `Tool result not found`, preventing an unbounded loop.
 
 ## Result resolution
 
-The tool searches for an exact matching call ID in this order:
+The tool searches for the latest invocation with the exact function name in this order:
 
 1. the active response stream for the current assistant message;
 2. the saved `message.output` for that message;
-3. completed tool results in the current dialogue supplied through `__messages__`.
+3. calls and results in the current dialogue supplied through `__messages__`.
 
-If an ID occurs more than once, the newest matching result is selected. Only the selected textual result is injected. Tool arguments, metadata, neighboring results, images, and file attachments are excluded.
+Latest means invocation order, even when parallel calls finish in a different order. Once the latest matching call is found, a pending or missing result triggers the single retry rather than falling back to older data. Another snapshot can supply that same call's result only within the same assistant message. History without a message ID cannot be used to complete a call selected from the active/stored message, because call IDs may repeat across turns.
+
+Supported formats include Responses API call/output pairs (direct or nested in `message.output`), Chat Completions `assistant.tool_calls` paired with `role="tool"` messages, and result messages carrying an explicit `name`. When call records are absent, named results are ordered by their appearance in the history. Names are never inferred from IDs or result text.
+
+Only the selected textual result is injected. Tool arguments, metadata, neighboring results, images, and file attachments are excluded.
 
 JSON strings are parsed before injection. Ordinary text remains a string and JSON `null` becomes JavaScript `null`.
 
@@ -119,10 +123,10 @@ The selected result is serialized into a non-executable `<script type="applicati
 
 ## Errors
 
-- `Invalid source_tool_call_id`: the required ID is empty or invalid.
+- `Invalid source_tool_name`: the required function name is empty or invalid.
 - `Invalid retry_attempt`: the retry control is outside its supported `0`/`1` range.
 - `retry_required`: the initial call could not see the source result yet; retry the visualizer once with the supplied arguments.
-- `Tool result not found`: the single visualization retry still could not resolve the exact ID.
+- `Tool result not found`: the single visualization retry still could not resolve the latest call's result for this function name.
 - `Tool result cannot be serialized`: the selected result cannot be safely encoded as JSON.
 
 When the tool returns `retry_required` or an error, do not emit a `@@@VIZ-START` block.

@@ -31,7 +31,7 @@ def run(awaitable):
     return asyncio.run(awaitable)
 
 
-def response_output(*calls):
+def response_output(*calls, name="execute_sql"):
     output = []
     for call_id, result in calls:
         output.append(
@@ -39,7 +39,7 @@ def response_output(*calls):
                 "type": "function_call",
                 "id": call_id,
                 "call_id": call_id,
-                "name": "execute_sql",
+                "name": name,
                 "arguments": json.dumps({"sql": f"secret-{call_id}"}),
                 "status": "completed",
             }
@@ -66,14 +66,19 @@ def response_output(*calls):
     return output
 
 
-def tool_message(call_id, result):
+def tool_message(call_id, result, name="execute_sql"):
     return {
         "role": "tool",
+        "name": name,
         "tool_call_id": call_id,
         "content": (
             result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         ),
     }
+
+
+def resolve_messages(messages, name="execute_sql"):
+    return run(iv._resolve_tool_result(name, None, {}, messages))
 
 
 def extract_tool_json(html):
@@ -128,14 +133,14 @@ def test_extract_text_content_omits_images_and_files():
     ) == ""
 
 
-def test_find_output_result_matches_exact_id_and_uses_latest_duplicate():
+def test_find_output_result_selects_latest_named_call():
     output = response_output(
         ("call-same", [{"version": 1}]),
         ("call-other", [{"other": True}]),
         ("call-same", [{"version": 2}]),
     )
 
-    found, result = iv._find_output_tool_result(output, "call-same")
+    found, result = resolve_messages(output)
 
     assert found is True
     assert result == [{"version": 2}]
@@ -157,17 +162,17 @@ def test_find_output_result_requires_completed_result_item():
         },
     ]
 
-    assert iv._find_output_tool_result(output, "call-pending") == (False, None)
+    assert resolve_messages(output) == (False, None)
 
 
-def test_find_message_result_matches_exact_id_and_uses_latest_duplicate():
+def test_find_message_result_accepts_named_results_without_calls():
     messages = [
         tool_message("call-same", [{"version": 1}]),
         tool_message("call-other", [{"other": True}]),
-        tool_message("call-same", [{"version": 2}]),
+        tool_message("call-latest", [{"version": 2}]),
     ]
 
-    found, result = iv._find_message_tool_result(messages, "call-same")
+    found, result = resolve_messages(messages)
 
     assert found is True
     assert result == [{"version": 2}]
@@ -189,9 +194,7 @@ def test_find_message_result_accepts_saved_response_output_from_dialogue():
         },
     ]
 
-    found, result = iv._find_message_tool_result(
-        messages, "function.execute_sql:0"
-    )
+    found, result = resolve_messages(messages)
 
     assert found is True
     assert result == [{"source": "latest"}]
@@ -201,15 +204,14 @@ def test_find_message_result_accepts_direct_responses_api_item():
     messages = [
         {
             "type": "function_call_output",
+            "name": "execute_sql",
             "call_id": "call_provider_generated",
             "output": [{"type": "output_text", "text": '{"ok":true}'}],
             "status": "completed",
         }
     ]
 
-    found, result = iv._find_message_tool_result(
-        messages, "call_provider_generated"
-    )
+    found, result = resolve_messages(messages)
 
     assert found is True
     assert result == {"ok": True}
@@ -276,7 +278,7 @@ def test_resolve_result_prefers_active_stream_over_stored_output(monkeypatch):
 
     found, result = run(
         iv._resolve_tool_result(
-            "call-data",
+            "execute_sql",
             DummyRequest(),
             {"chat_id": "chat", "message_id": "assistant-message"},
             [tool_message("call-data", [{"source": "messages"}])],
@@ -289,13 +291,13 @@ def test_resolve_result_prefers_active_stream_over_stored_output(monkeypatch):
 
 def test_resolve_result_falls_back_to_messages(monkeypatch):
     async def load_outputs(request, metadata):
-        return [response_output(("call-other", [{"other": True}]))]
+        return [response_output(("call-other", [{"other": True}]), name="other_tool")]
 
     monkeypatch.setattr(iv, "_load_current_message_outputs", load_outputs)
 
     found, result = run(
         iv._resolve_tool_result(
-            "call-data",
+            "execute_sql",
             DummyRequest(),
             {},
             [tool_message("call-data", [{"source": "messages"}])],
@@ -306,13 +308,16 @@ def test_resolve_result_falls_back_to_messages(monkeypatch):
     assert result == [{"source": "messages"}]
 
 
-def test_source_tool_call_id_is_required_in_public_signature():
+def test_source_tool_name_is_required_in_public_signature():
     parameter = inspect.signature(iv.Tools.visualize_tool_result).parameters[
-        "source_tool_call_id"
+        "source_tool_name"
     ]
 
     assert parameter.default is inspect.Parameter.empty
     assert parameter.annotation is str
+    assert "source_tool_call_id" not in inspect.signature(
+        iv.Tools.visualize_tool_result
+    ).parameters
 
 
 def test_retry_attempt_is_bounded_in_public_signature():
@@ -327,7 +332,7 @@ def test_retry_attempt_is_bounded_in_public_signature():
 def test_visualize_without_event_emitter_returns_html_response_tuple():
     response, context = run(
         iv.Tools().visualize_tool_result(
-            source_tool_call_id="call-data",
+            source_tool_name="execute_sql",
             title="Fallback",
             __messages__=[tool_message("call-data", [{"x": 1}])],
             __metadata__={"chat_id": "chat/live", "message_id": "msg:live"},
@@ -338,7 +343,7 @@ def test_visualize_without_event_emitter_returns_html_response_tuple():
     assert response.headers["content-disposition"] == "inline"
     assert "waiting for content" in context
     assert b"getToolData" in response.body
-    assert b'tool-result-1.1.12' in response.body
+    assert b'tool-result-1.2.0' in response.body
     runtime = re.search(
         rb'<script id="iv-runtime-config" type="application/json">(.*?)</script>',
         response.body,
@@ -358,7 +363,7 @@ def test_event_emitter_persists_message_embed_and_html_response_is_still_returne
 
     response, context = run(
         iv.Tools().visualize_tool_result(
-            source_tool_call_id="call-data",
+            source_tool_name="execute_sql",
             title="Dual path",
             __messages__=[tool_message("call-data", [{"x": 1}])],
             __event_emitter__=emitter,
@@ -380,7 +385,7 @@ def test_event_emitter_persists_message_embed_and_html_response_is_still_returne
 
 def test_visualize_injects_only_the_selected_result():
     messages = [
-        tool_message("call-a", [{"marker": "DO_NOT_INCLUDE_A"}]),
+        tool_message("call-a", [{"marker": "DO_NOT_INCLUDE_A"}], name="other_tool"),
         {
             "role": "assistant",
             "content": "metadata-secret",
@@ -394,14 +399,14 @@ def test_visualize_injects_only_the_selected_result():
                 }
             ],
         },
-        tool_message("call-b", [{"marker": "ONLY_SELECTED_B"}]),
-        tool_message("call-c", [{"marker": "DO_NOT_INCLUDE_C"}]),
+        tool_message("call-b", [{"marker": "ONLY_SELECTED_B"}], name=None),
+        tool_message("call-c", [{"marker": "DO_NOT_INCLUDE_C"}], name="other_tool"),
     ]
 
     result, html, _ = capture_visualize(
         iv.Tools(),
         title="Selected",
-        source_tool_call_id="call-b",
+        source_tool_name="execute_sql",
         __messages__=messages,
         __metadata__={"private": "metadata-secret-value"},
     )
@@ -449,22 +454,22 @@ def test_safe_json_blocks_script_breakout_and_preserves_unicode():
     assert extract_tool_json(bridge) == payload
 
 
-@pytest.mark.parametrize("source_tool_call_id", ["", "   "])
-def test_empty_source_tool_call_id_is_a_controlled_error(source_tool_call_id):
+@pytest.mark.parametrize("source_tool_name", ["", "   "])
+def test_empty_source_tool_name_is_a_controlled_error(source_tool_name):
     result, html, events = capture_visualize(
         iv.Tools(),
-        source_tool_call_id=source_tool_call_id,
+        source_tool_name=source_tool_name,
         __messages__=[],
     )
 
     assert result["status"] == "error"
-    assert result["error"] == "Invalid source_tool_call_id"
-    assert result["source_tool_call_id"] == source_tool_call_id
+    assert result["error"] == "Invalid source_tool_name"
+    assert result["source_tool_name"] == source_tool_name
     assert html is None
     assert events == []
 
 
-def test_unknown_or_unfinished_source_tool_call_id_requests_one_retry(
+def test_unknown_or_unfinished_source_tool_name_requests_one_retry(
     monkeypatch,
 ):
     async def load_outputs(request, metadata):
@@ -483,17 +488,17 @@ def test_unknown_or_unfinished_source_tool_call_id_requests_one_retry(
 
     result, html, events = capture_visualize(
         iv.Tools(),
-        source_tool_call_id="call-pending",
+        source_tool_name="execute_sql",
         __messages__=[],
     )
 
     assert result["status"] == "retry_required"
     assert result["code"] == "source_result_not_visible_yet"
-    assert result["source_tool_call_id"] == "call-pending"
+    assert result["source_tool_name"] == "execute_sql"
     assert result["retry"] == {
         "tool": "visualize_tool_result",
         "arguments": {
-            "source_tool_call_id": "call-pending",
+            "source_tool_name": "execute_sql",
             "title": "Tool Result Visualization",
             "retry_attempt": 1,
         },
@@ -511,7 +516,7 @@ def test_second_missing_attempt_is_a_controlled_error(monkeypatch):
 
     result, html, events = capture_visualize(
         iv.Tools(),
-        source_tool_call_id="call-still-missing",
+        source_tool_name="execute_sql",
         title="Retry",
         retry_attempt=1,
         __messages__=[],
@@ -519,7 +524,7 @@ def test_second_missing_attempt_is_a_controlled_error(monkeypatch):
 
     assert result["status"] == "error"
     assert result["error"] == "Tool result not found"
-    assert result["source_tool_call_id"] == "call-still-missing"
+    assert result["source_tool_name"] == "execute_sql"
     assert "single visualization retry" in result["message"]
     assert "do not rerun the data-producing tool" in result["message"]
     assert html is None
@@ -529,7 +534,7 @@ def test_second_missing_attempt_is_a_controlled_error(monkeypatch):
 def test_retry_succeeds_when_source_result_becomes_visible():
     result, html, events = capture_visualize(
         iv.Tools(),
-        source_tool_call_id="call-data",
+        source_tool_name="execute_sql",
         title="Retry success",
         retry_attempt=1,
         __messages__=[tool_message("call-data", [{"value": 42}])],
@@ -543,7 +548,7 @@ def test_retry_succeeds_when_source_result_becomes_visible():
 def test_invalid_retry_attempt_is_a_controlled_error():
     result, html, events = capture_visualize(
         iv.Tools(),
-        source_tool_call_id="call-data",
+        source_tool_name="execute_sql",
         retry_attempt=2,
         __messages__=[tool_message("call-data", [{"value": 42}])],
     )
@@ -555,19 +560,19 @@ def test_invalid_retry_attempt_is_a_controlled_error():
 
 
 def test_unserializable_result_is_a_controlled_error(monkeypatch):
-    async def resolve(tool_call_id, request, metadata, messages):
+    async def resolve(tool_name, request, metadata, messages):
         return True, float("nan")
 
     monkeypatch.setattr(iv, "_resolve_tool_result", resolve)
 
     result, html, events = capture_visualize(
         iv.Tools(),
-        source_tool_call_id="call-nan",
+        source_tool_name="execute_sql",
     )
 
     assert result["status"] == "error"
     assert result["error"] == "Tool result cannot be serialized"
-    assert result["source_tool_call_id"] == "call-nan"
+    assert result["source_tool_name"] == "execute_sql"
     assert html is None
     assert events == []
 
@@ -683,7 +688,7 @@ def test_runtime_config_and_valve_defaults_are_injected():
     )
     assert config_match is not None
     assert json.loads(config_match.group(1)) == {
-        "build": "tool-result-1.1.12",
+        "build": "tool-result-1.2.0",
         "lifecycleVersion": 3,
         "maxActiveVisualizations": 4,
         "pointDensity": 1.5,
@@ -1114,3 +1119,206 @@ def test_new_browser_scripts_parse_after_python_string_decoding(source):
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def messages_for_format(output, format, message_id="assistant-source"):
+    if format == "responses":
+        return output
+    if format == "saved":
+        return [{"role": "assistant", "id": message_id, "output": output}]
+    calls = [item for item in output if item["type"] == "function_call"]
+    messages = [{
+        "role": "assistant",
+        "id": message_id,
+        "tool_calls": [
+            {"id": call["call_id"], "function": {"name": call["name"]}}
+            for call in calls
+        ],
+    }]
+    for item in output:
+        if item["type"] != "function_call_output":
+            continue
+        message = {
+            "role": "tool",
+            "tool_call_id": item["call_id"],
+            "status": item.get("status"),
+        }
+        if "output" in item:
+            message["content"] = item["output"]
+        messages.append(message)
+    return messages
+
+
+@pytest.mark.parametrize("format", ["responses", "saved", "chat"])
+def test_latest_invocation_wins_when_results_complete_out_of_order(format):
+    old_call, old_result = response_output(("old", {"version": 1}))
+    new_call, new_result = response_output(("new", {"version": 2}))
+    other_call, other_result = response_output(("other", "secret"), name="other")
+    output = [old_call, new_call, other_call, new_result, other_result, old_result]
+
+    assert resolve_messages(messages_for_format(output, format)) == (
+        True, {"version": 2}
+    )
+
+
+@pytest.mark.parametrize("format", ["responses", "saved", "chat"])
+@pytest.mark.parametrize(
+    "status", ["missing", "in_progress", "pending", "queued", "requires_approval"]
+)
+def test_latest_pending_invocation_blocks_older_result(format, status):
+    output = response_output(("old", {"version": 1}), ("new", {"partial": True}))
+    if status == "missing":
+        output.pop()
+    else:
+        output[-1]["status"] = status
+
+    assert resolve_messages(messages_for_format(output, format)) == (False, None)
+
+
+@pytest.mark.parametrize("format", ["responses", "saved", "chat"])
+def test_recycled_call_id_cannot_complete_a_later_pending_turn(format):
+    old = response_output(("reused", {"version": "old"}))
+    new = response_output(("reused", {"version": "new"}))[:1]
+    messages = (
+        messages_for_format(old, format, "old-message")
+        + [{"role": "user", "content": "Get new data"}]
+        + messages_for_format(new, format, "new-message")
+    )
+
+    assert resolve_messages(messages) == (False, None)
+
+
+@pytest.mark.parametrize("name", ["Execute_SQL", "sql", "functions.execute_sql", " execute_sql "])
+def test_tool_names_match_exactly(name):
+    assert resolve_messages(response_output(("call", 42)), name) == (False, None)
+
+
+def test_namespaced_function_name_is_supported_without_normalization():
+    output = response_output(("call", 42), name="functions.execute_sql")
+    assert resolve_messages(output, "functions.execute_sql") == (True, 42)
+
+
+def test_unnamed_orphan_result_does_not_infer_name_from_id_or_content():
+    message = tool_message("functions.execute_sql:0", "execute_sql", name=None)
+    assert resolve_messages([message]) == (False, None)
+
+
+@pytest.mark.parametrize("format", ["responses", "saved", "chat"])
+def test_null_result_is_present_but_absent_payload_is_pending(format):
+    output = response_output(("call", None))
+    assert resolve_messages(messages_for_format(output, format)) == (True, None)
+    del output[-1]["output"]
+    assert resolve_messages(messages_for_format(output, format)) == (False, None)
+
+
+def test_pending_live_call_never_falls_back_to_different_stored_or_historical_call(monkeypatch):
+    async def load_outputs(request, metadata):
+        return [
+            response_output(("new", "partial"))[:1],
+            response_output(("old", "stale stored")),
+        ]
+
+    monkeypatch.setattr(iv, "_load_current_message_outputs", load_outputs)
+    history = messages_for_format(response_output(("older", "stale history")), "saved")
+    assert run(iv._resolve_tool_result(
+        "execute_sql", None, {"message_id": "assistant-source"}, history
+    )) == (False, None)
+
+
+@pytest.mark.parametrize("include_call", [True, False])
+def test_pending_live_call_can_use_same_call_result_from_stored_snapshot(monkeypatch, include_call):
+    async def load_outputs(request, metadata):
+        stored = response_output(("selected", {"ok": True}))
+        if not include_call:
+            stored = stored[1:]
+        return [response_output(("selected", "partial"))[:1], stored]
+
+    monkeypatch.setattr(iv, "_load_current_message_outputs", load_outputs)
+    assert run(iv._resolve_tool_result("execute_sql", None, {}, [])) == (
+        True, {"ok": True}
+    )
+
+
+@pytest.mark.parametrize("history_id", ["current", "earlier", ""])
+def test_history_can_complete_live_call_only_in_same_message(monkeypatch, history_id):
+    async def load_outputs(request, metadata):
+        return [response_output(("reused", "partial"))[:1]]
+
+    monkeypatch.setattr(iv, "_load_current_message_outputs", load_outputs)
+    history = messages_for_format(
+        response_output(("reused", {"ok": True})), "saved", history_id
+    )
+    result = run(iv._resolve_tool_result(
+        "execute_sql", None, {"message_id": "current"}, history
+    ))
+    assert result == ((True, {"ok": True}) if history_id == "current" else (False, None))
+
+
+def test_saved_output_and_tool_calls_on_same_message_do_not_duplicate_pending_call():
+    messages = messages_for_format(response_output(("call", 42)), "saved")
+    messages[0]["tool_calls"] = [
+        {"id": "call", "function": {"name": "execute_sql"}}
+    ]
+    assert resolve_messages(messages) == (True, 42)
+
+
+@pytest.mark.parametrize("completes", [True, False])
+def test_retry_of_latest_call_never_renders_old_data(monkeypatch, completes):
+    output = response_output(("old", "STALE"), ("new", {"fresh": True}))
+    latest_result = output.pop()
+
+    async def load_outputs(request, metadata):
+        return [output]
+
+    monkeypatch.setattr(iv, "_load_current_message_outputs", load_outputs)
+    tool = iv.Tools()
+    first, html, events = capture_visualize(
+        tool, source_tool_name="execute_sql", title="Latest"
+    )
+    assert first["status"] == "retry_required"
+    assert html is None and events == []
+    assert first["retry"]["arguments"] == {
+        "source_tool_name": "execute_sql", "title": "Latest", "retry_attempt": 1
+    }
+    if completes:
+        output.append(latest_result)
+    second, html, events = capture_visualize(tool, **first["retry"]["arguments"])
+    if completes:
+        assert extract_tool_json(html) == {"fresh": True}
+        assert "STALE" not in html
+        assert len(events) == 1
+    else:
+        assert second["error"] == "Tool result not found"
+        assert "retry" not in second
+        assert html is None and events == []
+
+
+def test_unknown_tool_name_requests_one_retry():
+    result, html, events = capture_visualize(
+        iv.Tools(), source_tool_name="unknown",
+        __messages__=response_output(("call", 42)),
+    )
+    assert result["status"] == "retry_required"
+    assert result["retry"]["arguments"]["source_tool_name"] == "unknown"
+    assert html is None and events == []
+
+
+def test_tool_calls_can_name_results_stored_in_output_without_declarations():
+    messages = messages_for_format(response_output(("call", 42))[1:], "saved")
+    messages[0]["tool_calls"] = [
+        {"id": "call", "function": {"name": "execute_sql"}}
+    ]
+    assert resolve_messages(messages) == (True, 42)
+
+
+def test_active_result_can_use_name_from_stored_call(monkeypatch):
+    async def load_outputs(request, metadata):
+        return [
+            response_output(("call", {"source": "active"}))[1:],
+            response_output(("call", {"source": "stored"})),
+        ]
+
+    monkeypatch.setattr(iv, "_load_current_message_outputs", load_outputs)
+    assert run(iv._resolve_tool_result("execute_sql", None, {}, [])) == (
+        True, {"source": "active"}
+    )

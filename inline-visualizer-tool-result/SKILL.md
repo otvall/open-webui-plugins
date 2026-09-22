@@ -13,14 +13,13 @@ Use this skill only when a system or developer instruction explicitly tells you 
 
 1. Call the data-producing tool.
 2. Wait until that tool call has fully completed.
-3. Identify the completed call containing the required data and read its explicit `tool_call_id` or `call_id` from the structured conversation context.
-4. Copy the complete identifier character-for-character.
-5. In a later sequential tool round, call `visualize_tool_result(title="…", source_tool_call_id="<exact copied ID>")`. Leave `retry_attempt` at its default `0`. YOU MUST CALL THE TOOL, otherwise the visualization will not render.
-6. If the tool returns `status="retry_required"`, call `visualize_tool_result()` exactly once in the next sequential tool round using `retry.arguments` exactly. Reuse the existing source call; never rerun the producer to recover the visualization.
-7. Wait for `visualize_tool_result()` to complete successfully. It mounts an iframe wrapper sandbox in the chat and injects the selected result as `getToolData()`.
-8. Emit `@@@VIZ-START` on its own line.
-9. Emit exactly one HTML/SVG fragment with `<style>` first, visible content next, and `<script>` last. Access the source result with `getToolData()`.
-10. Emit `@@@VIZ-END` on its own line, then continue with any brief explanation for the user.
+3. Use the exact name of the data-producing function. The visualizer selects its latest invocation in the current dialogue.
+4. In a later sequential tool round, call `visualize_tool_result(title="…", source_tool_name="execute_sql")` (replace `execute_sql` with your source function name). Leave `retry_attempt` at its default `0`. YOU MUST CALL THE TOOL, otherwise the visualization will not render.
+5. If the tool returns `status="retry_required"`, call `visualize_tool_result()` exactly once in the next sequential tool round using `retry.arguments` exactly. Reuse the existing source call; never rerun the producer to recover the visualization.
+6. Wait for `visualize_tool_result()` to complete successfully. It mounts an iframe wrapper sandbox in the chat and injects the selected result as `getToolData()`.
+7. Emit `@@@VIZ-START` on its own line.
+8. Emit exactly one HTML/SVG fragment with `<style>` first, visible content next, and `<script>` last. Access the source result with `getToolData()`.
+9. Emit `@@@VIZ-END` on its own line, then continue with any brief explanation for the user.
 
 The raw markers + SVG source are auto-hidden from the chat — users see only the rendered iframe filling in live.
 
@@ -58,15 +57,11 @@ The chart shows the main changes in the completed result.
 - Pre-styled bare-tag form elements (see below) — saves tokens on simple forms
 - Consider making diagrams **conversational** with sendPrompt() — see the "sendPrompt bridge" section further below for patterns and examples
 
-## Source call ID
+## Source tool name
 
-`source_tool_call_id` is required. It is the ID of a completed tool call, not the name of the tool.
+`source_tool_name` is the exact name of the data-producing function, for example `execute_sql`. Preserve its case and any namespace. The visualizer finds the latest invocation and resolves its result internally; call IDs are not needed.
 
-Treat the identifier as an opaque token. Copy it exactly as it appears on the completed source call. Never construct, infer, normalize, shorten, extend, or repair it. Preserve every prefix, separator, and numeric suffix.
-
-For example, if the completed call explicitly contains `tool_call_id = "functions.get_sales:1"`, pass exactly `source_tool_call_id="functions.get_sales:1"`. Do not pass `get_sales`, `get_sales:1`, `function.get_sales:1`, or `functions.get_sales`.
-
-The example demonstrates exact copying only. It does not define a universal ID format. If no explicit `tool_call_id` or `call_id` is available, do not guess one and do not call `visualize_tool_result()`.
+Latest means the last invocation, even when results arrive out of order. If that call is still pending, follow the visualizer's single retry instead of using an older result. Finish the producer call before calling the visualizer in a subsequent tool round.
 
 ## Result handling
 
@@ -78,11 +73,11 @@ const data = getToolData();
 
 The value is already parsed when possible: JSON strings become objects, arrays, scalars, or `null`, while ordinary text remains a string. Do not call `JSON.parse()` unless the producer intentionally returned JSON encoded inside another string. Do not reproduce the producer result in the tool arguments, generated HTML, generated JavaScript, or another model-generated JSON object.
 
-Each visualization accepts exactly one `source_tool_call_id`. If the visualization requires several related datasets, have one producer call return them together as a combined result.
+Each visualization uses the latest result for one `source_tool_name`. If the visualization requires several related datasets, have one producer call return them together as a combined result.
 
 Never call the producer and `visualize_tool_result()` in the same parallel batch. The result is unavailable until the producer call has finished and Open WebUI has recorded it. If the provider batches them despite this rule, follow the returned `retry.arguments` in the next round.
 
-`retry_required` is a bounded visualization retry, not a request for fresh data. Call only `visualize_tool_result()` with the supplied arguments. If that retry returns `Tool result not found`, stop visualization recovery and report that the existing result could not be resolved. For `Invalid source_tool_call_id`, re-read the explicit ID attached to the completed source call; never construct or repair it.
+`retry_required` is a bounded visualization retry, not a request for fresh data. Call only `visualize_tool_result()` with the supplied arguments. If that retry returns `Tool result not found`, stop visualization recovery and report that the existing result could not be resolved. For `Invalid source_tool_name`, use the exact non-empty name of the data-producing function.
 
 ## Dense line and scatter data
 

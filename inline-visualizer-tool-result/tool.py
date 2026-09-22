@@ -3,21 +3,22 @@ title: Inline Visualizer — Tool Result
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 1.1.12
+version: 1.2.0
 required_open_webui_version: 0.10.2
-description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Requires the source call's exact ID and sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
+description: Renders the result of one completed tool call as an interactive HTML/SVG visualization. Selects the latest call by source tool name and requires sequential execution. Requires "iframe Sandbox Allow Same Origin" to be enabled in Open WebUI Settings -> Interface. The model must call view_skill("visualize-tool-result") before use.
 """
 
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Any, Literal
 
 # Build marker embedded into the rendered iframe so the running
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "tool-result-1.1.12"
+_IV_BUILD = "tool-result-1.2.0"
 
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -53,59 +54,106 @@ def _extract_text_content(content: Any) -> Any:
     return "".join(text_parts)
 
 
-def _find_output_tool_result(
-    output: list[dict[str, Any]], tool_call_id: str
-) -> tuple[bool, Any]:
-    """Find the newest matching Open WebUI function_call_output item."""
-    for item in reversed(output):
-        if (
-            isinstance(item, dict)
-            and item.get("type") == "function_call_output"
-            and str(item.get("call_id") or "") == tool_call_id
-            and item.get("status")
-            not in ("in_progress", "pending", "queued", "requires_approval")
-        ):
-            return True, _normalize_tool_result(
-                _extract_text_content(item.get("output"))
+@dataclass
+class _SourceCall:
+    name: str
+    call_id: str
+    has_result: bool = False
+    result: Any = None
+
+
+def _read_tool_calls(items: list[dict[str, Any]]) -> list[_SourceCall]:
+    """Join calls and results within one message, preserving invocation order."""
+    calls = []
+    by_id = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        is_tool_message = item.get("role") == "tool"
+        if kind == "function_call":
+            call = _SourceCall(
+                name=str(item.get("name") or ""),
+                call_id=str(item.get("call_id") or item.get("id") or ""),
             )
-    return False, None
+            calls.append(call)
+            if call.call_id:
+                by_id[call.call_id] = call
+        elif kind == "function_call_output" or is_tool_message:
+            call_id = str(
+                item.get("tool_call_id" if is_tool_message else "call_id") or ""
+            )
+            call = by_id.get(call_id) if call_id else None
+            if call is None:
+                # Some adapters retain only named result messages. An unnamed
+                # result may still complete a known call in another snapshot.
+                call = _SourceCall(str(item.get("name") or ""), call_id)
+                calls.append(call)
+                if call_id:
+                    by_id[call_id] = call
+            key = "content" if is_tool_message else "output"
+            call.has_result = key in item and item.get("status") not in (
+                "in_progress", "pending", "queued", "requires_approval"
+            )
+            call.result = (
+                _normalize_tool_result(_extract_text_content(item[key]))
+                if call.has_result else None
+            )
+    return calls
 
 
-def _find_message_tool_result(
-    messages: list[dict[str, Any]], tool_call_id: str
-) -> tuple[bool, Any]:
-    """Find the newest matching result anywhere in the current dialogue."""
-    for message in reversed(messages):
+def _message_tool_scopes(
+    messages: list[dict[str, Any]],
+) -> list[tuple[str, list[_SourceCall]]]:
+    """Keep assistant turns separate so recycled call IDs cannot cross turns."""
+    scopes = []
+    message_id = ""
+    items = []
+    for message in messages:
         if not isinstance(message, dict):
             continue
+        if message.get("type") in ("function_call", "function_call_output"):
+            items.append(message)
+        elif message.get("role") == "tool":
+            items.append(message)
+        else:
+            if items:
+                scopes.append((message_id, _read_tool_calls(items)))
+            message_id = str(message.get("id") or "")
+            output = message.get("output")
+            items = list(output) if isinstance(output, list) else []
+            tool_calls = message.get("tool_calls")
+            if message.get("role") == "assistant" and isinstance(tool_calls, list):
+                # Saved Responses output is authoritative when both formats
+                # expose the same call on the assistant message.
+                output_ids = {
+                    str(item.get("call_id") or item.get("id") or "")
+                    for item in items
+                    if isinstance(item, dict) and item.get("type") == "function_call"
+                }
+                declarations = []
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    call_id = str(call.get("id") or "")
+                    if call_id and call_id in output_ids:
+                        continue
+                    declarations.append({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": function.get("name"),
+                    })
+                items = declarations + items
+    if items:
+        scopes.append((message_id, _read_tool_calls(items)))
+    return scopes
 
-        # Some Open WebUI versions expose saved Responses API items on the
-        # assistant message instead of converting them to role="tool" messages.
-        output = message.get("output")
-        if isinstance(output, list):
-            found, result = _find_output_tool_result(output, tool_call_id)
-            if found:
-                return True, result
 
-        # Other adapters pass Responses API output items directly.
-        if (
-            message.get("type") == "function_call_output"
-            and str(message.get("call_id") or "") == tool_call_id
-            and message.get("status")
-            not in ("in_progress", "pending", "queued", "requires_approval")
-        ):
-            return True, _normalize_tool_result(
-                _extract_text_content(message.get("output"))
-            )
-
-        if (
-            message.get("role") == "tool"
-            and str(message.get("tool_call_id") or "") == tool_call_id
-        ):
-            return True, _normalize_tool_result(
-                _extract_text_content(message.get("content"))
-            )
-    return False, None
+def _latest_named_call(calls: list[_SourceCall], name: str) -> _SourceCall | None:
+    return next((call for call in reversed(calls) if call.name == name), None)
 
 
 async def _load_current_message_outputs(
@@ -151,15 +199,43 @@ async def _load_current_message_outputs(
 
 
 async def _resolve_tool_result(
-    tool_call_id: str, __request__, __metadata__, __messages__
+    tool_name: str, __request__, __metadata__, __messages__
 ) -> tuple[bool, Any]:
-    for output in await _load_current_message_outputs(__request__, __metadata__):
-        found, result = _find_output_tool_result(output, tool_call_id)
-        if found:
-            return True, result
-
+    snapshots = [
+        _read_tool_calls(output)
+        for output in await _load_current_message_outputs(__request__, __metadata__)
+    ]
     messages = __messages__ if isinstance(__messages__, list) else []
-    return _find_message_tool_result(messages, tool_call_id)
+    scopes = _message_tool_scopes(messages)
+    metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+    message_id = str(
+        metadata.get("message_id") or metadata.get("assistant_message_id") or ""
+    )
+    for calls in snapshots:
+        selected = _latest_named_call(calls, tool_name)
+        if selected is None:
+            continue
+        # A known pending call blocks older calls with the same name. Other
+        # snapshots can supply only this call's result in the same message.
+        if selected.call_id:
+            same_message = [
+                calls for scope_id, calls in reversed(scopes)
+                if message_id and scope_id == message_id
+            ]
+            for candidates in snapshots + same_message:
+                match = next((
+                    call for call in reversed(candidates)
+                    if call.call_id == selected.call_id
+                ), None)
+                if match and match.name in ("", tool_name) and match.has_result:
+                    return True, match.result
+        return selected.has_result, selected.result
+
+    for _, calls in reversed(scopes):
+        selected = _latest_named_call(calls, tool_name)
+        if selected is not None:
+            return selected.has_result, selected.result
+    return False, None
 
 
 def _safe_json_for_html(value: Any) -> str:
@@ -5252,7 +5328,7 @@ class Tools:
 
     async def visualize_tool_result(
         self,
-        source_tool_call_id: str,
+        source_tool_name: str,
         title: str = "Tool Result Visualization",
         retry_attempt: Literal[0, 1] = 0,
         __messages__=None,
@@ -5271,7 +5347,7 @@ class Tools:
         Never use it for an ordinary visualization; use visualize() for that workflow.
         The data-producing call MUST finish before this tool is called. Never place the producer and visualize_tool_result() in the same parallel tool batch.
         If this tool returns status="retry_required", call visualize_tool_result exactly once in the next tool round using retry.arguments exactly. Reuse the existing source call; never rerun the data-producing tool to recover a visualization.
-        Copy source_tool_call_id character-for-character from the completed source call's explicit tool_call_id or call_id. It is a call ID, not a tool name. Never construct, shorten, normalize, or repair it.
+        Pass the exact function name as source_tool_name. The visualizer selects its latest invocation in the current dialogue and resolves the result internally. If that invocation is pending, retry instead of using an older result.
 
         IMPORTANT:
         BEFORE CALLING THIS TOOL, YOU MUST call view_skill("visualize-tool-result") first.
@@ -5295,29 +5371,29 @@ class Tools:
         - Read the selected result with getToolData(). Never reproduce it as a JavaScript literal.
         - Do not describe the HTML/SVG source to the user. Describe what the visualization shows.
 
-        :param source_tool_call_id: Required complete tool_call_id/call_id copied character-for-character from the completed source tool call. Preserve every prefix, separator, and numeric suffix. This is a call ID, not a tool name; never construct or modify it.
+        :param source_tool_name: Required exact name of the data-producing function (case-sensitive), for example execute_sql. Selects its latest invocation in the current dialogue; no call ID is needed.
         :param title: Short descriptive title for the visualization.
         :param retry_attempt: Retry control. Leave at 0 for the initial call. Set to 1 only when a prior retry_required result supplies retry.arguments.
         :return: Interactive rich embed rendered in the chat, with LLM context.
         """
-        if not isinstance(source_tool_call_id, str) or not source_tool_call_id.strip():
+        if not isinstance(source_tool_name, str) or not source_tool_name.strip():
             return {
                 "status": "error",
-                "error": "Invalid source_tool_call_id",
-                "source_tool_call_id": source_tool_call_id,
-                "message": "Copy the complete call_id from the completed source tool call.",
+                "error": "Invalid source_tool_name",
+                "source_tool_name": source_tool_name,
+                "message": "Pass the exact non-empty name of the data-producing function.",
             }
 
         if retry_attempt not in (0, 1):
             return {
                 "status": "error",
                 "error": "Invalid retry_attempt",
-                "source_tool_call_id": source_tool_call_id,
+                "source_tool_name": source_tool_name,
                 "message": "Use retry_attempt=0 initially or the retry_attempt=1 value supplied by a retry_required result.",
             }
 
         has_tool_data, tool_result = await _resolve_tool_result(
-            source_tool_call_id, __request__, __metadata__, __messages__
+            source_tool_name, __request__, __metadata__, __messages__
         )
 
         if not has_tool_data:
@@ -5325,7 +5401,7 @@ class Tools:
                 return {
                     "status": "retry_required",
                     "code": "source_result_not_visible_yet",
-                    "source_tool_call_id": source_tool_call_id,
+                    "source_tool_name": source_tool_name,
                     "message": (
                         "Call visualize_tool_result exactly once in the next "
                         "sequential tool round using retry.arguments exactly. "
@@ -5335,7 +5411,7 @@ class Tools:
                     "retry": {
                         "tool": "visualize_tool_result",
                         "arguments": {
-                            "source_tool_call_id": source_tool_call_id,
+                            "source_tool_name": source_tool_name,
                             "title": title,
                             "retry_attempt": 1,
                         },
@@ -5344,11 +5420,11 @@ class Tools:
             return {
                 "status": "error",
                 "error": "Tool result not found",
-                "source_tool_call_id": source_tool_call_id,
+                "source_tool_name": source_tool_name,
                 "message": (
                     "The single visualization retry could not find a completed "
-                    "tool result with this exact ID. Verify the ID against the "
-                    "existing source call; do not rerun the data-producing tool "
+                    "result for the latest call of this tool name. Verify the "
+                    "function name; do not rerun the data-producing tool "
                     "solely to recover the visualization."
                 ),
             }
@@ -5359,7 +5435,7 @@ class Tools:
             return {
                 "status": "error",
                 "error": "Tool result cannot be serialized",
-                "source_tool_call_id": source_tool_call_id,
+                "source_tool_name": source_tool_name,
                 "detail": str(exc),
             }
 
