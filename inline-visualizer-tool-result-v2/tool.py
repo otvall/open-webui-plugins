@@ -3,7 +3,7 @@ title: Inline Visualizer
 author: Classic298
 author_url: https://github.com/Classic298
 funding_url: https://github.com/Classic298
-version: 3.0.0
+version: 3.1.0
 required_open_webui_version: 0.11.1
 description: Shows a loading embed, generates a complete visualization in an internal model call, then replaces the embed. Requires Native tool calling, a saved chat, and "iframe Sandbox Allow Same Origin" in Open WebUI Settings -> Interface. For design instructions, call view_skill("visualize").
 """
@@ -27,7 +27,7 @@ from typing import Literal
 # version can be verified at runtime (search DevTools for
 # `data-iv-build` on <html>).  Bump on every protocol-level change
 # so stale cached iframes can be spotted immediately.
-_IV_BUILD = "3.0.0"
+_IV_BUILD = "3.1.0"
 
 log = logging.getLogger(__name__)
 _IV_GENERATION_ACTIVE = ContextVar("iv_generation_active", default=False)
@@ -397,61 +397,6 @@ def _extract_text_content(content: Any) -> Any:
     return "".join(text_parts)
 
 
-def _find_output_tool_result(
-    output: list[dict[str, Any]], tool_call_id: str
-) -> tuple[bool, Any]:
-    """Find the newest matching Open WebUI function_call_output item."""
-    for item in reversed(output):
-        if (
-            isinstance(item, dict)
-            and item.get("type") == "function_call_output"
-            and str(item.get("call_id") or "") == tool_call_id
-            and item.get("status")
-            not in ("in_progress", "pending", "queued", "requires_approval")
-        ):
-            return True, _normalize_tool_result(
-                _extract_text_content(item.get("output"))
-            )
-    return False, None
-
-
-def _find_message_tool_result(
-    messages: list[dict[str, Any]], tool_call_id: str
-) -> tuple[bool, Any]:
-    """Find the newest matching result anywhere in the current dialogue."""
-    for message in reversed(messages):
-        if not isinstance(message, dict):
-            continue
-
-        # Some Open WebUI versions expose saved Responses API items on the
-        # assistant message instead of converting them to role="tool" messages.
-        output = message.get("output")
-        if isinstance(output, list):
-            found, result = _find_output_tool_result(output, tool_call_id)
-            if found:
-                return True, result
-
-        # Other adapters pass Responses API output items directly.
-        if (
-            message.get("type") == "function_call_output"
-            and str(message.get("call_id") or "") == tool_call_id
-            and message.get("status")
-            not in ("in_progress", "pending", "queued", "requires_approval")
-        ):
-            return True, _normalize_tool_result(
-                _extract_text_content(message.get("output"))
-            )
-
-        if (
-            message.get("role") == "tool"
-            and str(message.get("tool_call_id") or "") == tool_call_id
-        ):
-            return True, _normalize_tool_result(
-                _extract_text_content(message.get("content"))
-            )
-    return False, None
-
-
 async def _load_current_message_outputs(
     __request__, __metadata__
 ) -> list[list[dict[str, Any]]]:
@@ -494,51 +439,89 @@ async def _load_current_message_outputs(
     return candidates
 
 
-def _contains_call_id(items, tool_call_id):
-    """An existing exact call, even pending, must never alias another call."""
-    for item in items:
-        if not isinstance(item, dict):
+def _source_items(messages):
+    """Normalize Native Responses and Chat Completions history in source order."""
+    for message in messages:
+        if not isinstance(message, dict):
             continue
-        if item.get("type") in ("function_call", "function_call_output") and item.get("call_id") == tool_call_id:
-            return True
-        if item.get("role") == "tool" and item.get("tool_call_id") == tool_call_id:
-            return True
-        calls = item.get("tool_calls")
-        if isinstance(calls, list) and any(isinstance(call, dict) and call.get("id") == tool_call_id for call in calls):
-            return True
-        output = item.get("output")
-        if isinstance(output, list) and _contains_call_id(output, tool_call_id):
-            return True
-    return False
+        if message.get("type") in ("function_call", "function_call_output"):
+            yield message
+        output = message.get("output")
+        if isinstance(output, list) and message.get("type") != "function_call_output":
+            yield from _source_items(output)
+        for call in message.get("tool_calls") or []:
+            if isinstance(call, dict) and isinstance(call.get("function"), dict):
+                yield {"type": "function_call", "call_id": call.get("id"),
+                       "name": call["function"].get("name")}
+        if message.get("role") == "tool":
+            yield {"type": "function_call_output", "call_id": message.get("tool_call_id"),
+                   "name": message.get("name"), "status": message.get("status"),
+                   "output": message.get("content")}
 
 
-async def _resolve_tool_result_with_id(
-    tool_call_id: str, __request__, __metadata__, __messages__
+def _is_tool_error_result(data):
+    """Recover OWUI 0.11.1 error markers when role=tool history loses status."""
+    if not isinstance(data, dict):
+        return False
+
+    def has_message(value):
+        return bool(value.strip()) if isinstance(value, str) else (
+            isinstance(value, (dict, list)) and bool(value)
+        )
+
+    if has_message(data.get("error")):
+        return True
+    status = data.get("status")
+    if isinstance(status, str) and status.strip().lower() in ("error", "failed"):
+        return True
+    return (data.get("success") is False or data.get("ok") is False) and has_message(data.get("message"))
+
+
+async def _resolve_latest_tool_result(
+    tool_name: str, __request__, __metadata__, __messages__
 ) -> tuple[bool, Any, str]:
+    """Select the newest completed JSON result by exact tool name; pin its ID."""
     outputs = await _load_current_message_outputs(__request__, __metadata__)
     messages = __messages__ if isinstance(__messages__, list) else []
+    # Live output takes precedence over stored snapshots, then prior messages
+    # supplied by Open WebUI for this conversation branch.
+    sources = [list(_source_items(items)) for items in [*outputs, messages]]
+    names = {}
+    for items in sources:
+        for item in reversed(items):
+            call_id, name = item.get("call_id"), item.get("name")
+            if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
+                names.setdefault(call_id, name)
 
-    def find(candidate):
-        for output in outputs:
-            found, result = _find_output_tool_result(output, candidate)
-            if found:
-                return True, result, candidate
-        found, result = _find_message_tool_result(messages, candidate)
-        return found, result, candidate
-
-    # Search ALL sources exactly before trying the sole supported correction.
-    resolved = find(tool_call_id)
-    if resolved[0]:
-        return resolved
-    if not tool_call_id.startswith("functions.") and not any(
-        _contains_call_id(items, tool_call_id) for items in [*outputs, messages]
-    ):
-        candidate = "functions." + tool_call_id
-        resolved = find(candidate)
-        if resolved[0]:
-            return resolved
-    # No fuzzy/suffix/tool-name matching, no stripping other namespaces.
-    return False, None, tool_call_id
+    seen = set()
+    for items in sources:
+        for item in reversed(items):
+            if item.get("type") != "function_call_output":
+                continue
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id or call_id in seen:
+                continue
+            # Even an unfinished/failed live result masks a stale saved copy.
+            seen.add(call_id)
+            if names.get(call_id) != tool_name or item.get("status") not in (None, "completed"):
+                continue
+            output = item.get("output")
+            if isinstance(output, list) and any(
+                isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text")
+                for part in output
+            ):
+                output = _extract_text_content(output)
+            data = _normalize_tool_result(output)
+            if not isinstance(data, (dict, list)):
+                continue
+            if item.get("status") is None and _is_tool_error_result(data):
+                continue
+            try:
+                json.dumps(data, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError):
+                continue
+            return True, data, call_id
+    return False, None, ""
 
 
 # ---------------------------------------------------------------------------
@@ -1323,16 +1306,19 @@ function _ivToolDataError(message) {
 function _ivParseToolData(output) {
   if (typeof output === 'string') return JSON.parse(output);
   if (Array.isArray(output)) {
-    if (output.length === 1 && output[0] &&
-        typeof output[0].text === 'string') {
-      return JSON.parse(output[0].text);
+    function isTextPart(part) {
+      return part && ['text', 'input_text', 'output_text'].indexOf(part.type) !== -1;
     }
-    // A direct JSON array is already parsed. Multiple content blocks are
-    // ambiguous, so require one text result instead of silently dropping data.
-    if (!output.some(function(part) { return part && typeof part.text === 'string'; })) {
-      return output;
+    // Match the server's typed content extraction. An ordinary data row can
+    // have a text column without being a protocol content block.
+    if (output.some(isTextPart)) {
+      return JSON.parse(output.map(function(part) {
+        if (typeof part === 'string') return part;
+        if (isTextPart(part)) return part.text === undefined ? '' : String(part.text);
+        return '';
+      }).join(''));
     }
-    throw new Error('tool output contains multiple text blocks');
+    return output;
   }
   if (output && typeof output === 'object') return output;
   throw new Error('tool output is not JSON');
@@ -1342,8 +1328,23 @@ function _ivFindToolOutput(chat, callId) {
   var messages = chat && chat.chat && chat.chat.history &&
                  chat.chat.history.messages;
   if (!messages || typeof messages !== 'object') return null;
+  var messageId = document.documentElement.getAttribute('data-iv-message-id');
+  var branch = [];
+  if (messageId) {
+    var visited = Object.create(null);
+    while (messageId) {
+      if (visited[messageId]) throw new Error('chat branch contains a cycle');
+      visited[messageId] = true;
+      if (!messages[messageId]) return null;
+      branch.push(messageId);
+      messageId = messages[messageId].parentId;
+    }
+  } else {
+    // Compatibility for documents built without a containing message ID.
+    branch = Object.keys(messages);
+  }
   var matches = [];
-  Object.keys(messages).forEach(function(messageId) {
+  branch.forEach(function(messageId) {
     var items = messages[messageId] && messages[messageId].output;
     if (!Array.isArray(items)) return;
     items.forEach(function(item) {
@@ -2750,6 +2751,7 @@ def _build_html(
     chime: bool = True,
     source_tool_call_id: str = "",
     visualization_id: str = "",
+    message_id: str = "",
 ) -> str:
     """Wrap a completed HTML/SVG fragment in the visualization runtime."""
     csp_tag = _build_csp_tag(security_level)
@@ -2763,6 +2765,7 @@ def _build_html(
         .replace('"', "&quot;")
     )
     safe_call_id = html.escape(source_tool_call_id, quote=True)
+    safe_message_id = html.escape(message_id, quote=True)
     safe_visualization_id = html.escape(visualization_id, quote=True)
     # Sanitize lang to a simple lowercase BCP-47 primary subtag.
     # Split on '-' first so "zh-CN" → "zh", not "zhcn".
@@ -2790,6 +2793,7 @@ def _build_html(
     return (
         f'<!DOCTYPE html><html data-iv-lang="{safe_lang}" data-iv-build="{_IV_BUILD}" '
         f'data-iv-visualization-id="{safe_visualization_id}" '
+        f'data-iv-message-id="{safe_message_id}" '
         f'data-iv-source-tool-call-id="{safe_call_id}"><head>'
         f"<title>{safe_title}</title>"
         f"{csp_tag}"
@@ -2869,7 +2873,7 @@ class Tools:
 
     async def visualize(
         self,
-        source_tool_call_id: str,
+        source_tool_name: str,
         title: str = "Visualization",
         __messages__=None,
         __request__=None,
@@ -2882,14 +2886,17 @@ class Tools:
         """Show a loading visualization, then replace it with complete HTML.
 
         Use only for an explicit visual request and only after calling
-        view_skill("visualize"). Copy the exact ID of a completed JSON-producing
-        Native tool call in this saved chat. Do not pass HTML or copied data.
+        view_skill("visualize"). Pass the exact name of the JSON-producing Native
+        tool you called, not its call ID. This tool selects that tool's latest
+        successfully completed JSON result in the current conversation branch.
+        To plot a different query, run that query last before calling visualize.
+        Do not pass HTML or copied data.
         This tool validates the source, publishes a loading embed, generates the
         full HTML/SVG fragment through the selected model, and replaces the same
         embed with the result or an error. After success, briefly explain what
         the visualization shows; never output HTML or VIZ markers in chat.
 
-        :param source_tool_call_id: Exact ID of the completed JSON tool result.
+        :param source_tool_name: Exact name of the tool whose latest completed JSON result to plot (for example, run_sql).
         :param title: Short title for the visualization.
         """
         metadata = __metadata__ if isinstance(__metadata__, dict) else {}
@@ -2897,13 +2904,13 @@ class Tools:
         def failure(message):
             return {
                 "status": "error",
-                "source_tool_call_id": source_tool_call_id,
+                "source_tool_name": source_tool_name,
                 "message": message,
                 "retryable": False,
             }
 
-        if not isinstance(source_tool_call_id, str) or not source_tool_call_id.strip():
-            return failure("source_tool_call_id must be a non-empty tool call ID")
+        if not isinstance(source_tool_name, str) or not source_tool_name.strip():
+            return failure("source_tool_name must be a non-empty tool name")
         if not isinstance(title, str) or not title.strip() or len(title) > 300:
             return failure("title must be a short non-empty string")
         request_metadata = getattr(getattr(__request__, "state", None), "metadata", None)
@@ -2932,11 +2939,11 @@ class Tools:
         if not isinstance(model_id, str) or not model_id:
             return failure("Choose a server-side model or set generation_model_id")
 
-        found, data, resolved_source_id = await _resolve_tool_result_with_id(
-            source_tool_call_id, __request__, metadata, __messages__
+        found, data, resolved_source_id = await _resolve_latest_tool_result(
+            source_tool_name, __request__, metadata, __messages__
         )
         if not found:
-            return failure("Completed source tool result was not found; verify the exact call ID")
+            return failure("Completed JSON source result was not found for this tool name; call the data tool first and pass its exact name")
         if not isinstance(data, (dict, list)):
             return failure("Source tool result must be a JSON object or array")
         try:
@@ -2997,6 +3004,7 @@ class Tools:
                 chime=self.valves.chime,
                 source_tool_call_id=resolved_source_id,
                 visualization_id=visualization_id,
+                message_id=str(metadata.get("message_id") or metadata.get("assistant_message_id")),
             )
         except asyncio.CancelledError:
             try:

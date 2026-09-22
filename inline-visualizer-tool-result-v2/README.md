@@ -4,21 +4,21 @@ Turn a JSON result from a Native tool call into a single interactive chart with 
 
 ## How it works
 
-1. A JSON-producing tool finishes. The assistant reads `view_skill("visualize")` and calls `visualize(source_tool_call_id="<exact call ID>", title="…")`.
-2. `visualize` checks the call ID and result before spending tokens on HTML generation. It publishes a loading embed in the current message.
+1. A JSON-producing tool finishes. The assistant reads `view_skill("visualize")` and calls `visualize(source_tool_name="<exact tool name>", title="…")`.
+2. `visualize` finds the named tool’s latest successfully completed JSON result in the current conversation branch before spending tokens on HTML generation. It publishes a loading embed in the current message.
 3. The tool sends the available conversation and selected result to the chat model, or to the model configured in `generation_model_id`. It requests one complete HTML/SVG fragment with `stream=False`.
 4. The tool replaces the loading embed with a complete iframe. The iframe loads the original JSON through `getToolData()` and displays the chart after its initial scripts and data have loaded. An error replaces the loader if generation or browser rendering fails.
 5. The assistant briefly describes the finished chart in ordinary text. It does not emit HTML or visualization markers.
 
 Each visualization contains one plotting area, which may show multiple curves or series. Hover tooltips, zoom, and legend toggles are allowed; dashboards, data tables, filters, and extra panels are excluded. The runtime retains its download controls and loading/error feedback.
 
-The result is selected by exact tool call ID. The model sees the selected JSON while designing the chart, but the data is not copied into generated HTML. The iframe reads it from the saved chat when it mounts.
+The assistant supplies the exact callable tool name, not a call ID. The server selects the latest eligible result and pins its real call ID in the embed, so later calls do not change an existing chart. The model sees the selected JSON while designing the chart, but the data is not copied into generated HTML. The iframe reads it from the saved chat when it mounts.
 
 ### Example request
 
 > Run the SQL query for daily revenue and plot its result as a line chart.
 
-The assistant calls the SQL tool, then `visualize(source_tool_call_id="<SQL call ID>", title="Daily revenue")`. The tool handles generation and display. For another chart, call `visualize` again with the relevant result ID. Calls should be sequential so each loader and final embed has its own place in the message.
+If the SQL tool is named `run_sql`, the assistant calls it and then calls `visualize(source_tool_name="run_sql", title="Daily revenue")`. For a chart of a different query, execute that query last before calling `visualize` again. Run each data-tool → visualize pair sequentially. No result-list tool or model-generated call ID is needed.
 
 ## Setup
 
@@ -38,7 +38,9 @@ Requirements: Open WebUI 0.11.1, a saved chat, Native function calling, a JSON-p
 
    These files are hosted separately and are not bundled in this repository. There is no CDN fallback.
 
-The tool call needs the exact ID of a completed JSON result. It checks current conversation messages, the active response stream, and saved message output before it starts the internal model call. If the ID is absent or the result is not a JSON object or array, it returns an error without generating HTML.
+The tool matches the callable name exactly against the current response stream, saved current-message output, and previous messages supplied for the current branch. Repeated snapshots of a call are deduplicated; live output takes precedence. Pending, failed, cancelled, and non-JSON results are skipped. When older tool messages lack a status, Open WebUI's JSON error markers identify failed results; an explicit completed status remains authoritative. If no completed JSON object or array exists for that tool name, it returns an error without generating HTML.
+
+This changes the public argument from `source_tool_call_id` to `source_tool_name`; update both the imported tool and skill. Existing saved embeds retain their original runtime and call-ID binding. New embeds also record their containing message so data lookup follows that message’s branch.
 
 ## Tool settings
 
@@ -83,7 +85,7 @@ A downloaded HTML file includes the current DOM, but a data-driven script that c
 
 ## Troubleshooting
 
-- **No placeholder appears:** save the chat, enable Native function calling, and check that the selected result is a completed JSON tool output with the exact call ID.
+- **No placeholder appears:** save the chat, enable Native function calling, and check that the named data tool has a completed JSON result. Pass its exact callable name, without invented prefixes or suffixes.
 - **The loader turns into an error:** the internal model may have timed out, returned incomplete HTML, or lacked enough context. The tool does not retry automatically.
 - **The final iframe reports unavailable data:** enable **Allow iframe same origin**, keep the chat saved, and confirm the source tool result remains in chat history.
 - **A chart is blank:** give Chart.js canvases an explicitly sized container and use `maintainAspectRatio: false`. Put external library scripts before the script that uses them.
@@ -92,6 +94,6 @@ A downloaded HTML file includes the current DOM, but a data-driven script that c
 
 ## Development
 
-Run `pytest -q` for the tool contract, source-result bridge, embed lifecycle, and CSP checks. [CONTEXT.md](CONTEXT.md) defines the project language; [ADR 0001](docs/adr/0001-generate-visualization-inside-tool.md) records why HTML generation lives inside the tool.
+Run `pytest -q` for the tool contract, source-result bridge, embed lifecycle, and CSP checks. [CONTEXT.md](CONTEXT.md) defines the project language; [ADR 0001](docs/adr/0001-generate-visualization-inside-tool.md) records why HTML generation lives inside the tool, and [ADR 0002](docs/adr/0002-select-latest-result-by-tool-name.md) records source selection by tool name.
 
 Regression tests invoke `Tools.visualize()` with only external Open WebUI services replaced. Browser tests execute the emitted iframe in Chromium, with a simulated chat API and animation clock, and check that errors remain visible after the chart is ready. They use Chromium from `PATH` or the standard Playwright cache; set `IV_TEST_CHROMIUM` to select an executable explicitly. Without Chromium, the browser tests are skipped.

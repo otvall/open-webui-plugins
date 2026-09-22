@@ -133,7 +133,7 @@ def owui(monkeypatch):
 
     env.tool = iv.Tools()
     env.invoke = lambda **kwargs: env.tool.visualize(
-        source_tool_call_id="call_sql", title="Daily revenue",
+        source_tool_name="query", title="Daily revenue",
         __request__=env.request, __metadata__=env.metadata,
         __user__={"id": user.id}, __model__=env.injected_model,
         __messages__=env.messages, __event_emitter__=emit, **kwargs,
@@ -152,7 +152,7 @@ def test_visualize_generates_with_the_skill_and_source_query_from_this_answer(ow
         {"type": "function_call", "call_id": "call_skill", "name": "view_skill", "arguments": '{"name":"visualize"}'},
         {"type": "function_call_output", "call_id": "call_skill", "status": "completed",
          "output": [{"type": "input_text", "text": skill}]},
-        {"type": "function_call", "call_id": "call_visualize", "name": "visualize", "arguments": '{"source_tool_call_id":"call_sql"}'},
+        {"type": "function_call", "call_id": "call_visualize", "name": "visualize", "arguments": '{"source_tool_name":"query"}'},
         {"type": "function_call_output", "call_id": "call_visualize", "status": "in_progress", "output": []},
     ]
     if source == "live":
@@ -183,7 +183,7 @@ def test_visualize_uses_the_chat_model_unless_explicitly_overridden(owui, overri
         "task-model": {"id": "task-model"}, "custom-model": {"id": "custom-model"},
     })
     owui.tool.valves.generation_model_id = override
-    owui.messages.append({"role": "tool", "tool_call_id": "call_sql", "content": '{"rows":[]} '})
+    owui.messages.append({"role": "tool", "name": "query", "tool_call_id": "call_sql", "content": '{"rows":[]} '})
 
     result = run(owui.invoke())
 
@@ -194,7 +194,7 @@ def test_visualize_uses_the_chat_model_unless_explicitly_overridden(owui, overri
 def test_visualize_can_generate_through_a_session_authenticated_connection(owui):
     owui.session_auth = True
     owui.request.state.token = SimpleNamespace(credentials="test-session-token")
-    owui.messages.append({"role": "tool", "tool_call_id": "call_sql", "content": '{"rows":[]}'})
+    owui.messages.append({"role": "tool", "name": "query", "tool_call_id": "call_sql", "content": '{"rows":[]}'})
 
     result = run(owui.invoke())
 
@@ -239,7 +239,7 @@ def chromium():
 ], ids=["script-error", "unhandled-rejection", "load-error-outside-download",
         "ios-download-error", "ios-download-rejection", "chart-error-during-download"])
 def test_visualization_handles_errors_after_the_chart_is_ready(owui, chromium, tmp_path, handler, expected_error):
-    owui.output = [{
+    owui.output = [{"type": "function_call", "call_id": "call_sql", "name": "query"}, {
         "type": "function_call_output", "call_id": "call_sql", "status": "completed",
         "output": [{"type": "input_text", "text": '{"rows":[]}'}],
     }]
@@ -302,15 +302,16 @@ setTimeout(inspectChart, 50);
         assert observed["chartVisible"] is True
 
 
-def test_visualize_contract_and_early_invalid_id():
+def test_visualize_contract_and_early_invalid_name():
     parameters = inspect.signature(iv.Tools.visualize).parameters
-    assert "source_tool_call_id" in parameters
+    assert "source_tool_name" in parameters
+    assert "source_tool_call_id" not in parameters
     assert "title" in parameters
     assert "html_code" not in parameters
     assert "__messages__" in parameters
-    result = run(iv.Tools().visualize(source_tool_call_id=" "))
+    result = run(iv.Tools().visualize(source_tool_name=" "))
     assert result["status"] == "error"
-    assert "source_tool_call_id" in result["message"]
+    assert "source_tool_name" in result["message"]
 
 
 def test_completed_fragment_is_in_embed_after_tool_data_helper():
@@ -320,7 +321,7 @@ def test_completed_fragment_is_in_embed_after_tool_data_helper():
         source_tool_call_id='call_1"><script>alert(1)',
         visualization_id="a" * 32,
     )
-    assert 'data-iv-build="3.0.0"' in document
+    assert 'data-iv-build="3.1.0"' in document
     assert 'data-iv-source-tool-call-id="call_1&quot;&gt;&lt;script&gt;alert(1)"' in document
     assert iv._slot_id(document) == "a" * 32
     assert document.index("function getToolData()") < document.index(fragment)
@@ -359,7 +360,7 @@ def test_visualize_validates_source_then_replaces_placeholder(monkeypatch):
         captured.update(model_id=model_id, messages=messages)
         return '<div id="chart">Chart</div><script>getToolData().then(draw)</script>'
 
-    monkeypatch.setattr(iv, "_resolve_tool_result_with_id", resolve)
+    monkeypatch.setattr(iv, "_resolve_latest_tool_result", resolve)
     monkeypatch.setattr(iv, "_publish_slot", publish)
     monkeypatch.setattr(iv, "_generate_fragment", generate)
     request = SimpleNamespace(state=SimpleNamespace(metadata={}))
@@ -367,13 +368,13 @@ def test_visualize_validates_source_then_replaces_placeholder(monkeypatch):
     messages = [{"role": "system", "content": "Use Russian"},
                 {"role": "user", "content": "Plot x against y"}]
     result = run(iv.Tools().visualize(
-        source_tool_call_id="call_sql", title="Sales",
+        source_tool_name="query", title="Sales",
         __messages__=messages, __request__=request, __metadata__=metadata,
         __user__={"id": "user-1"}, __model__={"id": "main-model"},
         __event_emitter__=lambda _: None,
     ))
     assert result["status"] == "success"
-    assert captured["source"] == "call_sql"
+    assert captured["source"] == "query"
     assert captured["model_id"] == "main-model"
     assert "Plot x against y" in str(captured["messages"])
     assert "Use Russian" in str(captured["messages"])
@@ -389,10 +390,10 @@ def test_visualize_validates_source_then_replaces_placeholder(monkeypatch):
 def test_invalid_source_does_not_start_generation(monkeypatch):
     async def resolve(*args):
         return False, None, "missing"
-    monkeypatch.setattr(iv, "_resolve_tool_result_with_id", resolve)
+    monkeypatch.setattr(iv, "_resolve_latest_tool_result", resolve)
     request = SimpleNamespace(state=SimpleNamespace(metadata={}))
     result = run(iv.Tools().visualize(
-        source_tool_call_id="missing", __messages__=[], __request__=request,
+        source_tool_name="missing", __messages__=[], __request__=request,
         __metadata__={"chat_id": "c", "message_id": "m", "params": {"function_calling": "native"}},
         __user__={"id": "u"}, __model__={"id": "main"}, __event_emitter__=lambda _: None,
     ))
@@ -408,12 +409,12 @@ def test_generation_failure_replaces_loading_with_error(monkeypatch):
         documents.append(document)
     async def generate(*args):
         raise ValueError("incomplete response")
-    monkeypatch.setattr(iv, "_resolve_tool_result_with_id", resolve)
+    monkeypatch.setattr(iv, "_resolve_latest_tool_result", resolve)
     monkeypatch.setattr(iv, "_publish_slot", publish)
     monkeypatch.setattr(iv, "_generate_fragment", generate)
     request = SimpleNamespace(state=SimpleNamespace(metadata={}))
     result = run(iv.Tools().visualize(
-        source_tool_call_id="call_sql", __messages__=[{"role": "user", "content": "Chart"}],
+        source_tool_name="query", __messages__=[{"role": "user", "content": "Chart"}],
         __request__=request,
         __metadata__={"chat_id": "c", "message_id": "m", "params": {"function_calling": "native"}},
         __user__={"id": "u"}, __model__={"id": "main"}, __event_emitter__=lambda _: None,
@@ -437,13 +438,13 @@ def test_full_context_over_limit_fails_without_calling_model(monkeypatch):
     async def generate(*args):
         pytest.fail("the model must not receive a shortened conversation")
 
-    monkeypatch.setattr(iv, "_resolve_tool_result_with_id", resolve)
+    monkeypatch.setattr(iv, "_resolve_latest_tool_result", resolve)
     monkeypatch.setattr(iv, "_publish_slot", publish)
     monkeypatch.setattr(iv, "_generate_fragment", generate)
     tool = iv.Tools()
     tool.valves.generation_context_max_chars = 10000
     result = run(tool.visualize(
-        source_tool_call_id="call_sql",
+        source_tool_name="query",
         __messages__=[{"role": "user", "content": "A" * 11000}],
         __request__=SimpleNamespace(state=SimpleNamespace(metadata={})),
         __metadata__={"chat_id": "c", "message_id": "m", "params": {"function_calling": "native"}},
@@ -517,21 +518,72 @@ setImmediate(() => process.stdout.write(JSON.stringify({...state, visibility: co
         assert observed["fallback"] == 1
 
 
-def test_source_resolution_uses_exact_call_id_and_current_output():
-    messages = [{"output": [
-        {"type": "function_call_output", "call_id": "functions.call_sql",
-         "output": [{"type": "input_text", "text": '{"rows":[{"x":1}]}'}]},
-        {"type": "function_call_output", "call_id": "functions.other",
-         "output": [{"type": "input_text", "text": '{"rows":[]}'}]},
-    ]}]
-    found, data, resolved = run(iv._resolve_tool_result_with_id(
-        "call_sql", None, {}, messages,
-    ))
-    assert found is True
-    assert resolved == "functions.call_sql"
-    assert data == {"rows": [{"x": 1}]}
-    found, _, _ = run(iv._resolve_tool_result_with_id("unknown", None, {}, messages))
-    assert found is False
+def source_output(call_id, name, data, status="completed"):
+    return [
+        {"type": "function_call", "call_id": call_id, "name": name},
+        {"type": "function_call_output", "call_id": call_id, "status": status,
+         "output": [{"type": "input_text", "text": json.dumps(data)}]},
+    ]
+
+
+@pytest.mark.parametrize("storage", ["live", "saved", "history", "chat-completions"])
+def test_visualize_resolves_latest_result_by_tool_name_and_pins_real_id(owui, storage):
+    old = source_output("opaque-old", "query", {"rows": [{"y": 1}]})
+    latest = source_output("opaque-latest", "query", {"rows": [{"y": 2}]})
+    unrelated = source_output("opaque-other", "other_query", {"rows": [{"y": 99}]})
+    owui.messages.append({"role": "assistant", "output": old})
+    if storage == "live":
+        owui.saved_message["output"] = old
+        owui.output = old + latest + unrelated
+    elif storage == "saved":
+        owui.saved_message["output"] = latest + unrelated
+    elif storage == "history":
+        owui.messages.append({"role": "assistant", "output": latest + unrelated})
+    else:
+        owui.messages.extend([
+            {"role": "assistant", "tool_calls": [
+                {"id": "opaque-latest", "function": {"name": "query", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "opaque-latest", "content": '{"rows":[{"y":2}]}'},
+            {"role": "tool", "tool_call_id": "opaque-other", "name": "other_query", "content": '{}'},
+        ])
+    result = run(owui.invoke())
+    assert result["status"] == "success"
+    selection = owui.generations[0][1]["messages"][-1]["content"].split("\n", 1)[1]
+    assert json.loads(selection)["selected_source_result"] == {"rows": [{"y": 2}]}
+    assert 'data-iv-source-tool-call-id="opaque-latest"' in owui.events[-1]["data"]["embeds"][0]
+    assert 'data-iv-message-id="message-1"' in owui.events[-1]["data"]["embeds"][0]
+
+
+@pytest.mark.parametrize("status,data", [
+    ("in_progress", {}), ("pending", {}), ("failed", {}), ("cancelled", {}),
+    ("completed", "not a JSON object"), ("completed", float("nan")),
+])
+def test_source_selection_skips_unfinished_failed_and_non_json_results(owui, status, data):
+    owui.output = source_output("good", "query", {"rows": [1]}) + source_output("bad", "query", data, status)
+    # A stale stored copy must not resurrect the invalid newer result.
+    owui.saved_message["output"] = source_output("bad", "query", {"rows": [99]})
+    result = run(owui.invoke())
+    assert result["status"] == "success"
+    assert 'data-iv-source-tool-call-id="good"' in owui.events[-1]["data"]["embeds"][0]
+
+
+@pytest.mark.parametrize("name", ["other_query", "functions.query", "query_1", "call_query_1"])
+def test_source_selection_does_not_guess_names_or_use_other_tools(owui, name):
+    owui.output = source_output("some-id", name, {"rows": []})
+    result = run(owui.invoke())
+    assert result["status"] == "error"
+    assert "not found" in result["message"]
+    assert owui.generations == []
+    assert owui.events == []
+
+
+def test_source_selection_joins_call_names_and_results_across_snapshots(owui):
+    owui.messages.append({"role": "assistant", "tool_calls": [
+        {"id": "opaque", "function": {"name": "query"}}]})
+    owui.output = source_output("opaque", "query", {"rows": []})[1:]
+    result = run(owui.invoke())
+    assert result["status"] == "success"
+    assert 'data-iv-source-tool-call-id="opaque"' in owui.events[-1]["data"]["embeds"][0]
 
 
 def test_publish_slot_replaces_only_its_own_embed(monkeypatch):
@@ -632,7 +684,7 @@ def test_generated_iframe_scripts_parse_in_node():
                            capture_output=True, check=True, timeout=5)
 
 
-def execute_tool_data_helper(chat, call_id="call_sql", path="/c/chat-1", invoke=True):
+def execute_tool_data_helper(chat, call_id="call_sql", path="/c/chat-1", invoke=True, message_id=""):
     if not shutil.which("node"):
         pytest.skip("Node.js is required for the browser helper test")
 
@@ -642,6 +694,7 @@ const vm = require('vm');
 const helper = {json.dumps(helper)};
 const chat = {json.dumps(chat)};
 const callId = {json.dumps(call_id)};
+const messageId = {json.dumps(message_id)};
 const path = {json.dumps(path)};
 const invoke = {json.dumps(invoke)};
 let fetchCount = 0;
@@ -649,7 +702,7 @@ const notices = [];
 const area = {{ parentNode: {{ insertBefore: (notice) => notices.push(notice) }} }};
 const context = {{
   document: {{
-    documentElement: {{ getAttribute: () => callId }},
+    documentElement: {{ getAttribute: (name) => name === "data-iv-message-id" ? messageId : callId }},
     getElementById: (id) => id === 'iv-render' ? area : notices.find((n) => n.id === id),
     createElement: () => ({{ id: '', style: {{}}, setAttribute: () => {{}}, textContent: '' }})
   }},
@@ -753,3 +806,67 @@ def test_source_is_validated_even_when_generated_html_never_calls_helper():
 def test_get_tool_data_requires_saved_chat():
     result = execute_tool_data_helper({}, path="/")
     assert "saved chat" in result["error"]
+
+
+def test_get_tool_data_stays_on_visualization_branch_and_pinned_call():
+    selected = source_output("pinned-id", "query", {"rows": [{"y": 2}]})
+    other = source_output("pinned-id", "query", {"rows": [{"y": 99}]})
+    latest = source_output("later-call", "query", {"rows": [{"y": 3}]})
+    chat = {"chat": {"history": {"currentId": "other-branch", "messages": {
+        "root": {"parentId": None},
+        "selected": {"parentId": "root", "output": selected},
+        "visualization": {"parentId": "selected", "output": []},
+        "later": {"parentId": "visualization", "output": latest},
+        "other-branch": {"parentId": "root", "output": other},
+    }}}}
+    result = execute_tool_data_helper(chat, call_id="pinned-id", message_id="visualization")
+    assert result["second"] == {"rows": [{"y": 2}]}
+
+
+@pytest.mark.parametrize("error", [
+    {"error": "SQL failed"}, {"error": {"message": "SQL failed"}},
+    {"status": "FAILED"}, {"success": False, "message": "SQL failed"},
+    {"ok": False, "message": "SQL failed"},
+])
+@pytest.mark.parametrize("has_earlier_result", [False, True])
+def test_historical_tool_errors_without_status_are_not_source_data(owui, error, has_earlier_result):
+    if has_earlier_result:
+        owui.messages.extend(source_output("good", "query", {"rows": [1]}))
+    owui.messages.extend([
+        {"role": "assistant", "tool_calls": [
+            {"id": "failed", "function": {"name": "query"}}]},
+        {"role": "tool", "tool_call_id": "failed", "content": json.dumps(error)},
+    ])
+    result = run(owui.invoke())
+    if has_earlier_result:
+        assert result["status"] == "success"
+        assert 'data-iv-source-tool-call-id="good"' in owui.events[-1]["data"]["embeds"][0]
+    else:
+        assert result["status"] == "error"
+        assert owui.generations == []
+        assert owui.events == []
+
+
+def test_explicit_completed_status_preserves_data_with_error_fields(owui):
+    owui.output = source_output("good", "query", {"error": "Measurement error", "value": 2})
+    assert run(owui.invoke())["status"] == "success"
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ([{"text": "hello", "value": 1}], [{"text": "hello", "value": 1}]),
+    ([{"text": "hello"}, {"text": "world"}], [{"text": "hello"}, {"text": "world"}]),
+    ([{"type": "input_text", "text": '{"values":'},
+      {"type": "input_text", "text": '[1]}'}], {"values": [1]}),
+])
+def test_selected_source_payload_parses_identically_in_browser(owui, payload, expected):
+    owui.output = source_output("selected", "query", {})
+    owui.output[-1]["output"] = payload
+    result = run(owui.invoke())
+    assert result["status"] == "success"
+    selection = owui.generations[0][1]["messages"][-1]["content"].split("\n", 1)[1]
+    assert json.loads(selection)["selected_source_result"] == expected
+    chat = {"chat": {"history": {"messages": {
+        "message-1": {"parentId": None, "output": owui.output},
+    }}}}
+    loaded = execute_tool_data_helper(chat, call_id="selected", message_id="message-1")
+    assert loaded.get("second") == expected, loaded

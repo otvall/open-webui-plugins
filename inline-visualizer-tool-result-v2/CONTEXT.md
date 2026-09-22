@@ -8,6 +8,10 @@ This context covers visualizations of JSON results produced by tools in an Open 
 A completed JSON object or array from a tool call in the chat, identified by its exact call ID.
 _Avoid_: Dataset copy, chart data argument
 
+**Source tool**:
+The tool whose latest successfully completed JSON result in the current conversation branch supplies a visualization. To visualize a different query, that query is executed last through the source tool.
+_Avoid_: Guessed call ID, source list
+
 **Visualization**:
 A single chart of a source result embedded in an assistant message, with axes, labels, and a legend. It can contain multiple series and support tooltips, zooming, and toggling series through the legend.
 _Avoid_: Dashboard, data table, streamed markup, raw HTML response

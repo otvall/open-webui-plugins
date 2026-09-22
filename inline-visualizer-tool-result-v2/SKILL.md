@@ -1,6 +1,6 @@
 ---
 name: visualize
-description: Render one interactive chart from a JSON tool result in a saved Open WebUI chat. Call visualize(source_tool_call_id=...) only for explicit chart requests after a Native tool call. Use local Chart.js or Plotly and getToolData() for the source data.
+description: Render one interactive chart from a JSON tool result in a saved Open WebUI chat. Call visualize(source_tool_name=...) only for explicit chart requests after a Native tool call. Use local Chart.js or Plotly and getToolData() for the source data.
 ---
 
 # Inline Visualizer
@@ -9,10 +9,10 @@ A visualization is one chart with axes, labels, and a legend. Multiple curves or
 
 ## Use the tool
 
-1. Identify the exact `tool_call_id` of a completed JSON-producing Native tool call in this saved chat. If no completed JSON result and exact call ID are available, do not call `visualize`.
-2. Call `visualize(source_tool_call_id="…", title="…")`. The tool validates the result, shows a loading placeholder, and asks the selected model to generate the chart using the available conversation and selected result.
+1. Call the Native data tool and wait for its JSON result. Use its exact callable name as `source_tool_name`; do not construct or guess a call ID. If several queries use the same tool, run the query you want to plot last.
+2. Call `visualize(source_tool_name="run_sql", title="…")`, replacing `run_sql` with the exact name of the tool you used. The visualizer selects that tool’s latest successfully completed JSON result in the current conversation branch, validates it, shows a loading placeholder, and generates the chart. It resolves and stores the real call ID internally; no source-list call is needed.
 3. After success, briefly describe the chart in ordinary text. The tool embeds the generated HTML; do not print HTML, code fences, or visualization delimiters in the chat response.
-4. If the tool returns an error, explain it. Do not automatically rerun the source tool or visualization generation. If the user requests separate charts, call the tool sequentially; each visualization still contains one chart.
+4. If the tool returns an error, explain it. Do not retry with invented names or IDs, or automatically rerun failed generation. For a different query, call the data tool with that query before calling `visualize` again. For separate charts, run each data-tool → visualize pair sequentially; each visualization contains one chart.
 
 ## Chart content
 
@@ -58,7 +58,7 @@ Return one complete HTML fragment: `<style>` first, the chart container next, li
 
 `getToolData()` returns a Promise with a fresh parsed JSON copy of the selected source result. Await it before building the chart. Derive series from that result; never copy its rows or arrays into the generated fragment. The internal model sees the available conversation and selected result to choose the fields and chart type.
 
-Data can come from the current answer or an earlier answer in the same saved chat. Open WebUI 0.11.1 needs Native function calling and **Allow iframe same origin** enabled in User Settings → Interface. Data-loading and rendering failures are displayed by the runtime; do not hide exceptions or substitute invented data.
+The latest matching result can come from the current answer or an earlier answer in the current chat branch. Each finished chart stays bound to the selected call ID even after later tool calls. Pending, failed, cancelled, and non-JSON results are skipped; if no eligible result exists, the tool returns an error. To use a different query, execute it last; do not request an older result by ID. Open WebUI 0.11.1 needs Native function calling and **Allow iframe same origin** enabled in User Settings → Interface. Data-loading and rendering failures are displayed by the runtime; do not hide exceptions or substitute invented data.
 
 ## Chart appearance
 

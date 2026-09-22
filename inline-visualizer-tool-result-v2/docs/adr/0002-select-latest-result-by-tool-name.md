@@ -1,0 +1,5 @@
+# Select the latest result by tool name
+
+Models have attempted to invent `source_tool_call_id` values from tool names when asked to visualize a result. `visualize` therefore accepts `source_tool_name` and selects that tool's latest successfully completed JSON result in the current conversation branch. A separate source-list tool was considered and rejected because it adds an unnecessary selection step; to plot a different query, the model executes that query last.
+
+Selection covers current live/saved output and earlier messages supplied for the current branch. Pending, failed, cancelled, and non-JSON results are ineligible. Tool names match exactly, and repeated snapshots of the same call are deduplicated with live output taking precedence. The server resolves the actual call ID and pins it in the embed; browser data loading follows the visualization message's branch and never reselects by tool name. This preserves existing charts when later queries run while replacing the public call-ID requirement introduced in ADR 0001.
