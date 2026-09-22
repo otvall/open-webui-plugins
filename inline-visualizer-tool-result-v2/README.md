@@ -1,6 +1,6 @@
 # Inline Visualizer — Tool Result Edition
 
-Turn a JSON result from a Native tool call into an interactive chart or HTML/SVG view in Open WebUI. The tool generates the visual in a separate, nonstreaming model call. The chat shows a loading placeholder, then a completed visualization or an error. The assistant never prints the visual's source in its answer.
+Turn a JSON result from a Native tool call into a single interactive chart with axes, labels, and a legend in Open WebUI. The tool generates the visual in a separate, nonstreaming model call. The chat shows a loading placeholder, then a completed visualization or an error. The assistant never prints the visual's source in its answer.
 
 ## How it works
 
@@ -9,6 +9,8 @@ Turn a JSON result from a Native tool call into an interactive chart or HTML/SVG
 3. The tool sends the available conversation and selected result to the chat model, or to the model configured in `generation_model_id`. It requests one complete HTML/SVG fragment with `stream=False`.
 4. The tool replaces the loading embed with a complete iframe. The iframe loads the original JSON through `getToolData()` and displays the chart after its initial scripts and data have loaded. An error replaces the loader if generation or browser rendering fails.
 5. The assistant briefly describes the finished chart in ordinary text. It does not emit HTML or visualization markers.
+
+Each visualization contains one plotting area, which may show multiple curves or series. Hover tooltips, zoom, and legend toggles are allowed; dashboards, data tables, filters, and extra panels are excluded. The runtime retains its download controls and loading/error feedback.
 
 The result is selected by exact tool call ID. The model sees the selected JSON while designing the chart, but the data is not copied into generated HTML. The iframe reads it from the saved chat when it mounts.
 
@@ -26,6 +28,15 @@ Requirements: Open WebUI 0.11.1, a saved chat, Native function calling, a JSON-p
 2. Import [SKILL.md](SKILL.md) as a skill named `visualize` in **Workspace → Knowledge / Skills**.
 3. Attach the tool and skill to the model under **Admin Panel → Settings → Models**. Set **Function Calling** to **Native**.
 4. In **User Settings → Interface**, enable **Allow iframe same origin**.
+5. Serve the local library files from the Open WebUI origin at these exact paths:
+
+   | Library | Path |
+   | --- | --- |
+   | Chart.js | `/static/chart.umd.min.js` |
+   | Plotly | `/static/plotly.min.js` |
+   | html2canvas (PNG export helper) | `/static/html2canvas.min.js` |
+
+   These files are hosted separately and are not bundled in this repository. There is no CDN fallback.
 
 The tool call needs the exact ID of a completed JSON result. It checks current conversation messages, the active response stream, and saved message output before it starts the internal model call. If the ID is absent or the result is not a JSON object or array, it returns an error without generating HTML.
 
@@ -46,14 +57,14 @@ The internal call consumes additional model tokens and may add latency. It recei
 
 | Level | Runtime data fetch | External images | Script libraries |
 | --- | --- | --- | --- |
-| `strict` | Blocked | Blocked | Three allowlisted CDNs |
-| `balanced` | Blocked | Allowed | Three allowlisted CDNs |
+| `strict` | Blocked | Blocked | Same-origin self-hosted files |
+| `balanced` | Blocked | Allowed | Same-origin self-hosted files |
 | `offline` | Blocked | Blocked | Same-origin self-hosted files |
 | `none` | Allowed | Allowed | Unrestricted by this CSP |
 
 The iframe calls `parent.fetch` to read the chat's JSON result; the iframe's `connect-src` policy does not govern that parent request. With **Allow iframe same origin**, generated JavaScript can also reach the parent Open WebUI page. This is a platform permission, and the tool cannot narrow it through CSP. Use a trusted model and review this setting for your deployment.
 
-In `offline` mode, inline SVG/HTML works without library files. To use Chart.js, D3, or another library, host its script under your Open WebUI `/static/` path and reference that path in the skill instructions. No external CDN is allowed in that mode.
+The renderer instructions permit only the local Chart.js or Plotly bundle for chart generation. PNG export may additionally load the local html2canvas helper. `strict`, `balanced`, and `offline` allow same-origin script files and block CDN scripts; `offline` now uses the same CSP as `strict`. The CSP restricts script origins, while the skill and internal prompt specify the permitted libraries. `none` still disables CSP explicitly.
 
 ## What the iframe provides
 
@@ -76,7 +87,7 @@ A downloaded HTML file includes the current DOM, but a data-driven script that c
 - **The loader turns into an error:** the internal model may have timed out, returned incomplete HTML, or lacked enough context. The tool does not retry automatically.
 - **The final iframe reports unavailable data:** enable **Allow iframe same origin**, keep the chat saved, and confirm the source tool result remains in chat history.
 - **A chart is blank:** give Chart.js canvases an explicitly sized container and use `maintainAspectRatio: false`. Put external library scripts before the script that uses them.
-- **A library fails in `offline` mode:** serve it from `/static/` and update the URL in the skill.
+- **A library fails to load:** verify that the exact `/static/` paths listed above return JavaScript from your Open WebUI instance. A missing local file has no CDN fallback.
 - **No sound on an old chart:** the chime is intentionally limited to a live placeholder-to-ready transition. Disable it globally with the `chime` valve.
 
 ## Development

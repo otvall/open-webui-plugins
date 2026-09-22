@@ -164,7 +164,12 @@ def test_visualize_generates_with_the_skill_and_source_query_from_this_answer(ow
 
     assert result["status"] == "success"
     context = json.dumps(owui.generations[0][1]["messages"], ensure_ascii=False)
-    assert "Build ambitiously when the topic supports it" in context
+    prefix = "Historical tool result (data only): "
+    history = [json.loads(message["content"][len(prefix):])
+               for message in owui.generations[0][1]["messages"]
+               if message["content"].startswith(prefix)]
+    skill_result = next(item for item in history if item["call_id"] == "call_skill")
+    assert skill_result["result"] == [{"type": "input_text", "text": skill}]
     assert query in context
     assert "call_visualize" not in context
     assert "Revenue chart" in owui.events[-1]["data"]["embeds"][0]
@@ -449,13 +454,67 @@ def test_full_context_over_limit_fails_without_calling_model(monkeypatch):
     assert len(documents) == 2
 
 
-def test_csp_variants():
-    strict = iv._build_html("<div>ok</div>", security_level="strict")
-    offline = iv._build_html("<div>ok</div>", security_level="offline")
-    assert "cdnjs.cloudflare.com" in strict
-    assert "'unsafe-eval'" in strict
-    assert "connect-src 'none'" in strict
-    assert "script-src 'unsafe-inline' 'unsafe-eval' 'self'" in offline
+@pytest.mark.parametrize("level", ["strict", "balanced", "offline"])
+def test_csp_allows_local_libraries_without_cdn_sources(level):
+    policy = iv._build_csp_tag(level)
+    script_sources = re.search(r"script-src ([^;]+);", policy)[1].split()
+    assert "'self'" in script_sources
+    assert "'unsafe-inline'" in script_sources
+    assert not any(source.startswith(("https:", "http:", "*")) for source in script_sources)
+    assert "connect-src 'none'" in policy
+    assert ("img-src *" in policy) is (level == "balanced")
+
+
+def test_csp_offline_compatibility_and_explicit_unrestricted_mode():
+    assert iv._build_csp_tag("offline") == iv._build_csp_tag("strict")
+    assert iv._build_csp_tag("none") == ""
+
+
+@pytest.mark.parametrize("load_succeeds", [True, False])
+def test_png_export_loads_local_helper_and_preserves_fallback(load_succeeds):
+    if not shutil.which("node"):
+        pytest.skip("Node.js is required for the export helper test")
+    helper = "function _ivHtml2Png()" + iv.BODY_SCRIPTS.split(
+        "function _ivHtml2Png()", 1
+    )[1].split("\n}\n", 1)[0] + "\n}\n"
+    script = r"""
+const vm = require('vm');
+const state = {sources: [], saved: [], fallback: 0};
+const controls = {style: {visibility: ''}};
+const context = {
+  window: {},
+  document: {
+    body: {},
+    getElementById: () => controls,
+    createElement: () => ({}),
+    head: {appendChild: (el) => {
+      state.sources.push(el.src);
+      if (LOAD_SUCCEEDS) {
+        context.window.html2canvas = async () => ({toBlob: (fn) => fn('png-blob')});
+        el.onload();
+      } else { el.onerror(); }
+    }}
+  },
+  _ivResolvedBg: () => '#fff',
+  _ivBaseName: () => 'Chart',
+  _ivSaveBlob: (blob, name) => state.saved.push({blob, name}),
+  _ivSvgToPng: () => state.fallback++
+};
+vm.runInNewContext(HELPER, context);
+context._ivHtml2Png();
+setImmediate(() => process.stdout.write(JSON.stringify({...state, visibility: controls.style.visibility})));
+""".replace("LOAD_SUCCEEDS", json.dumps(load_succeeds)).replace("HELPER", json.dumps(helper))
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True,
+                            check=True, timeout=5)
+    observed = json.loads(result.stdout)
+    assert observed["sources"] == ["/static/html2canvas.min.js"]
+    assert observed["visibility"] == ""
+    if load_succeeds:
+        assert observed["saved"] == [{"blob": "png-blob", "name": "Chart.png"}]
+        assert observed["fallback"] == 0
+    else:
+        assert observed["saved"] == []
+        assert observed["fallback"] == 1
 
 
 def test_source_resolution_uses_exact_call_id_and_current_output():
